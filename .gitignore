@@ -1,0 +1,17 @@
+# build output
+*.o
+*.d
+/qlim
+/build-pkg/
+/build-win/
+/releases/
+third_party/rubberband/single/*.o
+tests-win/out/
+# test binaries (tests/Makefile builds them next to the sources)
+tests/*
+!tests/*.c
+!tests/*.py
+!tests/Makefile.linux
+!tests/waitplug/
+tests/waitplug/*.clap
+__pycache__/
