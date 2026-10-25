@@ -1,0 +1,31 @@
+/* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
+#include <winver.h>
+#include "src/version.h"
+1 ICON "assets/icons/qlim.ico"
+2 ICON "assets/icons/qlim-project.ico"
+1 24 "src/win/qlim.manifest"
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904b0"
+    BEGIN
+      VALUE "CompanyName", "Georgi Stanimirov Ivanov"
+      VALUE "FileDescription", "Q-LiM clip launcher"
+      VALUE "FileVersion", QLIM_VERSION
+      VALUE "InternalName", "qlim"
+      VALUE "LegalCopyright", QLIM_COPYRIGHT
+      VALUE "OriginalFilename", "qlim.exe"
+      VALUE "ProductName", "Q-LiM"
+      VALUE "ProductVersion", QLIM_VERSION
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
