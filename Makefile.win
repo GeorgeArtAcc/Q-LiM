@@ -1,0 +1,98 @@
+# Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE)
+# ===== Q-LiM for Windows (7 and newer, 64-bit) - cross-compiled on Linux =====
+#   make -f Makefile.win            -> build-win/qlim.exe + the DLLs next to it
+#   make -f Makefile.win installer  -> build-win/Q-LiM-Setup-<version>.exe (Inno Setup under Wine, see tools/setup-win-toolchain.sh)
+# Toolchain: llvm-mingw (msvcrt runtime, so Windows 7 needs no extra runtime updates).
+# Libraries (Windows builds): SDL2 + SDL2_ttf (mingw devel), libsndfile (win64), PortAudio (static, WASAPI/WDM-KS/DS/MME),
+# RtMidi (WinMM, compiled in).
+
+WIN       ?= /opt/win
+LLVM      ?= $(WIN)/llvm-mingw-20241217-msvcrt-ubuntu-20.04-x86_64
+CC        := $(LLVM)/bin/x86_64-w64-mingw32-clang
+CXX       := $(LLVM)/bin/x86_64-w64-mingw32-clang++
+WINDRES   := $(LLVM)/bin/x86_64-w64-mingw32-windres
+SDL       := $(WIN)/SDL2-2.30.10/x86_64-w64-mingw32
+TTF       := $(WIN)/SDL2_ttf-2.22.0/x86_64-w64-mingw32
+SNDFILE   := $(WIN)/libsndfile-1.2.2-win64
+PA        := $(WIN)/prefix-asio
+RTMIDI    := $(WIN)/rtmidi
+
+OUT       := build-win
+OBJ       := $(OUT)/obj
+
+DEFS      := -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -DHAVE_RUBBERBAND -DUNICODE -D_UNICODE
+INC       := -Isrc -Isrc/win/include -I$(SDL)/include/SDL2 -I$(TTF)/include/SDL2 -I$(SNDFILE)/include -I$(PA)/include -I$(RTMIDI) \
+             -Ithird_party/rubberband -Ithird_party/lv2 -Ithird_party/lilv -Ithird_party/clap/include -Ithird_party/vst3
+COMMON    := -O2 -g -include src/win/compat.h $(DEFS) $(INC) -Wall -Wno-unused-parameter -Wno-unused-function
+CFLAGS    := -std=c11 $(COMMON)
+CXXFLAGS  := -std=c++17 $(COMMON)
+
+LIBS      := -L$(SDL)/lib -L$(TTF)/lib -lmingw32 -lSDL2main -lSDL2_ttf -lSDL2 $(SNDFILE)/lib/sndfile.lib \
+             $(PA)/lib/libportaudio.a -lwinmm -lole32 -loleaut32 -luuid -lsetupapi -lksuser -lavrt \
+             -lcomdlg32 -lshell32 -lpsapi -luser32 -lgdi32 -ladvapi32 -lws2_32 -lpthread -mwindows
+
+# Linux-only modules (PipeWire, LV2, /sys disk detection) -> src/win/stubs_win.c, diskinfo_win.c; plugin windows -> plugwin_win.c
+SRC_C     := src/main.c src/audio.c src/session.c src/wav.c src/ui.c src/filebrowser.c src/project.c src/settings.c \
+             src/theme.c src/stream.c src/dsp_meter.c src/devwatch.c src/stream_sndfile.c src/stream_resample.c \
+             src/mixer.c src/peaks.c src/sdlgfx.c src/dropfiles.c src/undo.c src/ui_dialogs.c src/bpm.c src/stretch.c \
+             src/applog.c src/edit.c src/plughost.c src/fxchain.c src/plugins.c src/host_vst2.c src/host_clap.c \
+             src/win/compat.c src/win/stubs_win.c src/win/diskinfo_win.c src/win/plugwin_win.c
+SRC_CXX   := src/midi.cpp src/host_vst3.cpp
+OBJS      := $(patsubst %.c,$(OBJ)/%.o,$(SRC_C)) $(patsubst %.cpp,$(OBJ)/%.o,$(SRC_CXX)) \
+             $(OBJ)/rtmidi.o $(OBJ)/rubberband.o $(OBJ)/qlim_res.o
+
+DLLS      := $(SDL)/bin/SDL2.dll $(TTF)/bin/SDL2_ttf.dll $(SNDFILE)/bin/sndfile.dll \
+             $(LLVM)/x86_64-w64-mingw32/bin/libc++.dll $(LLVM)/x86_64-w64-mingw32/bin/libunwind.dll \
+             $(LLVM)/x86_64-w64-mingw32/bin/libwinpthread-1.dll
+
+all: $(OUT)/qlim.exe
+
+$(OUT)/qlim.exe: $(OBJS)
+	@mkdir -p $(OUT)/assets
+	$(CXX) -o $@ $(OBJS) $(LIBS)
+	cp $(DLLS) $(OUT)/
+	cp assets/DejaVuSans.ttf $(OUT)/assets/
+	cp LICENSE $(OUT)/LICENSE.txt
+
+$(OBJ)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJ)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(OBJ)/rtmidi.o: $(RTMIDI)/RtMidi.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++17 -O2 -D__WINDOWS_MM__ -I$(RTMIDI) -c $< -o $@
+
+$(OBJ)/rubberband.o: third_party/rubberband/single/RubberBandSingle.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -std=c++14 -O3 -ffast-math -w -c $< -o $@
+
+$(OBJ)/qlim_res.o: src/win/qlim.rc assets/icons/qlim.ico
+	@mkdir -p $(dir $@)
+	$(WINDRES) -I. src/win/qlim.rc -O coff -o $@
+
+# dist: what goes into the installer (debug info stripped -> much smaller)
+VERSION   := $(shell sed -n 's/^\#define QLIM_VERSION *"\(.*\)"/\1/p' src/version.h)
+dist: $(OUT)/qlim.exe
+	rm -rf $(OUT)/dist && mkdir -p $(OUT)/dist/assets
+	cp $(OUT)/qlim.exe $(DLLS) $(OUT)/dist/
+	cp assets/DejaVuSans.ttf $(OUT)/dist/assets/
+	cp LICENSE $(OUT)/dist/LICENSE.txt
+	cp installer/NOTICE.txt $(OUT)/dist/NOTICE.txt
+	for f in $(OUT)/dist/*.exe $(OUT)/dist/*.dll; do $(LLVM)/bin/llvm-strip --strip-debug "$$f"; done
+
+# installer: Inno Setup (ISCC.exe) under Wine
+WINE      ?= $(WIN)/wine-10.0-amd64-wow64/bin/wine
+ISCC      ?= C:\\InnoSetup\\ISCC.exe
+installer: dist
+	cd installer && LANG=C.UTF-8 WINEPREFIX=$(WIN)/wp10 WINEDEBUG=-all WINEDLLOVERRIDES="mscoree,mshtml=" \
+	    $(WINE) $(ISCC) /Q /DAppVersion=$(VERSION) qlim.iss
+
+clean:
+	rm -rf $(OUT)
+
+-include $(OBJS:.o=.d)
+.PHONY: all clean installer dist

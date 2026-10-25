@@ -1,0 +1,5 @@
+#!/bin/sh
+# Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE)
+# AppImage start script: runs the qlim inside the AppImage (its font is in usr/bin/assets next to it).
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/qlim" "$@"

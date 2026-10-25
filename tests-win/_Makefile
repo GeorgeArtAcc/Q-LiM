@@ -1,0 +1,22 @@
+# Windows builds of the engine tests (run them under Wine or on Windows)
+WIN ?= /opt/win
+LLVM ?= $(WIN)/llvm-mingw-20241217-msvcrt-ubuntu-20.04-x86_64
+CXX := $(LLVM)/bin/x86_64-w64-mingw32-clang++
+SNDFILE := $(WIN)/libsndfile-1.2.2-win64
+DEFS := -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -DHAVE_RUBBERBAND -DUNICODE -D_UNICODE
+TSRC := ../src/session.c ../src/mixer.c ../src/stream.c ../src/stream_sndfile.c ../src/stream_resample.c ../src/peaks.c \
+        ../src/wav.c ../src/project.c ../src/undo.c ../src/bpm.c ../src/stretch.c ../src/edit.c \
+        ../src/win/compat.c ../src/win/diskinfo_win.c plug_stub.c
+TFLAGS := -std=c11 -O2 -include ../src/win/compat.h $(DEFS) -I../src -I$(SNDFILE)/include -I../third_party/rubberband \
+          -I../third_party/lv2 -I../third_party/clap/include -w
+TLIBS := $(SNDFILE)/lib/sndfile.lib -lole32 -lcomdlg32 -lshell32 -lpsapi -luser32 -lpthread
+T := out
+$(T)/rb.o: ../third_party/rubberband/single/RubberBandSingle.cpp
+	@mkdir -p $(T)
+	$(CXX) -std=c++14 -O3 -ffast-math -w -c $< -o $@
+$(T)/%.exe: %.c $(TSRC) $(T)/rb.o
+	@mkdir -p $(T)
+	$(CXX) -x c $(TFLAGS) $< $(TSRC) -x none $(T)/rb.o $(TLIBS) -o $@
+tests: $(T)/fuzz_engine.exe $(T)/test_edit.exe $(T)/fuzz_edit.exe $(T)/test_cut.exe $(T)/test_level.exe
+	cp $(SNDFILE)/bin/sndfile.dll $(LLVM)/x86_64-w64-mingw32/bin/libc++.dll $(LLVM)/x86_64-w64-mingw32/bin/libunwind.dll \
+	   $(LLVM)/x86_64-w64-mingw32/bin/libwinpthread-1.dll $(T)/

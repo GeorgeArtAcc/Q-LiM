@@ -1,0 +1,16 @@
+Q-LiM for Windows - Copyright (c) 2026 Georgi Stanimirov Ivanov
+License: GNU General Public License v3.0 or later (see LICENSE.txt). Source code: qlim-win-src-<version>.tar.gz
+
+Q-LiM for Windows contains or uses these third-party components:
+- SDL2, SDL2_ttf (zlib license) - SDL2.dll, SDL2_ttf.dll
+- libsndfile (LGPL-2.1-or-later) - sndfile.dll
+- PortAudio (MIT license) - built into qlim.exe
+- Steinberg ASIO SDK 2.3.4 (used under the GNU GPL v3 option) - built into qlim.exe
+  ASIO is a trademark and software of Steinberg Media Technologies GmbH.
+- Steinberg VST 3 "pluginterfaces" (MIT license) - built into qlim.exe
+  VST is a registered trademark of Steinberg Media Technologies GmbH.
+- CLAP headers (MIT license) - built into qlim.exe
+- RtMidi (MIT-style license) - built into qlim.exe
+- Rubber Band Library (GPL-2.0-or-later) - built into qlim.exe
+- DejaVu Sans font (Bitstream Vera / DejaVu license) - assets/DejaVuSans.ttf
+- LLVM libc++ / libunwind (Apache-2.0 WITH LLVM-exception), winpthreads (MIT) - the DLLs next to qlim.exe

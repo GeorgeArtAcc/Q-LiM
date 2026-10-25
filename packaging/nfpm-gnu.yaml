@@ -1,0 +1,53 @@
+# Q-LiM - .deb and .rpm (glibc systems). Built by: make -f packaging/Makefile.pkg T=gnu packages
+name: qlim
+arch: amd64
+platform: linux
+version: ${VERSION}
+release: 1
+section: sound
+priority: optional
+maintainer: Georgi Stanimirov Ivanov <georgeartacc@proton.me>
+description: |
+  Q-LiM - live clip launcher.
+  Clips and scenes, queue with crossfade, non-destructive cutting, tempo (Rubber Band),
+  faders/routing, MIDI, VST3/VST2/LV2/CLAP plugins, direct PipeWire output.
+  SDL2, FreeType, libsndfile (MP3/FLAC/Ogg/Opus) and PortAudio are built in.
+vendor: Georgi Stanimirov Ivanov
+homepage: https://github.com/GeorgeArtAcc/Q-LiM
+license: GPL-3.0-or-later
+contents:
+  - src: ${ROOT}/opt/qlim
+    dst: /opt/qlim
+    type: tree
+  - src: /opt/qlim/qlim
+    dst: /usr/bin/qlim
+    type: symlink
+  - src: ${ROOT}/usr/share
+    dst: /usr/share
+    type: tree
+scripts:
+  postinstall: ${PKGDIR}/postinstall.sh
+  postremove: ${PKGDIR}/postremove.sh
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
+      - libasound2 | libasound2t64
+      - libx11-6
+      - libgcc-s1
+    recommends:
+      - libgl1
+    suggests:
+      - pipewire
+      - liblilv-0-0
+      - ffmpeg
+  rpm:
+    depends:
+      - libasound.so.2()(64bit)
+      - libX11.so.6()(64bit)
+      - libgcc_s.so.1()(64bit)
+    recommends:
+      - mesa-libGL
+deb:
+  fields:
+    Bugs: mailto:georgeartacc@proton.me

@@ -1,0 +1,180 @@
+# Tests (since step 12: tempo, stretch). Needed: gcc, libsndfile, python3 + numpy (for the test audio).
+# Rename this file to "Makefile" first (or use: make -f Makefile.linux ...)
+#   make test      -> all
+#   make clean
+SRC  := ../src
+SHELL := /bin/bash
+.SHELLFLAGS := -o pipefail -c
+CFLAGS := -std=c11 -Wall -Wextra -O1 -g $(shell pkg-config --cflags sndfile)
+LIBS := $(shell pkg-config --libs sndfile) -lpthread -lm
+SAN  := -fsanitize=address,undefined -fno-omit-frame-pointer
+DATA := /tmp/qlim_test_audio
+
+all: test
+
+$(DATA)/tone.wav:
+	mkdir -p $(DATA)
+	python3 gen_test_audio.py $(DATA)
+	python3 gen_tone.py $(DATA)/tone.wav
+
+test_stretch: test_stretch.c $(SRC)/stretch.c
+	gcc $(CFLAGS) -O2 $^ -lm -o $@
+
+test_bpm: test_bpm.c $(SRC)/bpm.c $(SRC)/stream_sndfile.c $(SRC)/stream_resample.c
+	gcc $(CFLAGS) -O2 $^ $(LIBS) -o $@
+
+RB := ../third_party/rubberband
+rb.o: $(RB)/single/RubberBandSingle.cpp
+	g++ -std=c++14 -O3 -ffast-math -w -c $< -o $@
+
+TEMPO_SRC := test_tempo.c $(SRC)/session.c $(SRC)/mixer.c $(SRC)/stream.c $(SRC)/stream_sndfile.c \
+             $(SRC)/stream_resample.c $(SRC)/peaks.c $(SRC)/wav.c $(SRC)/diskinfo.c $(SRC)/project.c \
+             $(SRC)/undo.c $(SRC)/bpm.c $(SRC)/stretch.c $(SRC)/edit.c plug_stub.c
+test_tempo: $(TEMPO_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(TEMPO_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(TEMPO_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+QUEUE_SRC := test_queue.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_queue: $(QUEUE_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(QUEUE_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(QUEUE_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+XFADE_SRC := test_xfade.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_xfade: $(XFADE_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(XFADE_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(XFADE_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# ===== Stress tests (step 21): make stress  (long, ~15-30 min; everything with ASan/UBSan) =====
+ENGINE_SRC := $(filter-out test_tempo.c,$(TEMPO_SRC))
+fuzz_engine: fuzz_engine.c $(ENGINE_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c fuzz_engine.c $(ENGINE_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir fuzz_engine.c $(ENGINE_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+fuzz_project: fuzz_project.c $(ENGINE_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c fuzz_project.c $(ENGINE_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir fuzz_project.c $(ENGINE_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+test_edge: test_edge.c $(ENGINE_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c test_edge.c $(ENGINE_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir test_edge.c $(ENGINE_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+gen_odd_audio: gen_odd_audio.c
+	gcc $(CFLAGS) $< $(LIBS) -o $@
+
+ODD := $(DATA)/odd
+stress: fuzz_engine fuzz_project test_edge gen_odd_audio $(DATA)/tone.wav
+	mkdir -p $(ODD) && cd $(ODD) && $(CURDIR)/gen_odd_audio > /dev/null
+	python3 gen_queue_audio.py $(DATA)
+	python3 gen_xfade_audio.py $(DATA)
+	cd /tmp && $(CURDIR)/test_edge $(ODD)/long_10min.wav $(ODD)/short_10ms.wav $(DATA)/t_128_house.wav > /tmp/qlim_stress.log 2>&1; r=$$?; grep -aE "^(ok|FAIL|EDGE|FUZZ|ENGINE)|ERROR: AddressSanitizer|runtime error" /tmp/qlim_stress.log; exit $$r
+	cd /tmp && $(CURDIR)/fuzz_project $(DATA)/qa.wav $(DATA)/t_128_house.wav 300 7 > /tmp/qlim_stress.log 2>&1; r=$$?; grep -aE "^(ok|FAIL|EDGE|FUZZ|ENGINE)|ERROR: AddressSanitizer|runtime error" /tmp/qlim_stress.log; exit $$r
+	cd /tmp && $(CURDIR)/fuzz_engine 6000 1 $(ODD)/*.wav $(DATA)/t_128_house.wav $(DATA)/qa.wav > /tmp/qlim_stress.log 2>&1; r=$$?; grep -aE "^(ok|FAIL|EDGE|FUZZ|ENGINE)|ERROR: AddressSanitizer|runtime error" /tmp/qlim_stress.log; exit $$r
+	cd /tmp && CONCURRENT=1 $(CURDIR)/fuzz_engine 6000 2 $(ODD)/*.wav $(DATA)/t_128_house.wav $(DATA)/qa.wav > /tmp/qlim_stress.log 2>&1; r=$$?; grep -aE "^(ok|FAIL|EDGE|FUZZ|ENGINE)|ERROR: AddressSanitizer|runtime error" /tmp/qlim_stress.log; exit $$r
+
+LOOP_SRC := test_loop.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_loop: $(LOOP_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(LOOP_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(LOOP_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# step 27: cutting
+fuzz_edit: fuzz_edit.c $(SRC)/edit.c $(SRC)/edit.h
+	gcc $(CFLAGS) $(SAN) fuzz_edit.c $(SRC)/edit.c -lm -o $@
+test_edit: test_edit.c $(SRC)/edit.c $(SRC)/edit.h
+	gcc $(CFLAGS) $(SAN) test_edit.c $(SRC)/edit.c -lm -o $@
+CUT_SRC := test_cut.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_cut: $(CUT_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(CUT_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(CUT_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# step 36: exact level (0 dB = the file), the new fader, moving channels
+LEVEL_SRC := test_level.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+TRIM_SRC := test_trimrace.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_trimrace: $(TRIM_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(TRIM_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(TRIM_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+test_level: $(LEVEL_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(LEVEL_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(LEVEL_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# step 28: mixer graph mode (PipeWire)
+GRAPH_SRC := test_graph.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_graph: $(GRAPH_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(GRAPH_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(GRAPH_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# step 34: plugins on the channel (needs the QTestGain test plugins: make test_fx QTEST=<folder>)
+PLUG_INC := -I../third_party/lv2 -I../third_party/lilv -I../third_party/clap/include -I../third_party/vst3
+SDL_FL := $(shell pkg-config --cflags sdl2)
+SDL_LB := $(shell pkg-config --libs sdl2) -lX11
+FX_SRC := test_fx.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fx: $(FX_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FX_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FX_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+FXR_SRC := test_fxrace.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fxrace: $(FXR_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FXR_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXR_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+FXW_SRC := test_fxwait.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fxwait: $(FXW_SRC) rb.o waitplug/waitplug.c
+	gcc -shared -fPIC -O2 -I../third_party/clap/include waitplug/waitplug.c -o waitplug/waitplug.clap
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FXW_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXW_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+FXS_SRC := test_fxslow.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fxslow: $(FXS_SRC) rb.o waitplug/slowplug.c
+	gcc -shared -fPIC -O2 -I../third_party/clap/include waitplug/slowplug.c -o waitplug/slowplug.clap
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FXS_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXS_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+fx: test_fx test_fxrace test_fxwait test_fxslow
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_fx $(QTEST) | grep -E "^(ok|FAIL|FX)"
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_fxrace $(QTEST) | grep -E "^(ok|FAIL|FXRACE)|ERROR|SUMMARY"
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_fxwait $(CURDIR)/waitplug/waitplug.clap | grep -E "^(ok|FAIL|FXWAIT|with)|ERROR|SUMMARY"
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_fxslow $(CURDIR)/waitplug/slowplug.clap | grep -E "^(ok|FAIL|FXSLOW|slowest)|ERROR|SUMMARY"
+
+test_applog: test_applog.c $(SRC)/applog.c
+	gcc $(CFLAGS) $^ -lpthread -o $@
+
+test: test_applog test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_stretch test_bpm test_tempo test_queue test_xfade test_loop $(DATA)/tone.wav
+	./test_applog
+	./test_edit | grep -E "^(ok|FAIL|EDIT)"
+	./fuzz_edit 1500
+	cd /tmp && $(CURDIR)/test_trimrace $(DATA)/t_128_house.wav 800 | grep -E "^(FAIL|TRIMRACE)"
+	cd /tmp && $(CURDIR)/test_cut | grep -E "^(ok|FAIL|CUT)"
+	cd /tmp && $(CURDIR)/test_level | grep -E "^(ok|FAIL|LEVEL)"
+	cd /tmp && $(CURDIR)/test_graph | grep -E "^(ok|FAIL|GRAPH)"
+	./test_stretch
+	./test_bpm $(DATA)
+	cd /tmp && $(CURDIR)/test_tempo $(DATA)/t_128_house.wav $(DATA)/tone.wav | grep -E "^(ok|FAIL|TEMPO)"
+	python3 gen_queue_audio.py $(DATA)
+	cd /tmp && $(CURDIR)/test_queue $(DATA)/qa.wav $(DATA)/qb.wav | grep -E "^(ok|FAIL|QUEUE)"
+	python3 gen_xfade_audio.py $(DATA)
+	cd /tmp && $(CURDIR)/test_xfade $(DATA)/xa.wav $(DATA)/xb.wav | grep -E "^(ok|FAIL|XFADE|   )"
+	python3 gen_sine.py $(DATA)
+	cd /tmp && $(CURDIR)/test_loop $(DATA)/sine48.wav $(DATA)/sine44.wav | grep -E "^(ok|FAIL|LOOP)"
+
+# Direct PipeWire output (step 25): no sound, only checks that it runs and with what buffer.
+#   make pwcheck                                   (the default system output)
+#   make pwcheck PW_OUT=<node.name>       (a specific output; the names are shown in the list)
+PW_INC := -isystem ../third_party/pipewire/pipewire-0.3 -isystem ../third_party/pipewire/spa-0.2
+test_pw: test_pw.c $(SRC)/audio_pw.c $(SRC)/audio_pw.h
+	$(CC) -std=c11 -Wall -Wextra -O2 -g $(PW_INC) test_pw.c $(SRC)/audio_pw.c -ldl -lpthread -o $@
+pwcheck: test_pw
+	./test_pw check $(or $(PW_OUT),-) $(or $(PW_RATE),48000) $(or $(PW_BUF),256)
+
+clean:
+	rm -f test_pw test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_applog test_stretch test_bpm test_tempo test_queue test_xfade test_loop test_fx test_fxrace test_fxwait test_fxslow fuzz_engine fuzz_project test_edge gen_odd_audio *.o

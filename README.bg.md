@@ -1,0 +1,70 @@
+# Q-LiM
+
+**Q-LiM е програма за изпълнения на живо с аудио клипове, за Linux и Windows.** Слагаш клипове в мрежа от канали × сцени и ги пускаш, спираш, въртиш в кръг и миксираш на живо. Работи подобно на изгледа със сесии в Ableton Live или Bitwig. Q-LiM е малка, бърза и свободна програма.
+
+![Главният прозорец на Q-LiM](docs/screenshots/main.png)
+
+*[Read in English](README.md)*
+
+## Какво може
+
+- **Мрежа с клипове**: до 50 канала и 250 сцени. Пускаш един клип или цяла сцена, а следващия клип може да сложиш на опашка с плавен преход (crossfade). Клиповете могат да се въртят в кръг (loop).
+- **Вълната на клипа**: маркери за начало, край и loop. Рязане, копиране и поставяне на части, без да се пипа самият файл.
+- **Темпо**: разпознава BPM и сменя темпото без да сменя тона (Rubber Band R3).
+- **Миксер**:
+  - фейдъри, пан, solo и mute;
+  - мастер канал;
+  - насочване на всеки канал към всеки изход на картата (до 62 изхода).
+- **Ефекти**: плъгини **VST3, VST2, CLAP** и (на Linux) **LV2**, всеки със своя прозорец. Плъгините се проверяват в отделен процес, така че плъгин, който "гърми", не събаря Q-LiM.
+- **MIDI learn** за фейдъри, копчета, бутони и клипове.
+- **Звук**:
+  - **Linux**: ALSA/JACK през PortAudio или директно през **PipeWire**;
+  - **Windows**: WASAPI, **ASIO**, DirectSound, MME или WDM-KS.
+- **Файлове**: WAV, AIFF, FLAC, Ogg, Opus и MP3 са вградени. За M4A/AAC трябва `ffmpeg`.
+- **Сигурност**:
+  - Undo/Redo;
+  - автоматичен запис всяка минута;
+  - възстановяване след срив или спрян ток;
+  - запис, при който старият файл никога не остава наполовина презаписан.
+
+## Изтегляне и инсталиране
+
+Готовите версии са в [Releases](../../releases):
+
+| Система | Файл | Инсталиране |
+|---|---|---|
+| Ubuntu, Linux Mint, Debian | `qlim_<версия>-1_amd64.deb` | двоен клик или `sudo apt install ./qlim_<версия>-1_amd64.deb` |
+| Fedora, RHEL, openSUSE | `qlim-<версия>-1.x86_64.rpm` | `sudo dnf install ./qlim-<версия>-1.x86_64.rpm` |
+| Alpine Linux | `qlim_<версия>-r1_x86_64.apk` | `sudo apk add --allow-untrusted qlim_<версия>-r1_x86_64.apk` |
+| Всеки Linux (без инсталиране) | `Q-LiM-<версия>-x86_64.AppImage` | направи го изпълним и го пусни |
+| Windows 7 SP1 – 11 (64-битов) | `Q-LiM-Setup-<версия>.exe` | пусни инсталатора |
+
+Бележки:
+- **Linux пакетите** искат по-нова система: Ubuntu 22.04+, Mint 21+, Debian 12+ или Fedora 35+. Нужните библиотеки са вътре в пакета. Каквото липсва, apt, dnf или apk го слагат автоматично.
+- **AppImage** не слага Q-LiM в менюто. За това е .deb/.rpm пакетът.
+- **Windows** може да предупреди за "непознат издател", защото инсталаторът не е подписан с платен сертификат. Натисни "More info" → "Run anyway".
+- **ASIO драйверът** идва от производителя на звуковата карта (или ASIO4ALL). Q-LiM само го ползва и не инсталира нищо.
+
+## Компилиране
+
+На Linux (Ubuntu / Mint / Debian):
+
+```sh
+sudo apt install build-essential pkg-config libsdl2-dev libsdl2-ttf-dev portaudio19-dev \
+                 libsndfile1-dev librtmidi-dev libx11-dev
+mv Makefile.linux Makefile     # веднъж: файлът е записан като Makefile.linux - преименувай го
+make
+./qlim
+```
+
+**Важно:** Linux make-файловете са записани като `Makefile.linux` (в главната папка и в `tests/`). Преди компилиране
+ги преименувай на `Makefile`, или ги остави и пиши `make -f Makefile.linux` вместо `make`.
+
+Пакетите (.deb, .rpm, .apk, AppImage) и Windows версията се правят с `packaging/Makefile.pkg` и `Makefile.win` -
+подробностите са в [README.md](README.md#building-from-source) на английски.
+
+## Лиценз
+
+Q-LiM е свободен софтуер под **GNU General Public License, версия 3 или по-нова**. Виж [LICENSE](LICENSE) и [THIRD_PARTY.md](THIRD_PARTY.md).
+
+Copyright © 2026 Георги Станимиров Иванов (Georgi Stanimirov Ivanov, [GeorgeArtAcc](https://github.com/GeorgeArtAcc)).

@@ -1,0 +1,90 @@
+# Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE)
+# ===== Q-LiM Makefile (Linux) =====
+# Rename this file to "Makefile" and run "make"  (or, without renaming:  make -f Makefile.linux)
+
+CC      := gcc
+CXX     := g++
+CFLAGS  := -std=c11 -Wall -Wextra -O2 -g -MMD -MP
+CXXFLAGS := -std=c++11 -Wall -Wextra -O2 -g -MMD -MP
+LDFLAGS :=
+
+# SDL2 + SDL2_ttf (graphics, window, input, drag & drop, fonts)
+#   sudo apt install libsdl2-dev libsdl2-ttf-dev      (SDL2 >= 2.0.18 is needed)
+SDL_OK := $(shell pkg-config --atleast-version=2.0.18 sdl2 SDL2_ttf && echo yes)
+ifneq ($(SDL_OK),yes)
+$(error libsdl2-dev (>= 2.0.18) and libsdl2-ttf-dev are needed: sudo apt install libsdl2-dev libsdl2-ttf-dev)
+endif
+SDL_CFLAGS := $(shell pkg-config --cflags sdl2 SDL2_ttf)
+SDL_LIBS   := $(shell pkg-config --libs sdl2 SDL2_ttf)
+
+# PortAudio + libsndfile — through pkg-config
+PORTAUDIO_CFLAGS := $(shell pkg-config --cflags portaudio-2.0)
+PORTAUDIO_LIBS   := $(shell pkg-config --libs portaudio-2.0)
+SNDFILE_CFLAGS   := $(shell pkg-config --cflags sndfile)
+SNDFILE_LIBS     := $(shell pkg-config --libs sndfile)
+
+# Rubber Band (bundled in third_party/rubberband, compiled as a single file) — high-quality tempo change without pitch change
+RB_DIR := third_party/rubberband
+RB_OBJ := $(RB_DIR)/single/RubberBandSingle.o
+
+# PipeWire (direct output): the headers are bundled in third_party/pipewire (MIT license),
+# and libpipewire-0.3.so.0 is loaded at startup only if present -> libpipewire-0.3-dev is NOT needed.
+PW_DIR := third_party/pipewire
+src/audio_pw.o: CFLAGS += -isystem $(PW_DIR)/pipewire-0.3 -isystem $(PW_DIR)/spa-0.2
+
+# Include all headers
+CFLAGS += $(SDL_CFLAGS) $(PORTAUDIO_CFLAGS) $(SNDFILE_CFLAGS) -DHAVE_RUBBERBAND -I$(RB_DIR)
+
+# System libraries
+SYS_LIBS := -lm -lpthread -ldl -lrt -lX11
+
+# All libraries together
+LIBS := $(SDL_LIBS) $(SYS_LIBS) $(PORTAUDIO_LIBS) $(SNDFILE_LIBS) $(shell pkg-config --libs rtmidi)
+
+# Output file
+TARGET := qlim
+SRC_C  := src/main.c src/audio.c src/session.c src/wav.c src/ui.c src/filebrowser.c src/project.c src/settings.c src/theme.c src/stream.c src/diskinfo.c src/dsp_meter.c src/devwatch.c src/stream_sndfile.c src/stream_resample.c src/mixer.c src/peaks.c src/sdlgfx.c src/dropfiles.c src/undo.c src/ui_dialogs.c src/bpm.c src/stretch.c src/applog.c src/audio_pw.c src/edit.c src/plugins.c src/plughost.c src/host_vst2.c src/host_clap.c src/host_lv2.c src/fxchain.c src/plugwin.c
+SRC_CXX := src/midi.cpp src/host_vst3.cpp
+
+# Plugins (step 34): the headers are in third_party (MIT/ISC), liblilv is loaded when needed (dlopen)
+PLUG_INC := -Ithird_party/lv2 -Ithird_party/lilv -Ithird_party/clap/include -Ithird_party/vst3
+src/plughost.o src/host_vst2.o src/host_clap.o src/host_lv2.o src/plugins.o src/fxchain.o src/mixer.o src/ui.o src/main.o src/project.o src/plugwin.o: CFLAGS += $(PLUG_INC)
+src/host_vst3.o: CXXFLAGS += -std=c++17 -Wno-unused-parameter $(PLUG_INC)
+OBJ    := $(SRC_C:.c=.o) $(SRC_CXX:.cpp=.o) $(RB_OBJ)
+
+# ===== Rules =====
+
+all: $(TARGET)
+
+$(TARGET): $(OBJ)
+	$(CXX) -rdynamic $(OBJ) -o $(TARGET) $(LIBS)
+	@sh ./install-icon.sh || echo ">>> (shortcut in the applications menu was not created)"
+
+%.o: %.c
+	$(CC) $(CFLAGS) $(PORTAUDIO_CFLAGS) $(SNDFILE_CFLAGS) -c $< -o $@
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(shell pkg-config --cflags rtmidi) -c $< -o $@
+
+# Rubber Band: one big file (~15 s to compile; done only once, and again after "make clean")
+$(RB_OBJ): $(RB_DIR)/single/RubberBandSingle.cpp
+	$(CXX) -std=c++14 -O3 -ffast-math -w -MMD -MP -c $< -o $@
+
+run: $(TARGET)
+	./$(TARGET)
+
+# also track changes in the .h files (otherwise old .o files keep a different struct size -> crashes)
+-include $(OBJ:.o=.d)
+
+clean:
+	rm -f $(TARGET) $(OBJ) $(OBJ:.o=.d)
+
+# dated archive + checksums (proof of authorship); SIGN=1 make release -> also a GPG signature
+release:
+	@sh ./tools/release.sh
+
+# removing the shortcut and the icon from the menu
+uninstall-icon:
+	rm -f $(HOME)/.local/share/applications/qlim.desktop $(HOME)/.local/share/icons/hicolor/*/apps/qlim.png $(HOME)/.local/share/icons/hicolor/scalable/apps/qlim.svg
+
+.PHONY: all run clean uninstall-icon release

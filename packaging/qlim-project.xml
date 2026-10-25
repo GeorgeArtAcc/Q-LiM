@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-qlim-project">
+    <comment>Q-LiM project</comment>
+    <comment xml:lang="bg">Проект на Q-LiM</comment>
+    <icon name="application-x-qlim-project"/>
+    <generic-icon name="application-x-qlim-project"/>
+    <glob pattern="*.limproject"/>
+    <magic priority="60">
+      <match type="string" offset="0" value="# Q-LiM project"/>
+    </magic>
+  </mime-type>
+</mime-info>

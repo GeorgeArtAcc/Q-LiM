@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Q-LiM
+GenericName=Clip launcher
+Comment=Live clip launcher for audio
+Exec=qlim %f
+Icon=qlim
+Terminal=false
+StartupWMClass=qlim
+Categories=AudioVideo;Audio;Music;
+MimeType=application/x-qlim-project;
+Keywords=audio;clip;launcher;live;dj;
