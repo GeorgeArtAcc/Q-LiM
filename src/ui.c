@@ -3,6 +3,7 @@
 #include "version.h"
 #include "plugins.h"
 #include "fxchain.h"
+#include "midiq.h"
 #include <ctype.h>
 #include "ui_dialogs.h"
 #include "theme.h"
@@ -11,6 +12,11 @@
 #include "stream.h"
 #include "dsp_meter.h"
 #include "audio.h"
+#include "settings.h"
+#include "project.h"
+
+static bool fx_ui_free(void);                       /* 1.4: forward declarations */
+static void ui_rec_click(Session *s, int ch, int sc);
 #include "applog.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -1362,7 +1368,16 @@ static void draw_dsp_popup(int screen_w)
     char buf[160];
 
     ui_text("DSP load", (int)r.x + 14, (int)r.y + 10, 17, g_theme.text);
-    snprintf(buf, sizeof buf, "%d Hz  |  %d frames  |  %.1f ms", ac.sample_rate, ac.buffer_size, lat_ms);
+    {   /* 1.3.1: what really runs (e.g. PipeWire may run another buffer than the one asked for) */
+        int af; double ams;
+        if (audio_actual_buffer(&af, &ams) && ams > 0.0) {
+            if (af != ac.buffer_size)
+                snprintf(buf, sizeof buf, "%d Hz  |  %d frames (asked %d)  |  %.1f ms", ac.sample_rate, af, ac.buffer_size, ams);
+            else
+                snprintf(buf, sizeof buf, "%d Hz  |  %d frames  |  %.1f ms", ac.sample_rate, af, ams);
+        } else
+            snprintf(buf, sizeof buf, "%d Hz  |  %d frames  |  %.1f ms", ac.sample_rate, ac.buffer_size, lat_ms);
+    }
     int tw = ui_text_w(buf, 12);
     ui_text(buf, (int)(r.x + r.width - tw - 14), (int)r.y + 13, 12, g_theme.text_dim);
 
@@ -1417,39 +1432,175 @@ static void draw_dsp_popup(int screen_w)
     ui_text(buf, (int)r.x + 14, (int)r.y + 234, 12, g_theme.text_dim);
 }
 
-/* step 36e: the Q-LiM sign (the waveform with the orange "X" from the icon), simplified and muted - at the top centre */
-static void draw_top_logo(float cx, float cy, float h)
+/* 1.2.1: the Q-LiM wordmark at the top centre: "Q" + the sign (the waveform with the orange "X" from the icon,
+ * standing in for the dash) + "LiM". The sign is drawn from the same data as assets/icons/qlim.svg. */
+static const float LOGO_BARS[][4] = {   /* x, y, height, opacity - as in assets/icons/qlim.svg */
+    {92,236,40,1},{108,216,80,1},{124,196,120,1},{140,221,70,1},{156,181,150,1},{172,206,100,1},{188,226,60,1},
+    {204,191,130,.8f},{220,211,90,.6f},{236,171,170,.5f},{252,201,110,.5f},{268,176,160,.5f},{284,216,80,.6f},
+    {300,186,140,.8f},{316,226,60,1},{332,196,120,1},{348,206,100,1},{364,221,70,1},{380,201,110,1},
+    {396,231,50,1},{412,241,30,1} };
+
+/* the sign: its height h (the "X" from top to bottom), left edge x0, centre y; returns its width */
+static float draw_logo_sign(float x0, float cy, float h, bool draw)
 {
-    static const float bars[][4] = {   /* x, y, height, opacity - as in assets/icons/qlim.svg */
-        {92,236,40,1},{108,216,80,1},{124,196,120,1},{140,221,70,1},{156,181,150,1},{172,206,100,1},{188,226,60,1},
-        {204,191,130,.8f},{220,211,90,.6f},{236,171,170,.5f},{252,201,110,.5f},{268,176,160,.5f},{284,216,80,.6f},
-        {300,186,140,.8f},{316,226,60,1},{332,196,120,1},{348,206,100,1},{364,221,70,1},{380,201,110,1},
-        {396,231,50,1},{412,241,30,1} };
-    float fy = h / 212.0f;
-    float step = roundf(16.0f * fy * 1.55f);         /* spacing between the bars - whole pixels (all equally sharp) */
+    float fy = h / 196.0f;                           /* the "X" spans 158..354 in the svg */
+    float step = roundf(16.0f * fy * 1.25f);         /* whole pixels between the bars: all equally sharp */
     if (step < 3.0f) step = 3.0f;
     float fx = step / 16.0f;
-    float ox = roundf(cx - 256.0f * fx), oy = cy - 256.0f * fy;
-    for (size_t i = 0; i < sizeof bars / sizeof bars[0]; ++i) {
+    float bw = roundf(step * 0.55f);
+    if (bw < 2.0f) bw = 2.0f;
+    float width = 320.0f * fx + bw;                  /* bars from x 92 to 412 */
+    if (!draw) return width;
+    float ox = roundf(x0 - 92.0f * fx), oy = cy - 256.0f * fy;
+    for (size_t i = 0; i < sizeof LOGO_BARS / sizeof LOGO_BARS[0]; ++i) {
         Color c = g_theme.text;
-        c.a = (unsigned char)(95 * bars[i][3]);
-        float bw = roundf(step * 0.5f);
-        DrawRectangleGradientV(roundf(ox + bars[i][0] * fx), oy + bars[i][1] * fy, bw, bars[i][2] * fy, c, c);
+        c.a = (unsigned char)(170 * LOGO_BARS[i][3]);
+        DrawRectangleRounded((Rectangle){ roundf(ox + LOGO_BARS[i][0] * fx), oy + LOGO_BARS[i][1] * fy, bw, LOGO_BARS[i][2] * fy },
+                             0.5f, c);
     }
-    Color acc = { 255, 163, 26, 150 };
+    Color acc = { 255, 163, 26, 235 };
     for (int k = 0; k < 2; ++k) {                    /* the two orange curves ("X") */
         float p[4][2] = { {208,158},{248,158},{268,354},{304,354} };
         if (k) { p[0][1] = 354; p[1][0] = 244; p[1][1] = 354; p[2][0] = 264; p[2][1] = 158; p[3][1] = 158; }
         Vector2 prev = { 0, 0 };
-        for (int i = 0; i <= 24; ++i) {
-            float t = i / 24.0f, u = 1 - t;
-            float x = u*u*u*p[0][0] + 3*u*u*t*p[1][0] + 3*u*t*t*p[2][0] + t*t*t*p[3][0];
-            float y = u*u*u*p[0][1] + 3*u*u*t*p[1][1] + 3*u*t*t*p[2][1] + t*t*t*p[3][1];
+        for (int i = 0; i <= 32; ++i) {
+            float tt = i / 32.0f, u = 1 - tt;
+            float x = u*u*u*p[0][0] + 3*u*u*tt*p[1][0] + 3*u*tt*tt*p[2][0] + tt*tt*tt*p[3][0];
+            float y = u*u*u*p[0][1] + 3*u*u*tt*p[1][1] + 3*u*tt*tt*p[2][1] + tt*tt*tt*p[3][1];
             Vector2 v = { ox + x * fx, oy + y * fy };
-            if (i) DrawLineEx(prev, v, 1.6f, acc);
+            if (i) DrawLineEx(prev, v, 2.0f, acc);
             prev = v;
         }
     }
+    return width;
+}
+
+/* letters a little bolder and wider apart than the normal text */
+static float wm_text(const char *s, float x, float y, int size, Color c, bool draw)
+{
+    float sp = size * 0.06f, w = 0;
+    char ch[2] = { 0, 0 };
+    for (const char *q = s; *q; ++q) {
+        ch[0] = *q;
+        if (draw) { ui_text(ch, (int)roundf(x + w), (int)y, size, c); DrawTextEx(g_font, ch, (Vector2){ roundf(x + w) + 0.6f, y }, (float)size, 0, c); }
+        w += (float)ui_text_w(ch, size) + sp;
+    }
+    return w - sp;
+}
+
+/* the whole wordmark centred on cx (and kept between lmin and rmax) */
+static void draw_wordmark(float cx, float cy, float lmin, float rmax)
+{
+    const int fs = 24;
+    float sh = 32.0f;                                /* the sign is a bit taller than the letters */
+    float gap = 6.0f;
+    float wq = wm_text("Q", 0, 0, fs, g_theme.text, false);
+    float ws = draw_logo_sign(0, 0, sh, false);
+    float wl = wm_text("LiM", 0, 0, fs, g_theme.text, false);
+    float total = wq + gap + ws + gap - 2.0f + wl;
+    float x = roundf(cx - total * 0.5f);
+    if (x + total > rmax) x = rmax - total;
+    if (x < lmin) x = lmin;
+    if (x + total > rmax) return;                    /* no room (a very narrow window): nothing rather than overlap */
+    float ty = roundf(cy - fs * 0.51f);              /* DejaVu: puts the middle of the capitals on the middle of the sign */
+    wm_text("Q", x, ty, fs, g_theme.text, true);
+    draw_logo_sign(x + wq + gap, cy, sh, true);
+    wm_text("LiM", x + wq + gap + ws + gap - 2.0f, ty, fs, g_theme.text, true);   /* "L" has a wider left side bearing */
+}
+
+/* 1.1: launch quantization (as "Global Quantization" in Ableton/Bitwig) + the master BPM + the beat in the bar.
+ * Click on "Launch" = the next value, right click = the previous one. BPM: drag up/down, double click = type it. */
+static const float  QUANT_VALS[]   = { 0.0f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f };
+static const char  *QUANT_NAMES[]  = { "Now", "1 Beat", "1/2 Bar", "1 Bar", "2 Bars", "4 Bars" };
+#define QUANT_N 6
+
+static float draw_transport_group(float x, float y0)
+{
+    Session *s = g_ui_session;
+    if (!s) return x;
+    Vector2 m = GetMousePosition();
+    bool free_ui = !g_ti_active && !g_ctx_open && !g_file_menu_open && !g_edit_menu_open && !g_audio_dlg_open;
+    float h = 28.0f, y = y0 + (TOP_BAR_H - h) * 0.5f;
+
+    /* launch quantization */
+    float q = session_get_quantize(s);
+    int qi = 0;
+    for (int i = 0; i < QUANT_N; ++i) if (fabsf(QUANT_VALS[i] - q) < 0.01f) qi = i;
+    char ql[48];
+    snprintf(ql, sizeof ql, "Launch: %s", QUANT_NAMES[qi]);
+    float qw = (float)ui_text_w("Launch: 1/2 Bar", 14) + 22.0f;
+    Rectangle qr = { x, y, qw, h };
+    bool qh = free_ui && CheckCollisionPointRec(m, qr);
+    DrawRectangleRounded(qr, R_CELL, qh ? g_theme.cell_hover : g_theme.panel_bg2);
+    DrawRectangleRoundedLines(qr, R_CELL, 1, qi ? g_theme.selection : g_theme.text_dim);
+    ui_text(ql, (int)(x + 11), (int)(y + (h - 14) / 2) - 1, 14, qi ? g_theme.text : g_theme.text_dim);
+    if (qh) {
+        SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT))  session_set_quantize(s, QUANT_VALS[(qi + 1) % QUANT_N]);
+        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) session_set_quantize(s, QUANT_VALS[(qi + QUANT_N - 1) % QUANT_N]);
+    }
+    x += qw + 8.0f;
+
+    /* master BPM */
+    float bw = (float)ui_text_w("000.00 BPM", 15) + 18.0f;
+    Rectangle br = { x, y, bw, h };
+    bool editing = g_ti_active && g_ti_numeric == 1;
+    bool bh = free_ui && CheckCollisionPointRec(m, br);
+    DrawRectangleRounded(br, R_CELL, (bh || g_vf_id == 4) ? g_theme.cell_hover : g_theme.panel_bg2);
+    DrawRectangleRoundedLines(br, R_CELL, 1, g_theme.text_dim);
+    float tempo = session_get_tempo(s);
+    if (!editing) {
+        char num[32], lbl[48];
+        fmt_bpm(num, sizeof num, tempo);
+        snprintf(lbl, sizeof lbl, "%s BPM", num);
+        int tw = ui_text_w(lbl, 15);
+        ui_text(lbl, (int)(x + (bw - tw) / 2), (int)(y + (h - 15) / 2) - 1, 15, g_theme.text);
+    }
+    float v = tempo;
+    int res = value_field_input(4, br, &v, free_ui || g_vf_id == 4);
+    if (res == 1) session_set_tempo(s, v);
+    else if (res == 2) num_edit_begin(1, -1, -1, tempo, (Rectangle){ x, y - 1, bw > 100 ? bw : 100, h + 2 });
+    x += bw + 8.0f;
+
+    {   /* 1.3.1: the metronome (on/off) - ticks on every beat while clips play */
+        bool on = atomic_load(&s->metronome);
+        Rectangle mr = { x, y, 32.0f, h };
+        bool mh = free_ui && CheckCollisionPointRec(m, mr);
+        DrawRectangleRounded(mr, R_CELL, on ? g_theme.selection : mh ? g_theme.cell_hover : g_theme.panel_bg2);
+        DrawRectangleRoundedLines(mr, R_CELL, 1, on ? g_theme.selection : g_theme.text_dim);
+        Color ic = on ? g_theme.bg : g_theme.text;
+        float cx = mr.x + mr.width * 0.5f, top = mr.y + 5.0f, bot = mr.y + h - 5.0f;
+        /* the body: a trapezoid, the base, the pendulum leaning to one side */
+        Vector2 a = { cx - 3.0f, top }, b = { cx + 3.0f, top }, c = { cx + 8.0f, bot }, d = { cx - 8.0f, bot };
+        DrawLineEx(a, b, 1.6f, ic); DrawLineEx(b, c, 1.6f, ic); DrawLineEx(c, d, 1.6f, ic); DrawLineEx(d, a, 1.6f, ic);
+        DrawLineEx((Vector2){ cx, bot - 3.0f }, (Vector2){ cx + 7.0f, top + 1.0f }, 1.6f, ic);
+        DrawCircleV((Vector2){ cx + 3.6f, bot - 9.0f }, 1.8f, ic);
+        if (mh) {
+            SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) atomic_store(&s->metronome, !on);
+        }
+        x += mr.width + 10.0f;
+    }
+
+    /* the beat in the bar: 4 dots (the 1st one brighter) */
+    double beats = 0.0;
+    bool run = session_transport(s, &beats);
+    int beat = run ? (int)floor(beats) % 4 : -1;
+    for (int i = 0; i < 4; ++i) {
+        float d = 9.0f;
+        Rectangle r = { x + i * (d + 5.0f), y + (h - d) / 2, d, d };
+        Color c = g_theme.panel_bg2;
+        if (i == beat) c = i == 0 ? g_theme.selection : g_theme.text;
+        DrawRectangleRounded(r, 0.4f, c);
+        DrawRectangleRoundedLines(r, 0.4f, 1, g_theme.text_dim);
+    }
+    x += 4 * 14.0f;
+    if (run) {
+        char bb[24];
+        snprintf(bb, sizeof bb, "%d.%d", (int)(beats / 4.0) + 1, beat + 1);
+        ui_text(bb, (int)(x + 4), (int)(y + (h - 13) / 2), 13, g_theme.text_dim);
+    }
+    return x + 40.0f;
 }
 
 static void draw_top_bar(int screen_w)
@@ -1457,10 +1608,10 @@ static void draw_top_bar(int screen_w)
     int y0 = MENU_BAR_H;
 
     DrawRectangle(0, y0, screen_w, TOP_BAR_H, g_theme.panel_bg);
-    ui_text("Q-LiM", 12, y0 + 12, 22, g_theme.text);
-    {   /* step 36f: in the middle of the FREE space (between "Q-LiM" and the library button) - not of the screen */
-        float l = 12.0f + (float)ui_text_w("Q-LiM", 22), r = (float)(screen_w - MASTER_W - GAP - 36 - 12);
-        draw_top_logo((l + r) * 0.5f, y0 + TOP_BAR_H * 0.5f, TOP_BAR_H - 14.0f);
+    float group_r = draw_transport_group(12.0f, (float)y0);
+    {   /* 1.2.1: the wordmark in the middle of the WINDOW (where the eye looks for the centre), never over the buttons */
+        float r = (float)(screen_w - MASTER_W - GAP - 36 - 12) - 16.0f;
+        draw_wordmark(screen_w * 0.5f, y0 + TOP_BAR_H * 0.5f, group_r + 16.0f, r);
     }
 
     float icon_w = 36;
@@ -1661,6 +1812,30 @@ static void fader_draw(Rectangle sr, float pos, Color fill, Color frame)
     DrawRectangleRounded((Rectangle){ sr.x - 2, hy - 2, sr.width + 4, 4 }, 2, g_theme.text);
 }
 
+/* 1.0.5: during an automatic crossfade a "ghost" handle shows where the fader effectively is right now
+ * (the fader's own setting times the crossfade gain). The real fader is not touched, so your setting stays. */
+static void fader_draw_ghosts(Session *s, int ch, Rectangle sr, float pos)
+{
+    Channel *chp = &s->channels[ch];
+    float base_db = session_gain_to_db(pos);
+    for (int sc = 0; sc < s->scene_count; ++sc) {
+        Clip *cl = &chp->clips[sc];
+        if (!atomic_load_explicit(&cl->xf_vis_on, memory_order_relaxed)) continue;
+        float g = atomic_load_explicit(&cl->xf_vis, memory_order_relaxed);
+        float gp = (g <= 0.0005f || base_db < -500.0f) ? 0.0f : session_db_to_pos(base_db + 20.0f * log10f(g));
+        if (gp < 0.0f) gp = 0.0f;
+        if (gp > pos) gp = pos;
+        float hy = sr.y + sr.height * (1.0f - gp);
+        Color a = g_theme.selection;
+        /* the moving part between the setting and the ghost, faint */
+        float top = sr.y + sr.height * (1.0f - pos);
+        if (hy - top > 1.0f)
+            DrawRectangle((int)sr.x + 2, (int)top, (int)sr.width - 4, (int)(hy - top), (Color){ a.r, a.g, a.b, 40 });
+        DrawRectangleRounded((Rectangle){ sr.x - 5, hy - 4, sr.width + 10, 8 }, 4, (Color){ a.r, a.g, a.b, 70 });
+        DrawRectangleRounded((Rectangle){ sr.x - 3, hy - 2, sr.width + 6, 4 }, 2, (Color){ a.r, a.g, a.b, 220 });
+    }
+}
+
 /* true = the value changed (*pos is the new one) */
 static bool fader_input(int id, Rectangle sr, float *pos)
 {
@@ -1777,6 +1952,17 @@ static void draw_clip_cell(Session *s, int ch, int scene,
     /* the frame of the selected cell is drawn ON TOP, so it also covers the Play/Stop button (otherwise it goes under it) */
     if (g_selected_ch == ch && g_selected_scene == scene && !g_ch_focus && !atomic_load(&cl0->is_note))
         DrawRectangleRoundedLines((Rectangle){ x, y, w, h }, R_CELL, 2, g_theme.selection);
+    {   /* 1.1: the clip waits for the next beat/bar - it blinks (stop: red) */
+        int qs = session_clip_launch_state(s, ch, scene);
+        if (qs) {
+            float a = 0.5f + 0.5f * sinf((float)GetTime() * 14.0f);
+            Color c = qs == 2 ? (Color){ 235, 80, 80, 255 } : g_theme.selection;
+            Color f = c; f.a = (unsigned char)(25 + 70 * a);
+            c.a = (unsigned char)(110 + 145 * a);
+            DrawRectangleRounded((Rectangle){ x, y, h, h }, R_CELL, f);
+            DrawRectangleRoundedLines((Rectangle){ x, y, w, h }, R_CELL, 2, c);
+        }
+    }
     if (cmark_get(ch, scene)) {                         /* step 36: marked (Ctrl/Shift + click) */
         Color f = g_theme.selection; f.a = 70;
         DrawRectangleRounded((Rectangle){ x, y, w, h }, R_CELL, f);
@@ -1796,6 +1982,32 @@ static void draw_clip_cell_impl(Session *s, int ch, int scene,
     bool paused = atomic_load(&cl->paused);
     bool sel    = (g_selected_ch == ch && g_selected_scene == scene) && !g_ch_focus;   /* a selected channel -> the cell is not */
     bool hov    = (g_hovered_ch == ch && g_hovered_scene == scene);
+
+    {   /* 1.4: a cell that is being recorded (or waits for the bar to start / stop) */
+        double rb = 0.0;
+        int rst = session_rec_state(s, ch, scene, &rb);
+        if (rst != REC_IDLE) {
+            Color red = { 210, 45, 45, 255 };
+            bool blink = ((int)(GetTime() * 3.0)) & 1;
+            Color bgc = rst == REC_WAIT ? (blink ? (Color){ 110, 30, 30, 255 } : g_theme.panel_bg2) : red;
+            if (rst == REC_STOPPING && blink) bgc = (Color){ 150, 35, 35, 255 };
+            DrawRectangleRounded((Rectangle){ x, y, w, h }, R_CELL, bgc);
+            DrawRectangleRoundedLines((Rectangle){ x, y, w, h }, R_CELL, 2, (Color){ 255, 120, 110, 255 });
+            Vector2 c = { x + h / 2, y + h / 2 };
+            DrawCircleV(c, h * 0.2f, RAYWHITE);
+            char lb[64];
+            if (rst == REC_WAIT) snprintf(lb, sizeof lb, "REC - waits for the bar");
+            else snprintf(lb, sizeof lb, "REC  %d.%d%s", (int)(rb / 4.0) + 1, (int)fmod(rb, 4.0) + 1, rst == REC_STOPPING ? "  (stops on the bar)" : "");
+            while (ui_text_w_scaled(lb, 13) > w - h - 8 && strlen(lb) > 4) utf8_chop_last(lb);
+            ui_text_scaled(lb, (int)(x + h + 4), (int)(y + h / 2 - 8), 13, RAYWHITE);
+            if (CheckCollisionPointRec(GetMousePosition(), (Rectangle){ x, y, w, h }) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                !g_drag_active && !g_ctx_open && !g_ti_active && !g_audio_dlg_open && fx_ui_free()) {
+                g_selected_ch = ch; g_selected_scene = scene;
+                ui_rec_click(s, ch, scene);
+            }
+            return;
+        }
+    }
 
     if (is_note) {
         int ncol = cl->color;                                   /* 0 = the theme's default colour */
@@ -1879,9 +2091,14 @@ static void draw_clip_cell_impl(Session *s, int ch, int scene,
         DrawRectangleRounded(btn_rect, R_CELL, empty_btn);
         DrawRectangleRoundedLines(btn_rect, R_CELL, 1, g_theme.text_dim);
 
-        float sq = btn_size * (sq_hov ? 0.25f : 0.22f);
-        DrawRectangleRounded((Rectangle){ c.x - sq, c.y - sq, sq * 2, sq * 2 }, 1.5f,
-                             sq_hov ? g_theme.text : g_theme.text_dim);
+        bool armed_ch = session_is_armed(s, ch);           /* 1.4: an armed channel: a record circle instead of stop */
+        if (armed_ch) {
+            DrawCircleV(c, btn_size * (sq_hov ? 0.26f : 0.22f), sq_hov ? (Color){ 255, 80, 70, 255 } : (Color){ 200, 50, 45, 255 });
+        } else {
+            float sq = btn_size * (sq_hov ? 0.25f : 0.22f);
+            DrawRectangleRounded((Rectangle){ c.x - sq, c.y - sq, sq * 2, sq * 2 }, 1.5f,
+                                 sq_hov ? g_theme.text : g_theme.text_dim);
+        }
         if (sel) DrawRectangleRoundedLines((Rectangle){ x, y, w, h }, R_CELL, 2, g_theme.selection);
 
         ui_text("+", (int)(x + w/2 + 10), (int)(y + h/2 - 11),
@@ -1890,6 +2107,12 @@ static void draw_clip_cell_impl(Session *s, int ch, int scene,
         Vector2 mouse = GetMousePosition();
         Rectangle cell_rect = { x, y, w, h };
 
+        if (armed_ch && CheckCollisionPointRec(mouse, btn_rect) &&
+            IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !g_drag_active
+            && !g_ctx_open && !g_ti_active && !g_audio_dlg_open && fx_ui_free()) {
+            ui_rec_click(s, ch, scene);                     /* 1.4: start recording into this cell */
+            return;
+        }
         if (CheckCollisionPointRec(mouse, btn_rect) &&
             IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !g_drag_active
             && !g_ctx_open && !g_ti_active && !g_audio_dlg_open) {
@@ -1920,6 +2143,11 @@ static void draw_clip_cell_impl(Session *s, int ch, int scene,
                 g_last_click_ch = -1;
                 g_last_click_scene = -1;
 
+                if (fxchain_has_instrument(s, ch)) {         /* 1.3: an instrument channel -> a new MIDI clip */
+                    if (session_new_midi_clip(s, ch, scene, 4.0f, "MIDI") == 0)
+                        ui_flash_message("New MIDI clip - double click in the editor below to add notes");
+                    return;
+                }
                 g_pending_action.action = UI_ACTION_NEW_NOTE;
                 g_pending_action.ch = ch;
                 g_pending_action.scene = scene;
@@ -1967,7 +2195,7 @@ static void draw_clip_cell_impl(Session *s, int ch, int scene,
     char shortname[NAME_LEN];
     snprintf(shortname, sizeof(shortname), "%s", cl->name);
     char *dot = strrchr(shortname, '.');
-    if (dot) *dot = '\0';
+    if (dot && !atomic_load(&cl->is_midi)) *dot = '\0';
     while (ui_text_w_scaled(shortname, 15) > text_area_w && strlen(shortname) > 3) {
         utf8_chop_last(shortname);
     }
@@ -1975,7 +2203,33 @@ static void draw_clip_cell_impl(Session *s, int ch, int scene,
     ui_text_scaled(shortname, (int)text_x, (int)(y + 5),
             14, play ? g_theme.text : g_theme.text_dim);
 
-    if (cl->wav.sample_rate > 0 && cl->wav.frame_count > 0) {
+    if (atomic_load(&cl->is_midi)) {                    /* 1.3: a MIDI clip - a small picture of its notes */
+        const MidiSeq *mm = atomic_load(&cl->mseq);
+        char pb[40];
+        float Lb = mm ? mm->length : 4.0f;
+        double mp_ = play ? atomic_load(&cl->mpos_vis) : -1.0;
+        if (mp_ >= 0.0) snprintf(pb, sizeof pb, "%d.%d / %g", (int)(mp_ / 4.0) + 1, (int)fmod(mp_, 4.0) + 1, (double)(Lb / 4.0f));
+        else snprintf(pb, sizeof pb, "%g bar%s", (double)(Lb / 4.0f), Lb == 4.0f ? "" : "s");
+        int tw = ui_text_w_scaled(pb, 11);
+        ui_text_scaled(pb, (int)(x + w - tw - 6), (int)(y + h - 14), 11, play ? chan_col : g_theme.text_dim);
+        float rx = text_x, ry = y + 21, rw = x + w - tw - 12 - text_x, rh = h - 24;
+        if (mm && rw > 12 && rh >= 5) {
+            int lo = 127, hi = 0;
+            for (int i = 0; i < mm->n; ++i) { if (mm->note[i].key < lo) lo = mm->note[i].key; if (mm->note[i].key > hi) hi = mm->note[i].key; }
+            if (hi - lo < 6) { int c2 = (lo + hi) / 2; lo = c2 - 3; hi = c2 + 3; }
+            float kh = rh / (float)(hi - lo + 1);
+            Color nc = play ? chan_col : g_theme.text_dim;
+            for (int i = 0; i < mm->n && i < 4000; ++i) {
+                const MNote *q = &mm->note[i];
+                if (q->start >= Lb) continue;
+                float nx = rx + rw * q->start / Lb, nw = rw * q->len / Lb;
+                if (nw < 1.5f) nw = 1.5f;
+                float ny = ry + (hi - q->key) * kh;
+                DrawRectangle((int)nx, (int)ny, (int)ceilf(nw), (int)(kh < 1.5f ? 2 : ceilf(kh)), nc);
+            }
+            if (mp_ >= 0.0) { float px = rx + rw * (float)(mp_ / Lb); DrawLine((int)px, (int)ry, (int)px, (int)(ry + rh), g_theme.text); }
+        }
+    } else if (cl->wav.sample_rate > 0 && cl->wav.frame_count > 0) {
         double pos_sec = (double)cl->position / (double)cl->wav.sample_rate;
         double total_sec = (double)cl->wav.frame_count / (double)cl->wav.sample_rate;
         char t1[16], t2[16], buf[40];
@@ -2195,10 +2449,150 @@ static void draw_stop_button(Session *s, float x, float y, float w, float h)
 
 // ============ Channel header ============
 
+/* ===== 1.4: recording - the record button of a channel and the click on a cell ===== */
+static bool fx_ui_free(void);
+static int       g_rin_ch = -1;                  /* the input menu (right click on the record button) */
+static Vector2   g_rin_pos;
+static bool      g_rin_just;
+static Rectangle g_rin_rect;
+
+/* where a new recording goes: the project's "Recordings" folder, or ~/Q-LiM Recordings for a new project */
+static void rec_path(Session *s, int ch, char *out, size_t sz)
+{
+    char dir[1024];
+    if (project_has_current()) {
+        snprintf(dir, sizeof dir, "%s", project_get_current_path());
+        char *sl = strrchr(dir, '/');
+#ifdef _WIN32
+        char *bs = strrchr(dir, '\\'); if (bs && (!sl || bs > sl)) sl = bs;
+#endif
+        if (sl) *sl = 0; else snprintf(dir, sizeof dir, ".");
+        strncat(dir, "/Recordings", sizeof dir - strlen(dir) - 1);
+    } else {
+        const char *home = getenv("HOME");
+#ifdef _WIN32
+        if (!home || !home[0]) home = getenv("USERPROFILE");
+#endif
+        snprintf(dir, sizeof dir, "%s/Q-LiM Recordings", home && home[0] ? home : ".");
+    }
+    settings_ensure_dir(dir);
+    char nm[NAME_LEN];
+    snprintf(nm, sizeof nm, "%s", s->channels[ch].name);
+    for (char *q = nm; *q; ++q) if (*q == '/' || *q == '\\' || *q == ':' || *q == '*' || *q == '?' || *q == '"' || *q == '<' || *q == '>' || *q == '|') *q = '_';
+    time_t now = time(NULL);
+    struct tm tmv;
+    struct tm *lt = localtime(&now);                 /* UI thread only */
+    if (lt) tmv = *lt; else memset(&tmv, 0, sizeof tmv);
+    char ts[32];
+    strftime(ts, sizeof ts, "%Y-%m-%d %H-%M-%S", &tmv);
+    for (int k = 0; k < 100; ++k) {
+        if (k == 0) snprintf(out, sz, "%s/%s %s.wav", dir, nm, ts);
+        else snprintf(out, sz, "%s/%s %s (%d).wav", dir, nm, ts, k + 1);
+        FILE *f = fopen(out, "rb");
+        if (!f) return;
+        fclose(f);
+    }
+}
+
+/* a click on the record circle of an empty cell / on a recording cell */
+static void ui_rec_click(Session *s, int ch, int sc)
+{
+    char err[200] = "";
+    bool midi = fxchain_has_instrument(s, ch);
+    int st = session_rec_state(s, ch, sc, NULL);
+    if (st == REC_IDLE && !midi && audio_input_channels() <= 0) {
+        ui_flash_message("No audio input: choose a sound card with inputs in Edit > Audio (or arm an instrument channel to record MIDI)");
+        return;
+    }
+    char path[1100] = "";
+    if (st == REC_IDLE && !midi) rec_path(s, ch, path, sizeof path);
+    if (session_rec_cell(s, ch, sc, midi, path, audio_roundtrip_frames(), err, sizeof err) != 0) {
+        char m[300]; snprintf(m, sizeof m, "Cannot record: %s", err); ui_flash_message(m);
+        return;
+    }
+    if (st == REC_IDLE) {
+        g_selected_ch = ch; g_selected_scene = sc;
+        ui_flash_message(midi ? "Recording MIDI - click the cell again to stop" : "Recording - click the cell again to stop");
+    }
+}
+
+/* the record button: a circle (filled red = armed). Click = arm, right click = the inputs / monitoring */
+static void rec_arm_button(Session *s, int ch, Rectangle r, Color on_col)
+{
+    bool armed = session_is_armed(s, ch);
+    Vector2 m = GetMousePosition();
+    bool hov = CheckCollisionPointRec(m, r) && fx_ui_free() && !g_midi_learn_mode;
+    Vector2 c = { r.x + r.width / 2, r.y + r.height / 2 };
+    float rad = r.height * 0.36f;
+    Color red = { 230, 60, 55, 255 };
+    if (armed) {
+        DrawCircleV(c, rad + 1.5f, red);
+        if (atomic_load(&s->channels[ch].monitor)) DrawCircleLines((int)c.x, (int)c.y, rad + 3.5f, red);
+    } else {
+        DrawCircleLines((int)c.x, (int)c.y, rad, hov ? red : (Color){ on_col.r, on_col.g, on_col.b, 170 });
+        if (hov) DrawCircleV(c, rad * 0.5f, red);
+    }
+    if (hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) session_toggle_arm(s, ch);
+    if (hov && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) { g_rin_ch = ch; g_rin_pos = m; g_rin_just = true; }
+}
+
+/* the menu of the record button: which input(s) and monitoring */
+static void draw_rec_input_menu(Session *s)
+{
+    if (g_rin_ch < 0) { g_rin_rect = (Rectangle){ 0, 0, 0, 0 }; return; }
+    if (g_rin_ch >= s->channel_count) { g_rin_ch = -1; return; }
+    Channel *chp = &s->channels[g_rin_ch];
+    int nin = audio_input_channels();
+    bool midi = fxchain_has_instrument(s, g_rin_ch);
+    char items[40][48]; int kind[40], val[40]; int n = 0;
+    if (midi) { snprintf(items[n], 48, "Records MIDI (instrument channel)"); kind[n] = -1; val[n++] = 0; }
+    else if (nin <= 0) { snprintf(items[n], 48, "No audio input (Edit > Audio)"); kind[n] = -1; val[n++] = 0; }
+    else {
+        for (int i = 0; i + 1 < nin && n < 16; i += 2) { snprintf(items[n], 48, "Inputs %d + %d (stereo)", i + 1, i + 2); kind[n] = 1; val[n++] = i; }
+        for (int i = 0; i < nin && n < 34; ++i) { snprintf(items[n], 48, "Input %d (mono)", i + 1); kind[n] = 0; val[n++] = i; }
+    }
+    snprintf(items[n], 48, "Monitor: %s", atomic_load(&chp->monitor) ? "ON (hear the input)" : "off"); kind[n] = 2; val[n++] = 0;
+    snprintf(items[n], 48, "%s", session_is_armed(s, g_rin_ch) ? "Disarm" : "Arm for recording"); kind[n] = 3; val[n++] = 0;
+    const float W = 250, RH = 22;
+    float H = n * RH + 8;
+    float px = g_rin_pos.x, py = g_rin_pos.y + 6;
+    if (px + W > GetScreenWidth() - 4) px = GetScreenWidth() - 4 - W;
+    if (py + H > GetScreenHeight() - 4) py = GetScreenHeight() - 4 - H;
+    Rectangle r = { px, py, W, H };
+    g_rin_rect = r;
+    DrawRectangle((int)px + 4, (int)py + 4, (int)W, (int)H, (Color){ 0, 0, 0, 90 });
+    Color bg = g_theme.panel_bg; bg.r = (unsigned char)(bg.r + 8); bg.g = (unsigned char)(bg.g + 8); bg.b = (unsigned char)(bg.b + 8);
+    DrawRectangleRec(r, bg);
+    DrawRectangleLinesEx(r, 1, g_theme.selection);
+    Vector2 m = GetMousePosition();
+    int cf = atomic_load(&chp->rec_in_first);
+    bool cst = atomic_load(&chp->rec_in_stereo);
+    for (int i = 0; i < n; ++i) {
+        Rectangle ir = { px + 2, py + 4 + i * RH, W - 4, RH };
+        bool cur = (kind[i] == 1 && cst && val[i] == cf) || (kind[i] == 0 && !cst && val[i] == cf);
+        bool hov = kind[i] >= 0 && CheckCollisionPointRec(m, ir);
+        if (hov) DrawRectangleRec(ir, g_theme.cell_hover);
+        if (cur) DrawCircleV((Vector2){ ir.x + 9, ir.y + RH / 2 }, 3, g_theme.selection);
+        ui_text(items[i], (int)ir.x + 18, (int)ir.y + 4, 13, kind[i] < 0 ? g_theme.text_dim : g_theme.text);
+        if (hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !g_rin_just) {
+            if (kind[i] == 1 || kind[i] == 0) session_set_rec_input(s, g_rin_ch, val[i], kind[i] == 1);
+            else if (kind[i] == 2) session_set_monitor(s, g_rin_ch, !atomic_load(&chp->monitor));
+            else if (kind[i] == 3) session_toggle_arm(s, g_rin_ch);
+            g_rin_ch = -1;
+            return;
+        }
+    }
+    if (!g_rin_just && (IsKeyPressed(KEY_ESCAPE) ||
+        ((IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) && !CheckCollisionPointRec(m, r))))
+        g_rin_ch = -1;
+    g_rin_just = false;
+}
+
+static bool fx_ui_free(void);
 static void draw_channel_header(Session *s, int ch,
+
                                 float x, float y, float w, float h)
 {
-    (void)s;
     Channel *chp = &s->channels[ch];
     Color c = palette_raw(chp->color_id);
 
@@ -2211,6 +2605,27 @@ static void draw_channel_header(Session *s, int ch,
 
     int name_x = (int)(x + 8);
     int name_w = (int)(w - 16);
+    /* 1.4: the record button (right end of the header) */
+    if (w > 60) {
+        rec_arm_button(s, ch, (Rectangle){ x + w - 24, y + (h - 18) / 2, 18, 18 }, ui_text_color_on(c));
+        name_w -= 22;
+        w -= 22;                                   /* the keyboard icon goes left of it */
+    }
+    /* 1.2: an instrument channel - a small keyboard on the right (filled = the MIDI keyboard plays it; click = play it) */
+    if (fxchain_has_instrument(s, ch) && w > 60) {
+        bool armed = session_get_midi_target(s) == ch;
+        Color tc = ui_text_color_on(c);
+        Rectangle kb = { x + w - 26, y + (h - 14) / 2, 20, 14 };
+        Vector2 mm = GetMousePosition();
+        bool kh = CheckCollisionPointRec(mm, kb) && fx_ui_free();
+        if (armed) DrawRectangleRec(kb, tc);
+        else DrawRectangleLinesEx(kb, 1, kh ? tc : (Color){ tc.r, tc.g, tc.b, 150 });
+        Color key = armed ? c : (Color){ tc.r, tc.g, tc.b, 150 };
+        for (int i = 1; i < 4; ++i) DrawLine((int)(kb.x + i * 5), (int)kb.y + 1, (int)(kb.x + i * 5), (int)(kb.y + kb.height - 1), key);
+        for (int i = 0; i < 3; ++i) if (i != 1) DrawRectangle((int)(kb.x + 3 + i * 5 + (i > 1 ? 0 : 0)), (int)kb.y + 1, 3, 7, key);
+        if (kh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) session_set_midi_target(s, ch);
+        name_w -= 26;
+    }
     if (name_w > 20) {
         char nm[NAME_LEN];
         snprintf(nm, sizeof(nm), "%s", chp->name);
@@ -2307,7 +2722,7 @@ static int    g_fx_click_ch = -1, g_fx_click_k = -1;
 
 static bool fx_ui_free(void)
 {
-    return !g_ctx_open && !g_ti_active && !g_audio_dlg_open && g_fxp_ch < 0 && g_fxm_ch < 0;
+    return !g_ctx_open && !g_ti_active && !g_audio_dlg_open && g_fxp_ch < 0 && g_fxm_ch < 0 && g_rin_ch < 0;
 }
 
 /* ===== The FX strip of one channel: the slots (name, format, on/off) and "+" ===== */
@@ -2490,15 +2905,25 @@ static void draw_fx_picker(Session *s)
         char nm[PLUGIN_NAME_LEN]; snprintf(nm, sizeof nm, "%s", pi->name);
         const char *fmtn = plugins_fmt_name(plugins_fmt_index(pi->fmt));
         int tgw = ui_text_w(fmtn, 10);
-        while (ui_text_w(nm, 13) > W - 40 - tgw && strlen(nm) > 2) utf8_chop_last(nm);
+        int itw = pi->inst ? ui_text_w("INST", 9) + 10 : 0;    /* 1.2: instruments are marked */
+        while (ui_text_w(nm, 13) > W - 40 - tgw - itw && strlen(nm) > 2) utf8_chop_last(nm);
         ui_text(nm, (int)row.x + 8, (int)row.y + 4, 13, g_theme.text);
         ui_text(fmtn, (int)(row.x + row.width - tgw - 8), (int)row.y + 6, 10, g_theme.text_dim);
+        if (pi->inst) {
+            float fcol = (float)ui_text_w("VST3", 10);          /* the same column for every format */
+            Rectangle ib = { row.x + row.width - fcol - 8 - itw, row.y + 4, (float)itw - 4, RH - 8 };
+            DrawRectangleRounded(ib, R_SMALL, g_theme.selection);
+            ui_text("INST", (int)ib.x + 3, (int)ib.y + 2, 9, g_theme.bg);
+        }
         if (hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !g_fxp_just) picked = idx[g_fxp_scroll + r2];
     }
     if (IsKeyPressed(KEY_ENTER) && nf > 0) picked = idx[g_fxp_scroll];
     if (picked >= 0) {
         const PluginInfo *pi = plugins_get(picked);
-        int k = session_fx_add(s, g_fxp_ch, pi->fmt, pi->name, pi->path);
+        /* 1.2: an instrument goes before the effects (they then process its sound) */
+        int k = pi->inst ? session_fx_insert(s, g_fxp_ch, 0, pi->fmt, pi->name, pi->path)
+                         : session_fx_add(s, g_fxp_ch, pi->fmt, pi->name, pi->path);
+        if (k >= 0 && pi->inst) { session_set_midi_target(s, g_fxp_ch); chsel_only(g_fxp_ch); }
         char msg[200];
         if (k >= 0) snprintf(msg, sizeof msg, "%s added to %s", pi->name, s->channels[g_fxp_ch].name);
         else snprintf(msg, sizeof msg, "This channel already has %d plugins", MAX_CH_FX);
@@ -2515,6 +2940,7 @@ static void draw_fx_picker(Session *s)
 }
 
 /* ===== Menu on a slot: bypass on/off, remove ===== */
+static void draw_rec_input_menu(Session *s);
 static void draw_fx_slot_menu(Session *s)
 {
     if (g_fxm_ch < 0) { g_fxm_rect = (Rectangle){ 0, 0, 0, 0 }; return; }
@@ -2522,8 +2948,13 @@ static void draw_fx_slot_menu(Session *s)
     const ChFx *fx = &s->channels[g_fxm_ch].fx[g_fxm_idx];
     QPlug *qp = fxchain_find(s, g_fxm_ch, g_fxm_idx);
     bool open = qplug_editor_is_open(qp);
-    const char *items[3] = { open ? "Close window" : "Open window", fx->bypass ? "Turn on" : "Turn off (bypass)", "Remove" };
-    const float W = 180, RH = 24, H = 3 * RH + 8;
+    int nfx = s->channels[g_fxm_ch].fx_count;
+    /* 1.2: the order can be changed (the first device of an instrument channel is the instrument) */
+    const char *items[5] = { open ? "Close window" : "Open window", fx->bypass ? "Turn on" : "Turn off (bypass)",
+                             "Move left (earlier)", "Move right (later)", "Remove" };
+    bool en[5] = { qp && qplug_has_editor(qp), true, g_fxm_idx > 0, g_fxm_idx < nfx - 1, true };
+    const int NI = 5;
+    const float W = 190, RH = 24, H = NI * RH + 8;
     float px = g_fxm_pos.x, py = g_fxm_pos.y - H;
     if (px + W > GetScreenWidth() - 4) px = GetScreenWidth() - 4 - W;
     if (py < 4) py = 4;
@@ -2534,14 +2965,16 @@ static void draw_fx_slot_menu(Session *s)
     DrawRectangleRec(r, bg);
     DrawRectangleLinesEx(r, 1, g_theme.selection);
     Vector2 m = GetMousePosition();
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < NI; ++i) {
         Rectangle ir = { px + 2, py + 4 + i * RH, W - 4, RH };
-        bool hov = CheckCollisionPointRec(m, ir);
+        bool hov = en[i] && CheckCollisionPointRec(m, ir);
         if (hov) DrawRectangleRec(ir, g_theme.cell_hover);
-        ui_text(items[i], (int)ir.x + 10, (int)ir.y + 5, 14, g_theme.text);
+        ui_text(items[i], (int)ir.x + 10, (int)ir.y + 5, 14, en[i] ? g_theme.text : g_theme.text_dim);
         if (hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !g_fxm_just) {
             if (i == 0) { if (open) { GfxGLRelease(); qplug_editor_close(qp); GfxGLRestore(); } else fx_open_window(s, g_fxm_ch, g_fxm_idx); }
             else if (i == 1) session_fx_toggle_bypass(s, g_fxm_ch, g_fxm_idx);
+            else if (i == 2) session_fx_move(s, g_fxm_ch, g_fxm_idx, g_fxm_idx - 1);
+            else if (i == 3) session_fx_move(s, g_fxm_ch, g_fxm_idx, g_fxm_idx + 1);
             else session_fx_remove(s, g_fxm_ch, g_fxm_idx);
             g_fxm_ch = -1;
             g_fxm_just = false;
@@ -2759,6 +3192,7 @@ static void draw_channel_footer(Session *s, int ch,
     }
     Rectangle sr = { slider_x, slider_y, SLIDER_W, slider_h };
     fader_draw(sr, gain, slider_col, col);
+    fader_draw_ghosts(s, ch, sr, gain);
 
     if (g_midi_learn_mode) {
         Rectangle footer_r = { x, y, w, h };
@@ -3188,9 +3622,10 @@ static float wave_max_zoom(size_t total_frames)
     return (float)z;
 }
 
-/* The small panel in the top row of the waveform, under the Master column: [tick] 128 BPM
- *   tick off: the clip plays as it is; the number is the detected tempo (double click/drag = correction)
- *   tick on : the clip plays at the tempo in the field; changing it changes the speed WITHOUT changing the pitch */
+/* The small panel in the top row of the waveform, under the Master column: [ 124 BPM ] [WARP]
+ *   the number = the clip's own tempo (detected; drag / double click = correction)
+ *   WARP on  : the clip plays at the MASTER tempo (top bar) - faster/slower WITHOUT changing the pitch (Rubber Band)
+ *   WARP off : the clip plays as it is (1.1) */
 static void draw_clip_bpm_panel(Session *s, int ch, int sc, float px, float py, float pw, float ph)
 {
     DrawRectangle((int)px, (int)py, (int)pw, (int)ph, g_theme.panel_bg2);
@@ -3199,29 +3634,28 @@ static void draw_clip_bpm_panel(Session *s, int ch, int sc, float px, float py, 
     bool warp = session_get_clip_warp(s, ch, sc);
     bool busy = session_clip_bpm_busy(s, ch, sc);
     float orig = session_clip_bpm_orig(s, ch, sc);
-    float play = session_clip_bpm_play(s, ch, sc);
+    float master = session_get_tempo(s);
     Vector2 m = GetMousePosition();
     bool free_ui = !g_ti_active && !g_ctx_open && !g_file_menu_open && !g_edit_menu_open && !g_audio_dlg_open;
 
-    /* tick box */
-    Rectangle cb = { px + 6, py + (ph - 13) / 2, 13, 13 };
-    Rectangle cb_hit = { px, py, cb.width + 12, ph };
-    bool cb_hov = free_ui && CheckCollisionPointRec(m, cb_hit);
-    if (warp) DrawRectangleRec(cb, g_theme.solo);
-    else      DrawRectangleRec(cb, cb_hov ? g_theme.panel_bg : g_theme.bg);
-    DrawRectangleLines((int)cb.x, (int)cb.y, (int)cb.width, (int)cb.height, cb_hov ? g_theme.text : g_theme.text_dim);
-    if (warp) {                                     /* check mark */
-        Color k = g_theme.bg;
-        DrawLineEx((Vector2){ cb.x + 3, cb.y + 7 }, (Vector2){ cb.x + 5.5f, cb.y + 10 }, 2.0f, k);
-        DrawLineEx((Vector2){ cb.x + 5.5f, cb.y + 10 }, (Vector2){ cb.x + 10.5f, cb.y + 3 }, 2.0f, k);
+    /* WARP button on the right */
+    float btw = (float)ui_text_w("WARP", 12) + 16.0f;
+    Rectangle wb = { px + pw - btw - 4, py + 3, btw, ph - 6 };
+    bool wh = free_ui && CheckCollisionPointRec(m, wb);
+    DrawRectangleRounded(wb, R_SMALL, warp ? g_theme.solo : (wh ? g_theme.cell_hover : g_theme.bg));
+    DrawRectangleRoundedLines(wb, R_SMALL, 1, warp ? g_theme.solo : (wh ? g_theme.text : g_theme.text_dim));
+    {
+        int tw = ui_text_w("WARP", 12);
+        ui_text("WARP", (int)(wb.x + (wb.width - tw) / 2), (int)(wb.y + (wb.height - 12) / 2) - 1, 12,
+                warp ? g_theme.bg : g_theme.text);
     }
-    if (cb_hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && g_vf_id == 0)
-        session_set_clip_warp(s, ch, sc, !warp);
+    if (wh) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
+    if (wh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && g_vf_id == 0) session_set_clip_warp(s, ch, sc, !warp);
 
-    /* value */
-    Rectangle vr = { cb_hit.x + cb_hit.width, py, pw - cb_hit.width - 2, ph };
+    /* the clip's own tempo */
+    Rectangle vr = { px + 2, py, wb.x - px - 6, ph };
     bool editing = g_ti_active && g_ti_numeric == 2;
-    float cur = warp ? play : orig;
+    float cur = orig;
     bool vhov = free_ui && CheckCollisionPointRec(m, vr);
     if (!editing) {
         if (vhov || g_vf_id == 2) {
@@ -3230,7 +3664,7 @@ static void draw_clip_bpm_panel(Session *s, int ch, int sc, float px, float py, 
             DrawRectangle((int)vr.x, (int)vr.y + 2, (int)vr.width, (int)vr.height - 4, hc);
         }
         char num[32], lbl[48];
-        Color col = warp ? g_theme.solo : g_theme.text;
+        Color col = g_theme.text;
         if (cur > 0.0f) {
             fmt_bpm(num, sizeof(num), cur);
             snprintf(lbl, sizeof(lbl), "%s BPM", num);
@@ -3240,15 +3674,15 @@ static void draw_clip_bpm_panel(Session *s, int ch, int sc, float px, float py, 
         }
         int ty = (int)(py + (ph - 14) / 2);
         ui_text(lbl, (int)vr.x + 4, ty, 14, col);
-        /* with a changed tempo: the original one in brackets */
-        if (warp && orig > 0.0f && fabsf(play - orig) > 0.004f) {
+        /* WARP on and another tempo: where it goes */
+        if (warp && cur > 0.0f && fabsf(master - cur) > 0.004f) {
             char o[40], on[32];
-            fmt_bpm(on, sizeof(on), orig);
-            snprintf(o, sizeof(o), "(%s)", on);
+            fmt_bpm(on, sizeof(on), master);
+            snprintf(o, sizeof(o), "> %s", on);
             int lw = ui_text_w(lbl, 14);
             int ow = ui_text_w(o, 11);
-            if (vr.x + 4 + lw + 5 + ow <= vr.x + vr.width)
-                ui_text(o, (int)vr.x + 4 + lw + 5, (int)(py + (ph - 11) / 2), 11, g_theme.text_dim);
+            if (vr.x + 4 + lw + 6 + ow <= vr.x + vr.width)
+                ui_text(o, (int)vr.x + 4 + lw + 6, (int)(py + (ph - 11) / 2), 11, g_theme.solo);
         }
     }
     float v = cur;
@@ -3437,8 +3871,10 @@ static void ed_apply(Session *s, EditList *nl, const char *msg)
 }
 
 /* Delete: if a part is selected (clicked) - deletes the part, not the whole clip. main.c asks it first. */
+static bool me_take_delete(Session *s);
 bool ui_edit_take_delete(Session *s)
 {
+    if (me_take_delete(s)) return true;                /* 1.3: notes selected in the MIDI editor */
     if (g_part < 0 || g_ed_ch < 0 || g_ed_sc < 0 || g_ed_ch >= s->channel_count) return false;
     const EditList *el = session_clip_edits(s, g_ed_ch, g_ed_sc);
     if (!el || g_part >= el->n) { g_part = -1; return false; }
@@ -3485,8 +3921,11 @@ static bool ed_paste_at(Session *s, int ch, int sc, double f)
 }
 
 /* Ctrl+C / Ctrl+X: a part selected in the waveform -> copies it (not the clip) */
+static bool me_take_copy(Session *s, bool cut);
+static bool me_take_paste(Session *s);
 bool ui_edit_take_copy(Session *s, bool cut)
 {
+    if (me_take_copy(s, cut)) return true;             /* 1.3.2: notes selected in the MIDI editor */
     if (g_part < 0 || g_ed_ch < 0 || g_ed_sc < 0 || g_ed_ch >= s->channel_count) return false;
     const EditList *el = session_clip_edits(s, g_ed_ch, g_ed_sc);
     if (!el || g_part >= el->n) { g_part = -1; return false; }
@@ -3499,6 +3938,7 @@ bool ui_edit_take_copy(Session *s, bool cut)
 /* Ctrl+V: there is a copied part and the mouse is over the waveform -> pastes it there (at the bar under the mouse) */
 bool ui_edit_take_paste(Session *s)
 {
+    if (me_take_paste(s)) return true;                 /* 1.3.2: copied notes, the MIDI editor in use */
     if (!g_seg_clip || !g_wave_geo.valid) return false;
     Vector2 m = GetMousePosition();
     if (!CheckCollisionPointRec(m, (Rectangle){ g_wave_geo.x, g_wave_geo.ruler_y, g_wave_geo.w,
@@ -3748,10 +4188,1024 @@ static bool ed_detail(const Clip *cl, const EditList *e, double view0, double fp
     return any || ncol == 0;
 }
 
+/* ===== 1.3: the MIDI editor (piano roll) - in place of the waveform when a MIDI clip is selected =====
+ * Left: the keys (click = hear the note). Top: the ruler with the bars; the triangle at the end = the clip length (drag).
+ * Grid: double click = add a note / delete a note; drag a note = move (time + pitch); drag its right edge = length;
+ * drag on empty space = select a box; Shift = add to the selection. Bottom: the velocity of each note (drag up/down).
+ * Keys (after a click in the editor): Delete, arrows (up/down = pitch, Shift = octave; left/right = one grid step),
+ * Ctrl+A = all. Mouse wheel = up/down, Shift+wheel = sideways, Ctrl+wheel = zoom. */
+#define ME_KW   46
+#define ME_RH   16
+static const float ME_GRIDS[] = { 1.0f, 0.5f, 0.25f, 0.125f, 0.0f };
+static const char *ME_GRID_NAMES[] = { "1/4", "1/8", "1/16", "1/32", "Off" };
+#define ME_NGRID 5
+enum { MD_NONE = 0, MD_MOVE, MD_RESIZE, MD_BOX, MD_VEL, MD_LEN };
+static int     g_me_ch = -1, g_me_sc = -1;
+static double  g_me_b0 = 0.0;
+static float   g_me_ppb = 60.0f, g_me_kh = 11.0f;
+static int     g_me_top = 84, g_me_grid = 2;
+static bool    g_me_focus = false;
+static Rectangle g_me_rect;
+static int     g_md = MD_NONE;
+static Vector2 g_md_p0;
+static MidiSeq *g_md_orig = NULL;
+static int     g_md_note = -1, g_md_lastdk = 0;
+static double  g_me_click_t = 0;
+static Vector2 g_me_click_p;
+static float   g_me_lastlen = 0.25f;
+static bool    g_md_copy = false;          /* 1.3.2: Ctrl + drag = copies of the notes are moved, the originals stay */
+static float   g_me_pcur = -1.0f;          /* 1.3.2: where Ctrl+V pastes (beat; set by a click on empty space), <0 = none */
+static MNote  *g_me_cb = NULL;             /* 1.3.2: the copied notes (starts relative to the first one) */
+static int     g_me_cbn = 0;
+static float   g_me_cb_span = 0.0f;
+static int     g_me_pv_key = -1, g_me_pv_ch = -1;
+static double  g_me_pv_until = 0;
+
+static float me_grid(void) { return ME_GRIDS[g_me_grid]; }
+static float me_snap_floor(float b) { float g = me_grid(); return g > 0 ? floorf(b / g + 1e-4f) * g : b; }
+/* 1.3.2: the grid step really drawn at this zoom (coarser when zoomed out), 0 = grid off */
+static float me_vis_step(void)
+{
+    float g = me_grid();
+    if (g <= 0.0f) return 0.0f;
+    while (g * g_me_ppb < 5.0f) g *= 2.0f;
+    return g;
+}
+/* 1.3.2: a "magnet" like in other DAWs: a time near a grid line (closer than ME_MAGNET_PX on the screen) sticks
+ * exactly to it; otherwise it goes freely - so zoomed out it always lands on the grid, zoomed in it moves finely
+ * (to 1/960 of a beat). free_move (Shift) = no magnet. */
+#define ME_MAGNET_PX 12.0f
+static float me_magnet(float b, bool free_move)
+{
+    float g = me_vis_step();
+    if (!free_move && g > 0.0f) {
+        float n = roundf(b / g) * g;
+        if (fabsf(n - b) * g_me_ppb <= ME_MAGNET_PX) return n;
+    }
+    return roundf(b * 960.0f) / 960.0f;
+}
+/* the grid lines: the theme's grid colour, pushed away from the background so the fine lines can be seen */
+static Color me_grid_color(void)
+{
+    Color c = g_theme.text_dim, bg = g_theme.wave_bg;
+    return (Color){ (unsigned char)((c.r + bg.r) / 2), (unsigned char)((c.g + bg.g) / 2), (unsigned char)((c.b + bg.b) / 2), 255 };
+}
+static bool  me_black(int k) { int n = k % 12; return n == 1 || n == 3 || n == 6 || n == 8 || n == 10; }
+
+static void me_preview_off(void)
+{
+    if (g_me_pv_key >= 0) midiq_push_to(MIDIQ_UI, g_me_pv_ch, 0x80, (unsigned char)g_me_pv_key, 0);
+    g_me_pv_key = -1;
+}
+static void me_preview(int ch, int key, int vel)
+{
+    me_preview_off();
+    if (key < 0 || key > 127) return;
+    midiq_push_to(MIDIQ_UI, ch, 0x90, (unsigned char)key, (unsigned char)(vel > 0 ? vel : 100));
+    g_me_pv_key = key; g_me_pv_ch = ch; g_me_pv_until = GetTime() + 0.25;
+}
+
+static void me_publish(Session *s, MidiSeq *m) { session_midi_set(s, g_me_ch, g_me_sc, m); }
+
+/* the selection as a new list (the old one is still read by the audio thread) */
+static void me_select(Session *s, const MidiSeq *cur, int only, bool clear_others, bool on)
+{
+    MidiSeq *m = midiseq_dup(cur, 0);
+    if (!m) return;
+    for (int i = 0; i < m->n; ++i) {
+        if (i == only) m->note[i].sel = on;
+        else if (clear_others) m->note[i].sel = 0;
+    }
+    me_publish(s, m);
+}
+
+static int me_selected(const MidiSeq *m) { int n = 0; for (int i = 0; m && i < m->n; ++i) n += m->note[i].sel != 0; return n; }
+
+static void me_fit(Session *s, float gw, float gh)
+{
+    const MidiSeq *m = session_midi_get(s, g_me_ch, g_me_sc);
+    float L = m ? m->length : 4.0f;
+    g_me_b0 = 0.0;
+    g_me_ppb = (gw - 8) / (L > 1.0f ? L : 1.0f);
+    if (g_me_ppb > 240.0f) g_me_ppb = 240.0f;
+    int lo = 127, hi = 0;
+    for (int i = 0; m && i < m->n; ++i) { if (m->note[i].key < lo) lo = m->note[i].key; if (m->note[i].key > hi) hi = m->note[i].key; }
+    int vis = (int)(gh / g_me_kh);
+    int mid = (m && m->n) ? (lo + hi) / 2 : 60;
+    g_me_top = mid + vis / 2;
+    if (g_me_top > 127) g_me_top = 127;
+    if (g_me_top - vis + 1 < 0) g_me_top = vis - 1 < 127 ? vis - 1 : 127;
+}
+
+/* arrows: called by main.c before it moves the clip selection; true = the editor used them */
+bool ui_midi_take_arrows(Session *s)
+{
+    if (!g_me_focus || g_me_ch < 0 || !session_is_midi(s, g_me_ch, g_me_sc)) return false;
+    const MidiSeq *cur = session_midi_get(s, g_me_ch, g_me_sc);
+    bool up = IsKeyPressed(KEY_UP) || IsKeyPressedRepeat(KEY_UP), dn = IsKeyPressed(KEY_DOWN) || IsKeyPressedRepeat(KEY_DOWN);
+    bool lf = IsKeyPressed(KEY_LEFT) || IsKeyPressedRepeat(KEY_LEFT), rt = IsKeyPressed(KEY_RIGHT) || IsKeyPressedRepeat(KEY_RIGHT);
+    if (!(up || dn || lf || rt)) return me_selected(cur) > 0;
+    if (!me_selected(cur)) return false;
+    bool sh = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    int dk = up ? (sh ? 12 : 1) : dn ? (sh ? -12 : -1) : 0;
+    float g = me_grid() > 0 ? me_grid() : 0.25f;
+    float db = lf ? -g : rt ? g : 0.0f;
+    MidiSeq *m = midiseq_dup(cur, 0);
+    if (!m) return true;
+    int pk = -1;
+    for (int i = 0; i < m->n; ++i) {
+        MNote *q = &m->note[i];
+        if (!q->sel) continue;
+        int k = q->key + dk;
+        if (k < 0 || k > 127) { free(m); return true; }
+        float st = q->start + db;
+        if (st < 0.0f || st >= m->length) { free(m); return true; }
+        q->key = (unsigned char)k; q->start = st;
+        pk = k;
+    }
+    me_publish(s, m);
+    if (dk && pk >= 0) me_preview(g_me_ch, pk, 100);
+    return true;
+}
+
+/* Delete: called through ui_edit_take_delete */
+static bool me_take_delete(Session *s)
+{
+    if (!g_me_focus || g_me_ch < 0 || !session_is_midi(s, g_me_ch, g_me_sc)) return false;
+    const MidiSeq *cur = session_midi_get(s, g_me_ch, g_me_sc);
+    if (!me_selected(cur)) return false;
+    MidiSeq *m = midiseq_dup(cur, 0);
+    if (!m) return true;
+    int w = 0;
+    for (int i = 0; i < m->n; ++i) if (!m->note[i].sel) m->note[w++] = m->note[i];
+    m->n = w;
+    me_publish(s, m);
+    return true;
+}
+
+/* 1.3.2: Ctrl+C / Ctrl+X of the selected notes (main.c asks through ui_edit_take_copy) */
+static bool me_take_copy(Session *s, bool cut)
+{
+    if (!g_me_focus || g_me_ch < 0 || !session_is_midi(s, g_me_ch, g_me_sc)) return false;
+    const MidiSeq *cur = session_midi_get(s, g_me_ch, g_me_sc);
+    int n = me_selected(cur);
+    if (!n) return false;
+    MNote *cb = malloc(sizeof(MNote) * (size_t)n);
+    if (!cb) return true;
+    float st = 1e9f, en = 0.0f;
+    int k = 0;
+    for (int i = 0; i < cur->n; ++i) if (cur->note[i].sel) {
+        cb[k++] = cur->note[i];
+        if (cur->note[i].start < st) st = cur->note[i].start;
+        if (cur->note[i].start + cur->note[i].len > en) en = cur->note[i].start + cur->note[i].len;
+    }
+    for (int i = 0; i < k; ++i) { cb[i].start -= st; cb[i].sel = 1; }
+    free(g_me_cb); g_me_cb = cb; g_me_cbn = k;
+    /* the length of the copied block, rounded up to the grid (so pasting again continues right after it) */
+    float g = me_grid() > 0.0f ? me_grid() : 0.25f;
+    g_me_cb_span = ceilf((en - st) / g - 1e-4f) * g;
+    if (g_me_cb_span < g) g_me_cb_span = g;
+    if (g_me_pcur < 0.0f) g_me_pcur = st + g_me_cb_span;    /* no place chosen yet: right after the copied notes */
+    if (cut) { me_take_delete(s); ui_flash_message("Notes cut - click where to put them, Ctrl+V"); }
+    else ui_flash_message("Notes copied - click where to put them, Ctrl+V");
+    return true;
+}
+
+/* 1.3.2: Ctrl+V - the copied notes at the paste place (the last click on empty space), same pitches */
+static bool me_take_paste(Session *s)
+{
+    if (!g_me_focus || g_me_ch < 0 || !session_is_midi(s, g_me_ch, g_me_sc) || !g_me_cb || g_me_cbn <= 0) return false;
+    const MidiSeq *cur = session_midi_get(s, g_me_ch, g_me_sc);
+    if (!cur) return false;
+    if (cur->n + g_me_cbn > MIDI_MAX_NOTES) { ui_flash_message("Too many notes in this clip"); return true; }
+    float at = g_me_pcur >= 0.0f ? g_me_pcur : 0.0f;
+    MidiSeq *m = midiseq_dup(cur, g_me_cbn);
+    if (!m) return true;
+    for (int i = 0; i < m->n; ++i) m->note[i].sel = 0;
+    for (int i = 0; i < g_me_cbn; ++i) { m->note[m->n] = g_me_cb[i]; m->note[m->n].start += at; m->note[m->n].sel = 1; m->n++; }
+    me_publish(s, m);
+    g_me_pcur = at + g_me_cb_span;                          /* Ctrl+V again = the next copy right after it */
+    return true;
+}
+
+/* 1.3.2: quantize - the starts of the selected notes (all, if none is selected) to the grid (1/16 if it is off) */
+static void me_quantize(Session *s)
+{
+    const MidiSeq *cur = session_midi_get(s, g_me_ch, g_me_sc);
+    if (!cur || cur->n == 0) return;
+    float g = me_grid() > 0.0f ? me_grid() : 0.25f;
+    bool only_sel = me_selected(cur) > 0;
+    MidiSeq *m = midiseq_dup(cur, 0);
+    if (!m) return;
+    int moved = 0;
+    for (int i = 0; i < m->n; ++i) {
+        MNote *q = &m->note[i];
+        if (only_sel && !q->sel) continue;
+        float ns = roundf(q->start / g) * g;
+        if (ns < 0.0f) ns = 0.0f;
+        if (fabsf(ns - q->start) > 1e-5f) ++moved;
+        q->start = ns;
+    }
+    me_publish(s, m);
+    char msg[96];
+    snprintf(msg, sizeof msg, "Quantized %s to %s (%d moved)", only_sel ? "the selected notes" : "all notes",
+             ME_GRID_NAMES[me_grid() > 0.0f ? g_me_grid : 2], moved);
+    ui_flash_message(msg);
+}
+
+static bool me_hdr_button(Rectangle r, const char *label, bool on, bool enabled)
+{
+    Vector2 m = GetMousePosition();
+    bool hov = enabled && fx_ui_free() && CheckCollisionPointRec(m, r);
+    if (on) DrawRectangleRounded(r, R_SMALL, g_theme.selection);
+    else DrawRectangleRoundedLines(r, R_SMALL, 1, hov ? g_theme.text : g_theme.grid_line);
+    int tw = ui_text_w(label, 12);
+    ui_text(label, (int)(r.x + (r.width - tw) / 2), (int)(r.y + (r.height - 12) / 2), 12,
+            on ? g_theme.bg : (!enabled ? g_theme.grid_line : hov ? g_theme.text : g_theme.text_dim));
+    return hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+static void draw_midi_editor(Session *s, int ch, int sc, float x, float y, float w, float h)
+{
+    Clip *cl = &s->channels[ch].clips[sc];
+    Color col = channel_color(s->channels[ch].color_id);
+    Vector2 mp = GetMousePosition();
+    bool uf = fx_ui_free();
+    if (g_me_pv_key >= 0 && GetTime() > g_me_pv_until && !IsMouseButtonDown(MOUSE_BUTTON_LEFT)) me_preview_off();
+
+    float by = y + WAVE_HDR_H, bh = h - WAVE_HDR_H;
+    float vh = bh > 150 ? 36.0f : 0.0f;
+    float gx = x + ME_KW, gy = by + ME_RH, gw = w - ME_KW, gh = bh - ME_RH - vh;
+    g_me_rect = (Rectangle){ x, y, w, h };
+    if (ch != g_me_ch || sc != g_me_sc) {                  /* another clip: fit it into view */
+        if (g_waveform_h < 260.0f) {                       /* the piano roll needs room: the panel grows (once per clip) */
+            g_waveform_h = 260.0f;
+            return;                                         /* the layout of this frame used the old height */
+        }
+        g_me_ch = ch; g_me_sc = sc;
+        g_me_pcur = -1.0f;
+        g_md = MD_NONE; free(g_md_orig); g_md_orig = NULL;
+        me_fit(s, gw, gh);
+    }
+    const MidiSeq *m = session_midi_get(s, ch, sc);
+    if (!m) return;
+    float L = m->length;
+    {   /* the length changed from outside (a recording ended, undo): fit the view again */
+        static float lastL = -1.0f;
+        if (lastL >= 0.0f && fabsf(L - lastL) > 1e-3f && g_md != MD_LEN &&
+            ((L - g_me_b0) * g_me_ppb > gw - 8 || L * g_me_ppb < (gw - 8) * 0.5f)) me_fit(s, gw, gh);
+        lastL = L;
+    }
+
+    /* ---- the header ---- */
+    DrawRectangle((int)x, (int)y, (int)w, WAVE_HDR_H, g_theme.panel_bg);
+    char hdr[400];
+    snprintf(hdr, sizeof hdr, "%s  |  MIDI  |  %d note%s  |  Ch %d / S%d", cl->name, m->n, m->n == 1 ? "" : "s", ch + 1, sc + 1);
+    ui_text(hdr, (int)x + 10, (int)y + 4, 14, g_theme.text);
+    float hx = x + 10 + ui_text_w(hdr, 14) + 18;
+    char gl[32]; snprintf(gl, sizeof gl, "Grid %s", ME_GRID_NAMES[g_me_grid]);
+    Rectangle gr = { hx, y + 2, (float)ui_text_w("Grid 1/32", 12) + 16, WAVE_HDR_H - 4 };
+    if (me_hdr_button(gr, gl, false, true)) g_me_grid = (g_me_grid + 1) % ME_NGRID;
+    if (uf && CheckCollisionPointRec(mp, gr) && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) g_me_grid = (g_me_grid + ME_NGRID - 1) % ME_NGRID;
+    hx += gr.width + 10;
+    char ll[48];
+    if (fmodf(L, 4.0f) < 1e-3f) snprintf(ll, sizeof ll, "%d bar%s", (int)(L / 4.0f), (int)(L / 4.0f) == 1 ? "" : "s");
+    else snprintf(ll, sizeof ll, "%g beats", (double)L);
+    /* 1.3.1: the length is only shown here - it is changed by dragging the triangle in the ruler */
+    int llw = ui_text_w(ll, 12);
+    ui_text(ll, (int)hx, (int)y + 5, 12, g_theme.text_dim);
+    hx += llw + 10;
+    Rectangle dbl = { hx, y + 2, 30, WAVE_HDR_H - 4 };
+    bool dup = me_hdr_button(dbl, "x2", false, L <= 512.0f);
+    hx += dbl.width + 8;
+    bool loop_on = atomic_load(&cl->loop);
+    Rectangle lr = { hx, y + 2, 46, WAVE_HDR_H - 4 };
+    if (me_hdr_button(lr, "Loop", loop_on, true)) atomic_store(&cl->loop, !loop_on);
+    hx += lr.width + 8;
+    Rectangle qzr = { hx, y + 2, (float)ui_text_w("Quantize", 12) + 16, WAVE_HDR_H - 4 };
+    if (me_hdr_button(qzr, "Quantize", false, m->n > 0)) { g_me_focus = true; me_quantize(s); m = session_midi_get(s, ch, sc); }
+    hx += qzr.width + 14;
+    if (dup) {                                             /* x2: twice as long, the notes repeated */
+        MidiSeq *n2 = midiseq_dup(m, m->n);
+        if (n2) {
+            for (int i = 0; i < m->n; ++i) { n2->note[m->n + i] = m->note[i]; n2->note[m->n + i].start += L; n2->note[m->n + i].sel = 0; }
+            n2->n = m->n * 2;
+            n2->length = L * 2.0f;
+            me_publish(s, n2);
+            m = session_midi_get(s, ch, sc); L = m->length;
+            me_fit(s, gw, gh);
+        }
+    }
+    if (!fxchain_has_instrument(s, ch)) {
+        const char *warn = "No instrument on this channel: click the channel name and press + to add one";
+        ui_text(warn, (int)hx, (int)y + 5, 12, FX_FAIL_COL);
+    } else if (w - (hx - x) > 420) {
+        const char *hint = "Double click: add / delete   Ctrl+drag: copy   Ruler: drag = zoom/move, double click = play";
+        int hw = ui_text_w(hint, 11);
+        ui_text(hint, (int)(x + w - hw - 10), (int)y + 6, 11, g_theme.text_dim);
+    }
+
+    /* ---- focus (the keys go to the editor after a click in it) ---- */
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
+        g_me_focus = uf && CheckCollisionPointRec(mp, (Rectangle){ x, by, w, bh });
+
+    /* ---- the view: wheel ---- */
+    Rectangle grid_r = { gx, gy, gw, gh }, keys_r = { x, gy, ME_KW, gh };
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if (uf && (CheckCollisionPointRec(mp, grid_r) || CheckCollisionPointRec(mp, keys_r) ||
+                 CheckCollisionPointRec(mp, (Rectangle){ gx, by, gw, ME_RH }))) {
+        float wh = GetMouseWheelMove();
+        if (wh != 0.0f) {
+            if (ctrl && CheckCollisionPointRec(mp, keys_r)) {
+                g_me_kh *= wh > 0 ? 1.15f : 1.0f / 1.15f;
+                if (g_me_kh < 5) g_me_kh = 5;
+                if (g_me_kh > 30) g_me_kh = 30;
+            } else if (ctrl) {
+                double bm = g_me_b0 + (mp.x - gx) / g_me_ppb;
+                g_me_ppb *= wh > 0 ? 1.2f : 1.0f / 1.2f;
+                if (g_me_ppb < 4) g_me_ppb = 4;
+                if (g_me_ppb > 800) g_me_ppb = 800;
+                g_me_b0 = bm - (mp.x - gx) / g_me_ppb;
+            } else if (shift) {
+                g_me_b0 -= wh * 40.0 / g_me_ppb;
+            } else {
+                g_me_top += wh > 0 ? 3 : -3;
+            }
+        }
+    }
+    int vis = (int)(gh / g_me_kh) + 1;
+    if (g_me_top > 127) g_me_top = 127;
+    if (g_me_top - vis + 2 < 0) g_me_top = vis - 2 > 127 ? 127 : vis - 2;
+    double maxb0 = (double)L + 4.0 - (gw - 10) / g_me_ppb;
+    if (g_me_b0 > maxb0) g_me_b0 = maxb0;
+    if (g_me_b0 < 0) g_me_b0 = 0;
+#define BX(b) (gx + (float)(((double)(b) - g_me_b0) * g_me_ppb))
+#define KY(k) (gy + (float)(g_me_top - (k)) * g_me_kh)
+
+    /* ---- the grid ---- */
+    DrawRectangle((int)x, (int)by, (int)w, (int)bh, g_theme.wave_bg);
+    BeginScissorMode((int)gx, (int)gy, (int)gw, (int)gh);
+    for (int k = g_me_top; k >= 0 && KY(k) < gy + gh; --k) {
+        Color rc = g_theme.wave_bg;
+        if (me_black(k)) {                                 /* the rows of the black keys: a little darker/lighter */
+            int lum = (rc.r + rc.g + rc.b) / 3, d = lum > 128 ? -14 : 9;
+            rc.r = (unsigned char)(rc.r + d); rc.g = (unsigned char)(rc.g + d); rc.b = (unsigned char)(rc.b + d);
+        }
+        DrawRectangle((int)gx, (int)KY(k), (int)gw, (int)ceilf(g_me_kh), rc);
+        if (k % 12 == 0) DrawLine((int)gx, (int)(KY(k) + g_me_kh), (int)(gx + gw), (int)(KY(k) + g_me_kh), g_theme.grid_line);
+    }
+    /* 1.3.1: every second bar a little darker, and the lines of the chosen grid clearly visible (before, the 1/8 ..
+     * 1/32 lines were so faint that changing the grid looked like it did nothing). "Off" = beats only. */
+    for (double b = floor(g_me_b0 / 8.0) * 8.0 + 4.0; BX(b) < gx + gw; b += 8.0) {
+        if (b < 0) continue;
+        float x0 = BX(b), x1 = BX(b + 4.0);
+        if (x0 < gx) x0 = gx;
+        if (x1 > gx + gw) x1 = gx + gw;
+        if (x1 > x0) DrawRectangle((int)x0, (int)gy, (int)(x1 - x0), (int)gh, (Color){ 0, 0, 0, 22 });
+    }
+    float gstep = me_grid() > 0 ? me_grid() : 1.0f;
+    while (gstep * g_me_ppb < 5.0f) gstep *= 2.0f;
+    Color glc = me_grid_color();
+    double first = floor(g_me_b0 / gstep) * gstep;
+    for (double b = first; BX(b) < gx + gw; b += gstep) {
+        if (b < 0) continue;
+        bool bar = fmod(b + 1e-6, 4.0) < 2e-6, beat = fmod(b + 1e-6, 1.0) < 2e-6;
+        Color lc = glc;
+        lc.a = bar ? 255 : beat ? 170 : 110;
+        DrawLine((int)BX(b), (int)gy, (int)BX(b), (int)(gy + gh), lc);
+        if (bar) DrawLine((int)BX(b) + 1, (int)gy, (int)BX(b) + 1, (int)(gy + gh), lc);
+    }
+    if (BX(L) < gx + gw) DrawRectangle((int)BX(L), (int)gy, (int)(gx + gw - BX(L)) + 1, (int)gh, (Color){ 0, 0, 0, 110 });
+    if (g_me_pcur >= 0.0f && BX(g_me_pcur) >= gx && BX(g_me_pcur) < gx + gw) {   /* 1.3.2: where Ctrl+V pastes */
+        Color pc = g_theme.selection; pc.a = 170;
+        DrawLine((int)BX(g_me_pcur), (int)gy, (int)BX(g_me_pcur), (int)(gy + gh), pc);
+    }
+    /* the notes */
+    int hover_note = -1; bool hover_edge = false;
+    for (int i = 0; i < m->n; ++i) {
+        const MNote *q = &m->note[i];
+        float nx = BX(q->start), nw = q->len * g_me_ppb, ny = KY(q->key);
+        if (nx > gx + gw || nx + nw < gx || ny > gy + gh || ny + g_me_kh < gy) continue;
+        if (nw < 3) nw = 3;
+        Rectangle r = { nx, ny + 1, nw - 1, g_me_kh - 2 };
+        float a = 0.45f + 0.55f * q->vel / 127.0f;
+        Color c = col;
+        c.r = (unsigned char)(c.r * a); c.g = (unsigned char)(c.g * a); c.b = (unsigned char)(c.b * a);
+        if (q->start >= L) c.a = 90;
+        DrawRectangleRec(r, c);
+        DrawRectangleLinesEx(r, 1, q->sel ? g_theme.text : (Color){ (unsigned char)(col.r / 2), (unsigned char)(col.g / 2), (unsigned char)(col.b / 2), 255 });
+        if (q->sel) DrawRectangleLinesEx((Rectangle){ r.x - 1, r.y - 1, r.width + 2, r.height + 2 }, 1, g_theme.text);
+        if (uf && g_md == MD_NONE && CheckCollisionPointRec(mp, r)) {
+            hover_note = i;
+            hover_edge = r.width > 10 && mp.x > r.x + r.width - 6;
+        }
+    }
+    /* the playhead */
+    double ph = session_midi_playhead(s, ch, sc);
+    if (ph >= 0.0 && BX(ph) >= gx && BX(ph) <= gx + gw) DrawLine((int)BX(ph), (int)gy, (int)BX(ph), (int)(gy + gh), g_theme.text);
+    if (g_md == MD_BOX) {
+        Rectangle br = { fminf(g_md_p0.x, mp.x), fminf(g_md_p0.y, mp.y), fabsf(mp.x - g_md_p0.x), fabsf(mp.y - g_md_p0.y) };
+        Color bc = g_theme.selection; bc.a = 50;
+        DrawRectangleRec(br, bc);
+        DrawRectangleLinesEx(br, 1, g_theme.selection);
+    }
+    EndScissorMode();
+    if (hover_edge) SetMouseCursor(MOUSE_CURSOR_RESIZE_EW);
+
+    /* ---- the ruler ---- */
+    DrawRectangle((int)gx, (int)by, (int)gw, ME_RH, g_theme.panel_bg);
+    BeginScissorMode((int)gx, (int)by, (int)gw, ME_RH);
+    /* the numbers: bars ("3"), and when zoomed in also beats ("3.2") and sixteenths ("3.2.3") */
+    float bstep = 0.25f;
+    while (bstep * g_me_ppb < (bstep < 4.0f ? 40.0f : 34.0f)) bstep *= 2.0f;
+    for (double b = floor(g_me_b0 / bstep) * bstep; BX(b) < gx + gw; b += bstep) {
+        if (b < 0) continue;
+        long q16 = lround(b * 4.0);
+        int bar = (int)(q16 / 16) + 1, bt = (int)(q16 / 4 % 4) + 1, sx = (int)(q16 % 4) + 1;
+        char bn[24];
+        if (q16 % 16 == 0) snprintf(bn, sizeof bn, "%d", bar);
+        else if (q16 % 4 == 0) snprintf(bn, sizeof bn, "%d.%d", bar, bt);
+        else snprintf(bn, sizeof bn, "%d.%d.%d", bar, bt, sx);
+        bool major = q16 % 16 == 0;
+        DrawLine((int)BX(b), (int)by + (major ? 8 : 11), (int)BX(b), (int)by + ME_RH, g_theme.text_dim);
+        ui_text(bn, (int)BX(b) + 3, (int)by + 2, 10, major ? g_theme.text : g_theme.text_dim);
+    }
+    {   /* the end of the clip: a triangle to drag */
+        float ex = BX(L);
+        bool eh = uf && fabsf(mp.x - ex) < 7 && mp.y >= by && mp.y < by + ME_RH;
+        Color ec = (eh || g_md == MD_LEN) ? g_theme.text : g_theme.selection;
+        DrawTriangle((Vector2){ ex - 7, by + 2 }, (Vector2){ ex, by + ME_RH }, (Vector2){ ex, by + 2 }, ec);
+        if (eh) SetMouseCursor(MOUSE_CURSOR_RESIZE_EW);
+        if (eh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { g_md = MD_LEN; g_md_p0 = mp; }
+        /* 1.3.1: like the waveform - drag on the ruler (or the middle button anywhere in the notes): up/down = zoom
+         * around the place grabbed, left/right = move; double click on the ruler = play the clip from there */
+        static int    mz_btn = -1;
+        static float  mz_y0, mz_lastx, mz_ppb0, mz_rel;
+        static Vector2 mz_vm, mz_p0;                             /* 1.3.3: virtual mouse (the cursor is hidden) */
+        static bool   mz_fresh = false;
+        static double mz_anchor, mz_pan, rc_t = -10.0;
+        static float  rc_x = -1000.0f;
+        bool on_ruler = uf && !eh && g_md == MD_NONE && mp.x >= gx && mp.x < gx + gw && mp.y >= by && mp.y < by + ME_RH;
+        bool lp = on_ruler && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+        bool mpress = uf && g_md == MD_NONE && CheckCollisionPointRec(mp, (Rectangle){ gx, by, gw, bh }) && IsMouseButtonPressed(MOUSE_BUTTON_MIDDLE);
+        if (on_ruler) SetMouseCursor(MOUSE_CURSOR_RESIZE_EW);
+        if (lp) {
+            double now = GetTime();
+            if (now - rc_t < DOUBLE_CLICK_TIME && fabsf(mp.x - rc_x) < 6.0f) {
+                double b = g_me_b0 + (mp.x - gx) / g_me_ppb;
+                if (b >= 0.0 && b < L) session_midi_play_from(s, ch, sc, b);
+                rc_t = -10.0;
+            } else { rc_t = now; rc_x = mp.x; }
+        }
+        if (mz_btn < 0 && (lp || mpress)) {
+            mz_btn = lp ? MOUSE_BUTTON_LEFT : MOUSE_BUTTON_MIDDLE;
+            mz_vm = mp; mz_p0 = mp; mz_fresh = true;
+            mz_y0 = mp.y; mz_lastx = mp.x; mz_ppb0 = g_me_ppb;
+            mz_rel = mp.x - gx;
+            mz_anchor = g_me_b0 + mz_rel / g_me_ppb;
+            mz_pan = 0.0;
+        }
+        if (mz_btn >= 0) {
+            Vector2 md = GetMouseDelta();
+            if (!mz_fresh && IsMouseButtonDown(mz_btn)) {
+                mz_vm.x += md.x; mz_vm.y += md.y;
+                if (fabsf(mz_vm.x - mz_p0.x) + fabsf(mz_vm.y - mz_p0.y) > 3.0f) GfxMouseRelative(true);
+            }
+            mz_fresh = false;
+            Vector2 mp = mz_vm;                                  /* below: the virtual mouse */
+            if (!IsMouseButtonDown(mz_btn)) { mz_btn = -1; GfxMouseRelative(false); }
+            else {
+                float np = mz_ppb0 * expf((mz_y0 - mp.y) / 90.0f);      /* up = zoom in */
+                if (np < 4.0f) np = 4.0f;
+                if (np > 800.0f) np = 800.0f;
+                g_me_ppb = np;
+                mz_pan -= (double)(mp.x - mz_lastx) / g_me_ppb;          /* left = the view moves right */
+                mz_lastx = mp.x;
+                double want = mz_anchor - mz_rel / g_me_ppb + mz_pan;
+                double maxb = (double)L + 4.0 - (gw - 10) / g_me_ppb;
+                double cl2 = want > maxb ? maxb : want;
+                if (cl2 < 0.0) cl2 = 0.0;
+                mz_pan += cl2 - want;
+                g_me_b0 = cl2;
+                SetMouseCursor(MOUSE_CURSOR_RESIZE_EW);
+            }
+        }
+    }
+    if (ph >= 0.0) DrawRectangle((int)BX(ph) - 1, (int)by, 3, ME_RH, g_theme.text);
+    EndScissorMode();
+
+    /* ---- the keys ---- */
+    BeginScissorMode((int)x, (int)gy, ME_KW, (int)gh);
+    for (int k = g_me_top; k >= 0 && KY(k) < gy + gh; --k) {
+        bool blk = me_black(k);
+        Rectangle kr = { x, KY(k), blk ? ME_KW * 0.62f : (float)ME_KW, g_me_kh };
+        Color kc = blk ? (Color){ 30, 30, 34, 255 } : (Color){ 225, 225, 228, 255 };
+        if (g_me_pv_key == k) kc = col;
+        DrawRectangleRec(kr, kc);
+        DrawLine((int)x, (int)(KY(k) + g_me_kh), (int)(x + ME_KW), (int)(KY(k) + g_me_kh), (Color){ 120, 120, 120, 255 });
+        if (k % 12 == 0 && g_me_kh >= 8) {
+            char kn[8]; snprintf(kn, sizeof kn, "C%d", k / 12 - 2);   /* 60 = C3, as in Ableton and Bitwig */
+            ui_text(kn, (int)(x + ME_KW - ui_text_w(kn, 9) - 3), (int)(KY(k) + (g_me_kh - 9) / 2), 9, (Color){ 60, 60, 60, 255 });
+        }
+    }
+    EndScissorMode();
+    if (uf && CheckCollisionPointRec(mp, keys_r) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        int k = g_me_top - (int)((mp.y - gy) / g_me_kh);
+        me_preview(ch, k, 100);
+    }
+
+    /* ---- the velocity lane ---- */
+    if (vh > 0) {
+        float vy = gy + gh;
+        DrawRectangle((int)x, (int)vy, (int)w, (int)vh, g_theme.panel_bg);
+        ui_text("Vel", (int)x + 6, (int)(vy + vh / 2 - 6), 11, g_theme.text_dim);
+        BeginScissorMode((int)gx, (int)vy, (int)gw, (int)vh);
+        for (int i = 0; i < m->n; ++i) {
+            const MNote *q = &m->note[i];
+            float nx = BX(q->start);
+            if (nx < gx - 4 || nx > gx + gw) continue;
+            float hh = (vh - 6) * q->vel / 127.0f;
+            Color c = q->sel ? g_theme.text : col;
+            DrawRectangle((int)nx, (int)(vy + vh - 3 - hh), 3, (int)hh, c);
+            DrawRectangle((int)nx - 2, (int)(vy + vh - 3 - hh), 7, 2, c);
+        }
+        EndScissorMode();
+        if (uf && g_md == MD_NONE && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+            CheckCollisionPointRec(mp, (Rectangle){ gx, vy, gw, vh })) {
+            int best = -1; float bd = 6;
+            for (int i = 0; i < m->n; ++i) { float d = fabsf(BX(m->note[i].start) + 1 - mp.x); if (d < bd) { bd = d; best = i; } }
+            if (best >= 0) {
+                if (!m->note[best].sel) { me_select(s, m, best, !shift, true); m = session_midi_get(s, ch, sc); }
+                free(g_md_orig); g_md_orig = midiseq_dup(m, 0);
+                g_md = MD_VEL; g_md_p0 = mp; g_md_note = best;
+            }
+        }
+    }
+
+    /* ---- the mouse in the grid ---- */
+    bool in_grid = uf && CheckCollisionPointRec(mp, grid_r);
+    float mb = (float)(g_me_b0 + (mp.x - gx) / g_me_ppb);
+    int mk = g_me_top - (int)floorf((mp.y - gy) / g_me_kh);
+    if (in_grid && g_md == MD_NONE && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        double tnow = GetTime();
+        bool dbl = tnow - g_me_click_t < DOUBLE_CLICK_TIME && fabsf(mp.x - g_me_click_p.x) < 5 && fabsf(mp.y - g_me_click_p.y) < 5;
+        g_me_click_t = dbl ? 0 : tnow; g_me_click_p = mp;
+        if (dbl && hover_note >= 0) {                        /* double click on a note: delete it */
+            MidiSeq *n2 = midiseq_dup(m, 0);
+            if (n2) { memmove(&n2->note[hover_note], &n2->note[hover_note + 1], sizeof(MNote) * (size_t)(n2->n - hover_note - 1)); n2->n--; me_publish(s, n2); }
+        } else if (dbl && mk >= 0 && mk <= 127 && mb >= 0 && mb < L) {   /* double click on empty space: a new note */
+            MidiSeq *n2 = midiseq_dup(m, 1);
+            if (n2) {
+                for (int i = 0; i < n2->n; ++i) n2->note[i].sel = 0;
+                MNote *q = &n2->note[n2->n++];
+                q->start = me_snap_floor(mb); q->len = g_me_lastlen; q->key = (unsigned char)mk; q->vel = 100; q->sel = 1;
+                if (q->start + q->len > L) q->len = L - q->start;
+                if (q->len <= 0.0f) q->len = 0.0625f;
+                me_publish(s, n2);
+                me_preview(ch, mk, 100);
+            }
+        } else if (hover_note >= 0) {                        /* grab a note */
+            bool was = m->note[hover_note].sel != 0;
+            if (shift && was) { me_select(s, m, hover_note, false, false); }
+            else {
+                if (!was) { me_select(s, m, hover_note, !shift, true); m = session_midi_get(s, ch, sc); }
+                free(g_md_orig); g_md_orig = midiseq_dup(m, 0);
+                g_md = hover_edge ? MD_RESIZE : MD_MOVE;
+                g_md_copy = ctrl && g_md == MD_MOVE;             /* 1.3.2: Ctrl + drag = copy */
+                g_md_p0 = mp; g_md_lastdk = 0;
+                /* find the grabbed note again in the list (after the sort the index may differ) */
+                g_md_note = -1;
+                for (int i = 0; i < g_md_orig->n; ++i)
+                    if (g_md_orig->note[i].sel && fabsf(BX(g_md_orig->note[i].start) - BX(m->note[hover_note < m->n ? hover_note : 0].start)) < 0.5f &&
+                        g_md_orig->note[i].key == m->note[hover_note < m->n ? hover_note : 0].key) { g_md_note = i; break; }
+                if (g_md_note >= 0 && g_md == MD_MOVE) me_preview(ch, g_md_orig->note[g_md_note].key, g_md_orig->note[g_md_note].vel);
+            }
+        } else {                                             /* empty space: a selection box */
+            if (!shift && me_selected(m)) { me_select(s, m, -1, true, false); m = session_midi_get(s, ch, sc); }
+            g_md = MD_BOX; g_md_p0 = mp;
+            if (mb >= 0.0f) g_me_pcur = me_snap_floor(mb);      /* 1.3.2: Ctrl+V pastes here */
+        }
+    }
+
+    /* ---- dragging ---- */
+    if (g_md != MD_NONE) {
+        bool down = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        if (g_md == MD_MOVE && g_md_orig) {
+            /* 1.3.2: the grabbed note follows the mouse finely and sticks to a grid line near it (magnet) */
+            float a0 = g_md_note >= 0 ? g_md_orig->note[g_md_note].start : 0.0f;
+            float db = me_magnet(a0 + (mp.x - g_md_p0.x) / g_me_ppb, shift) - a0;
+            int dk = (int)roundf((g_md_p0.y - mp.y) / g_me_kh);
+            float minst = 1e9f; int mink = 127, maxk = 0;
+            for (int i = 0; i < g_md_orig->n; ++i) if (g_md_orig->note[i].sel) {
+                const MNote *q = &g_md_orig->note[i];
+                if (q->start < minst) minst = q->start;
+                if (q->key < mink) mink = q->key;
+                if (q->key > maxk) maxk = q->key;
+            }
+            if (minst + db < 0) db = -minst;
+            if (mink + dk < 0) dk = -mink;
+            if (maxk + dk > 127) dk = 127 - maxk;
+            int nsel = me_selected(g_md_orig);
+            bool cp = g_md_copy && (fabsf(db) > 1e-6f || dk != 0);   /* Ctrl: the copies move, the originals stay */
+            MidiSeq *n2 = midiseq_dup(g_md_orig, cp ? nsel : 0);
+            if (n2) {
+                int on = n2->n;
+                for (int i = 0; i < on; ++i) if (n2->note[i].sel) {
+                    MNote *q = &n2->note[i];
+                    if (cp) { if (n2->n < MIDI_MAX_NOTES) { n2->note[n2->n] = *q; q = &n2->note[n2->n++]; n2->note[i].sel = 0; } else continue; }
+                    q->start += db; q->key = (unsigned char)(q->key + dk);
+                }
+                me_publish(s, n2);
+            }
+            if (dk != g_md_lastdk && g_md_note >= 0) { g_md_lastdk = dk; me_preview(ch, g_md_orig->note[g_md_note].key + dk, g_md_orig->note[g_md_note].vel); }
+        } else if (g_md == MD_RESIZE && g_md_orig) {
+            float dl = (mp.x - g_md_p0.x) / g_me_ppb;
+            if (g_md_note >= 0) {                              /* 1.3.2: the end of the grabbed note: fine + magnet */
+                float e0 = g_md_orig->note[g_md_note].start + g_md_orig->note[g_md_note].len;
+                dl = me_magnet(e0 + dl, shift) - e0;
+            }
+            MidiSeq *n2 = midiseq_dup(g_md_orig, 0);
+            if (n2) {
+                float minlen = 1.0f / 64.0f;
+                for (int i = 0; i < n2->n; ++i) if (n2->note[i].sel) {
+                    MNote *q = &n2->note[i];
+                    float e = q->start + q->len + dl;
+                    q->len = e - q->start;
+                    if (q->len < minlen) q->len = minlen;
+                    if (i == g_md_note) g_me_lastlen = q->len;
+                }
+                me_publish(s, n2);
+            }
+        } else if (g_md == MD_VEL && g_md_orig) {
+            int dv = (int)roundf((g_md_p0.y - mp.y) * 127.0f / (vh > 0 ? vh : 36.0f));
+            MidiSeq *n2 = midiseq_dup(g_md_orig, 0);
+            if (n2) {
+                for (int i = 0; i < n2->n; ++i) if (n2->note[i].sel) {
+                    int v = n2->note[i].vel + dv;
+                    n2->note[i].vel = (unsigned char)(v < 1 ? 1 : v > 127 ? 127 : v);
+                }
+                me_publish(s, n2);
+            }
+        } else if (g_md == MD_LEN) {
+            float nl = roundf((float)(g_me_b0 + (mp.x - gx) / g_me_ppb));
+            if (nl < 1.0f) nl = 1.0f;
+            if (nl > 1024.0f) nl = 1024.0f;
+            if (nl != L) { MidiSeq *n2 = midiseq_dup(m, 0); if (n2) { n2->length = nl; me_publish(s, n2); } }
+        }
+        if (!down) {
+            if (g_md == MD_BOX) {
+                float b0 = (float)(g_me_b0 + (fminf(g_md_p0.x, mp.x) - gx) / g_me_ppb), b1 = (float)(g_me_b0 + (fmaxf(g_md_p0.x, mp.x) - gx) / g_me_ppb);
+                int k1 = g_me_top - (int)floorf((fminf(g_md_p0.y, mp.y) - gy) / g_me_kh);
+                int k0 = g_me_top - (int)floorf((fmaxf(g_md_p0.y, mp.y) - gy) / g_me_kh);
+                const MidiSeq *cur = session_midi_get(s, ch, sc);
+                MidiSeq *n2 = cur ? midiseq_dup(cur, 0) : NULL;
+                if (n2) {
+                    for (int i = 0; i < n2->n; ++i) {
+                        const MNote *q = &n2->note[i];
+                        if (q->start < b1 && q->start + q->len > b0 && q->key >= k0 && q->key <= k1) n2->note[i].sel = 1;
+                    }
+                    me_publish(s, n2);
+                }
+            }
+            g_md = MD_NONE; g_md_copy = false;
+            free(g_md_orig); g_md_orig = NULL;
+            me_preview_off();
+        }
+    }
+
+    /* ---- keys ---- */
+    if (g_me_focus && !g_ti_active) {
+        if (ctrl && IsKeyPressed(KEY_A)) {
+            MidiSeq *n2 = midiseq_dup(m, 0);
+            if (n2) { for (int i = 0; i < n2->n; ++i) n2->note[i].sel = 1; me_publish(s, n2); }
+        }
+        if (IsKeyPressed(KEY_ESCAPE) && me_selected(m)) me_select(s, m, -1, true, false);
+        if (ctrl && IsKeyPressed(KEY_U)) me_quantize(s);                  /* 1.3.2: like Ableton */
+    }
+#undef BX
+#undef KY
+}
+
+/* ===== 1.2: the device panel (like Bitwig) =====
+ * The channel name is selected -> in place of the waveform: the channel's plugins one next to another, each with its
+ * name, on/off, window button and knobs for its parameters (pages of 8). The first device of an instrument channel is
+ * the instrument. "+" at the end adds a plugin or an instrument. */
+#define DEV_CELL_W   62
+#define DEV_CELL_H   54
+#define DEV_HDR      20
+static float g_dev_scroll[MAX_CHANNELS];
+static int   g_dev_page[MAX_CHANNELS][MAX_CH_FX];
+static int   g_kd_ch = -1, g_kd_k = -1, g_kd_p = -1;       /* knob being dragged */
+static float g_kd_y0, g_kd_v0;
+
+/* 1.2: playing from the computer keyboard (like Ableton): A W S E D F T G Y H U J K O L P = C .. D#,
+ * Z / X = octave down / up, C / V = softer / harder */
+static bool g_ckeys = false;
+static int  g_ckeys_base = 60, g_ckeys_vel = 100;
+static int  g_ckeys_down[16] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+static void ckeys_release_all(void)
+{
+    for (int i = 0; i < 16; ++i)
+        if (g_ckeys_down[i] >= 0) { midiq_push(MIDIQ_UI, 0x80, (unsigned char)g_ckeys_down[i], 0); g_ckeys_down[i] = -1; }
+}
+bool ui_computer_keys_on(void) { return g_ckeys; }
+void ui_toggle_computer_keys(void)
+{
+    g_ckeys = !g_ckeys;
+    if (!g_ckeys) ckeys_release_all();
+    ui_flash_message(g_ckeys ? "Computer keys ON: A-K play notes, Z/X octave, C/V velocity" : "Computer keys OFF");
+}
+static void computer_keys(Session *s)
+{
+    (void)s;
+    if (!g_ckeys) return;
+    bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+    bool blocked = g_ti_active || g_ctx_open || g_fxp_ch >= 0 || g_audio_dlg_open || g_file_menu_open || dialogs_any_open() || ctrl;
+    static const int keys[16] = { KEY_A, KEY_W, KEY_S, KEY_E, KEY_D, KEY_F, KEY_T, KEY_G, KEY_Y, KEY_H, KEY_U, KEY_J,
+                                  KEY_K, KEY_O, KEY_L, KEY_P };
+    for (int i = 0; i < 16; ++i) {
+        if (!blocked && IsKeyPressed(keys[i]) && g_ckeys_down[i] < 0) {
+            int n = g_ckeys_base + i;
+            if (n >= 0 && n < 128) { midiq_push(MIDIQ_UI, 0x90, (unsigned char)n, (unsigned char)g_ckeys_vel); g_ckeys_down[i] = n; }
+        }
+        if (g_ckeys_down[i] >= 0 && !IsKeyDown(keys[i])) {
+            midiq_push(MIDIQ_UI, 0x80, (unsigned char)g_ckeys_down[i], 0);
+            g_ckeys_down[i] = -1;
+        }
+    }
+    if (blocked) return;
+    char msg[64];
+    if (IsKeyPressed(KEY_Z) && g_ckeys_base >= 12) { g_ckeys_base -= 12; snprintf(msg, sizeof msg, "Octave C%d", g_ckeys_base / 12 - 1); ui_flash_message(msg); }
+    if (IsKeyPressed(KEY_X) && g_ckeys_base <= 96) { g_ckeys_base += 12; snprintf(msg, sizeof msg, "Octave C%d", g_ckeys_base / 12 - 1); ui_flash_message(msg); }
+    if (IsKeyPressed(KEY_C) && g_ckeys_vel > 20) { g_ckeys_vel -= 20; snprintf(msg, sizeof msg, "Velocity %d", g_ckeys_vel); ui_flash_message(msg); }
+    if (IsKeyPressed(KEY_V) && g_ckeys_vel < 127) { g_ckeys_vel += 20; if (g_ckeys_vel > 127) g_ckeys_vel = 127; snprintf(msg, sizeof msg, "Velocity %d", g_ckeys_vel); ui_flash_message(msg); }
+}
+
+static int device_panel_channel(Session *s)
+{
+    if (!g_ch_focus || g_chsel_n != 1 || g_chsel_anchor < 0 || g_chsel_anchor >= s->channel_count) return -1;
+    return g_chsel_anchor;
+}
+
+static void draw_arc(Vector2 c, float r, float a0, float a1, float th, Color col)
+{
+    int seg = (int)(fabsf(a1 - a0) / 0.12f) + 1;
+    for (int i = 0; i < seg; ++i) {
+        float u0 = a0 + (a1 - a0) * i / seg, u1 = a0 + (a1 - a0) * (i + 1) / seg;
+        DrawLineEx((Vector2){ c.x + cosf(u0) * r, c.y + sinf(u0) * r }, (Vector2){ c.x + cosf(u1) * r, c.y + sinf(u1) * r }, th, col);
+    }
+}
+
+/* one knob: drag up/down (Shift = fine), mouse wheel */
+static void dev_knob(Session *s, int ch, int k, QPlug *qp, int pi, float x, float y, Color col, bool active)
+{
+    (void)s;
+    Vector2 m = GetMousePosition();
+    Rectangle cell = { x, y, DEV_CELL_W, DEV_CELL_H };
+    bool free = fx_ui_free();
+    bool hov = free && CheckCollisionPointRec(m, cell);
+    bool drag = g_kd_ch == ch && g_kd_k == k && g_kd_p == pi;
+    float v = qplug_param_get(qp, pi);
+    if (hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        g_kd_ch = ch; g_kd_k = k; g_kd_p = pi; g_kd_y0 = m.y; g_kd_v0 = v; drag = true;
+    }
+    if (drag) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            bool fine = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            float nv = g_kd_v0 + (g_kd_y0 - m.y) * (fine ? 0.001f : 0.006f);
+            if (nv < 0) nv = 0;
+            if (nv > 1) nv = 1;
+            if (fabsf(nv - v) > 1e-5f) { qplug_param_set(qp, pi, nv); v = nv; }
+            SetMouseCursor(MOUSE_CURSOR_RESIZE_NS);
+        } else { g_kd_ch = g_kd_k = g_kd_p = -1; drag = false; }
+    }
+    if (hov && !drag) {
+        float wh = GetMouseWheelMove();
+        if (wh != 0.0f) {
+            float nv = v + wh * ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.002f : 0.02f);
+            if (nv < 0) nv = 0;
+            if (nv > 1) nv = 1;
+            qplug_param_set(qp, pi, nv);
+            v = nv;
+        }
+    }
+    if (hov || drag) DrawRectangleRounded(cell, R_SMALL, g_theme.cell_hover);
+    Vector2 c = { x + DEV_CELL_W / 2.0f, y + 15 };
+    const float A0 = 2.356f, A1 = 7.069f, R = 11;               /* 135 deg .. 405 deg (a 270 deg arc) */
+    Color off = g_theme.grid_line;
+    draw_arc(c, R, A0, A1, 3, off);
+    Color on = active ? col : g_theme.text_dim;
+    if (v > 0.001f) draw_arc(c, R, A0, A0 + (A1 - A0) * v, 3, on);
+    float a = A0 + (A1 - A0) * v;
+    DrawLineEx(c, (Vector2){ c.x + cosf(a) * (R - 3), c.y + sinf(a) * (R - 3) }, 2, (hov || drag) ? g_theme.text : on);
+    char nm[64];
+    qplug_param_name(qp, pi, nm, sizeof nm);
+    while (ui_text_w(nm, 10) > DEV_CELL_W - 4 && strlen(nm) > 2) utf8_chop_last(nm);
+    int nw = ui_text_w(nm, 10);
+    ui_text(nm, (int)(x + (DEV_CELL_W - nw) / 2), (int)(y + 29), 10, active ? g_theme.text : g_theme.text_dim);
+    char val[64];
+    qplug_param_text(qp, pi, val, sizeof val);
+    while (ui_text_w(val, 10) > DEV_CELL_W - 4 && strlen(val) > 2) utf8_chop_last(val);
+    int vw = ui_text_w(val, 10);
+    ui_text(val, (int)(x + (DEV_CELL_W - vw) / 2), (int)(y + 41), 10, (hov || drag) ? g_theme.text : g_theme.text_dim);
+}
+
+static void draw_device_panel(Session *s, int ch, float x, float y, float w, float h)
+{
+    Channel *chp = &s->channels[ch];
+    Color col = channel_color(chp->color_id);
+    Vector2 m = GetMousePosition();
+    bool free = fx_ui_free();
+    /* header line: the channel, what it is, and who gets the MIDI keyboard */
+    DrawRectangle((int)x, (int)y, (int)w, WAVE_HDR_H, g_theme.panel_bg);
+    bool inst = fxchain_has_instrument(s, ch);
+    bool armed = inst && session_get_midi_target(s) == ch;
+    char hdr[320];
+    snprintf(hdr, sizeof hdr, "%s  |  %s  |  %d plugin%s", chp->name, inst ? "Instrument channel" : "Audio channel",
+             chp->fx_count, chp->fx_count == 1 ? "" : "s");
+    ui_text(hdr, (int)(x + 10), (int)(y + 4), 14, g_theme.text);
+    if (inst) {
+        const char *ml = armed ? "MIDI keyboard plays this channel" : "Click to play this channel from the MIDI keyboard";
+        int mw = ui_text_w(ml, 12);
+        Rectangle mr = { x + w - mw - 22, y + 2, (float)mw + 14, WAVE_HDR_H - 4 };
+        bool mh = free && !armed && CheckCollisionPointRec(m, mr);
+        if (armed) DrawRectangleRounded(mr, R_SMALL, col);
+        else DrawRectangleRoundedLines(mr, R_SMALL, 1, mh ? g_theme.text : g_theme.grid_line);
+        ui_text(ml, (int)(mr.x + 7), (int)(mr.y + 3), 12, armed ? ui_text_color_on(col) : (mh ? g_theme.text : g_theme.text_dim));
+        if (mh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) session_set_midi_target(s, ch);
+        /* the computer keyboard switch */
+        const char *kl = g_ckeys ? "Computer keys: ON  (A-K, Z/X octave)" : "Computer keys: OFF";
+        int kw = ui_text_w(kl, 12);
+        Rectangle kr = { mr.x - kw - 22, y + 2, (float)kw + 14, WAVE_HDR_H - 4 };
+        bool kh = free && CheckCollisionPointRec(m, kr);
+        if (g_ckeys) DrawRectangleRounded(kr, R_SMALL, g_theme.selection);
+        else DrawRectangleRoundedLines(kr, R_SMALL, 1, kh ? g_theme.text : g_theme.grid_line);
+        ui_text(kl, (int)(kr.x + 7), (int)(kr.y + 3), 12, g_ckeys ? g_theme.bg : (kh ? g_theme.text : g_theme.text_dim));
+        if (kh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) ui_toggle_computer_keys();
+    }
+    float by = y + WAVE_HDR_H, bh = h - WAVE_HDR_H;
+    DrawRectangle((int)x, (int)by, (int)w, (int)bh, g_theme.wave_bg);
+    int rows = (int)((bh - DEV_HDR - 8) / DEV_CELL_H);
+    if (rows < 1) rows = 1;
+    if (rows > 4) rows = 4;
+    int cols = rows == 1 ? 8 : 4;
+    int per_page = rows * cols;
+    float gap = 8;
+    float dwid[MAX_CH_FX];                            /* each device is as wide as its knobs (at least 170) */
+    float total = 120;
+    for (int k = 0; k < chp->fx_count; ++k) {
+        QPlug *q = fxchain_find(s, ch, k);
+        int np = q ? qplug_param_count(q) : 0;
+        int used = np < cols ? np : cols;
+        dwid[k] = used * DEV_CELL_W + 12;
+        if (dwid[k] < 170) dwid[k] = 170;
+        total += dwid[k] + gap;
+    }
+    float maxs = total - w; if (maxs < 0) maxs = 0;
+    if (free && CheckCollisionPointRec(m, (Rectangle){ x, by, w, bh }) && g_kd_ch < 0) {
+        float wh = GetMouseWheelMove();
+        bool over_knob = false;                     /* the wheel over a knob changes the knob, elsewhere it scrolls */
+        float fx0 = x + 6 - g_dev_scroll[ch];
+        for (int k = 0; k < chp->fx_count; ++k) {
+            Rectangle body = { fx0 + 6, by + 6 + DEV_HDR, dwid[k] - 12, rows * DEV_CELL_H };
+            if (CheckCollisionPointRec(m, body)) over_knob = true;
+            fx0 += dwid[k] + gap;
+        }
+        if (wh != 0.0f && !over_knob) g_dev_scroll[ch] -= wh * 60;
+    }
+    if (g_dev_scroll[ch] > maxs) g_dev_scroll[ch] = maxs;
+    if (g_dev_scroll[ch] < 0) g_dev_scroll[ch] = 0;
+    BeginScissorMode((int)x, (int)by, (int)w, (int)bh);
+    float dx = x + 6 - g_dev_scroll[ch];
+    for (int k = 0; k < chp->fx_count; dx += dwid[k] + gap, ++k) {
+        const ChFx *fx = &chp->fx[k];
+        float dev_w = dwid[k];
+        Rectangle box = { dx, by + 6, dev_w, bh - 12 };
+        if (box.x > x + w || box.x + box.width < x) continue;
+        QPlug *qp = fxchain_find(s, ch, k);
+        bool failed = !fx->bypass && fxchain_slot_failed(s, ch, k);
+        bool loading = !failed && fxchain_slot_loading(s, ch, k);
+        bool active = !fx->bypass && qp;
+        bool is_inst = qp && fxchain_slot_is_instrument(s, ch, k);
+        Color bg = g_theme.panel_bg;
+        DrawRectangleRounded(box, R_SMALL, bg);
+        DrawRectangleRoundedLines(box, R_SMALL, 1, qplug_editor_is_open(qp) ? col : g_theme.grid_line);
+        /* the device header: power | name | INST/format | page | window */
+        Rectangle hr = { box.x, box.y, box.width, DEV_HDR };
+        Color hb = active ? col : g_theme.panel_bg2;
+        hb.a = active ? 70 : 255;
+        DrawRectangleRounded(hr, R_SMALL, hb);
+        Vector2 pc = { hr.x + 11, hr.y + DEV_HDR / 2.0f };
+        Rectangle pwr = { hr.x + 2, hr.y, 18, DEV_HDR };
+        bool pwh = free && CheckCollisionPointRec(m, pwr);
+        if (fx->bypass) DrawCircleLines((int)pc.x, (int)pc.y, 5, pwh ? g_theme.text : g_theme.text_dim);
+        else DrawCircleV(pc, 5, pwh ? g_theme.text : col);
+        if (pwh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) session_fx_toggle_bypass(s, ch, k);
+        /* window button */
+        Rectangle wb = { hr.x + hr.width - 22, hr.y + 3, 18, DEV_HDR - 6 };
+        bool has_ed = qp && qplug_has_editor(qp);
+        bool wbh = free && has_ed && CheckCollisionPointRec(m, wb);
+        if (has_ed) {
+            DrawRectangleLinesEx(wb, 1, wbh ? g_theme.text : g_theme.text_dim);
+            DrawRectangle((int)wb.x, (int)wb.y, (int)wb.width, 3, wbh ? g_theme.text : g_theme.text_dim);
+            if (wbh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) fx_open_window(s, ch, k);
+        }
+        int np = qp ? qplug_param_count(qp) : 0;
+        int pages = np > 0 ? (np + per_page - 1) / per_page : 1;
+        int *pg = &g_dev_page[ch][k];
+        if (*pg >= pages) *pg = pages - 1;
+        if (*pg < 0) *pg = 0;
+        float right = wb.x - 4;
+        if (pages > 1) {                                  /* < 2/5 > */
+            char pl[24]; snprintf(pl, sizeof pl, "%d/%d", *pg + 1, pages);
+            int plw = ui_text_w(pl, 10);
+            Rectangle nx = { right - 12, hr.y + 2, 12, DEV_HDR - 4 };
+            Rectangle pv = { right - 12 - plw - 16, hr.y + 2, 12, DEV_HDR - 4 };
+            bool nh = free && CheckCollisionPointRec(m, nx), ph = free && CheckCollisionPointRec(m, pv);
+            float cy = hr.y + DEV_HDR / 2.0f;
+            DrawTriangle((Vector2){ nx.x + 3, cy - 4 }, (Vector2){ nx.x + 3, cy + 4 }, (Vector2){ nx.x + 9, cy }, nh ? g_theme.text : g_theme.text_dim);
+            DrawTriangle((Vector2){ pv.x + 9, cy - 4 }, (Vector2){ pv.x + 3, cy }, (Vector2){ pv.x + 9, cy + 4 }, ph ? g_theme.text : g_theme.text_dim);
+            ui_text(pl, (int)(pv.x + 14), (int)(hr.y + 5), 10, g_theme.text_dim);
+            if (nh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) *pg = (*pg + 1) % pages;
+            if (ph && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) *pg = (*pg + pages - 1) % pages;
+            right = pv.x - 4;
+        }
+        const char *tag = failed ? "ERROR" : loading ? "starting..." : is_inst ? "INST" : plugins_fmt_name(plugins_fmt_index(fx->fmt));
+        int tgw = ui_text_w(tag, 9);
+        ui_text(tag, (int)(right - tgw), (int)hr.y + 6, 9, failed ? FX_FAIL_COL : (is_inst ? g_theme.text : g_theme.text_dim));
+        char nm[96]; snprintf(nm, sizeof nm, "%s", fx->name);
+        float maxw = right - tgw - 6 - (hr.x + 22);
+        while (ui_text_w(nm, 12) > maxw && strlen(nm) > 2) utf8_chop_last(nm);
+        ui_text(nm, (int)hr.x + 22, (int)hr.y + 3, 12, active ? g_theme.text : g_theme.text_dim);
+        /* right click on the header: the slot menu (open window / bypass / remove) */
+        if (free && CheckCollisionPointRec(m, hr) && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            g_fxm_ch = ch; g_fxm_idx = k; g_fxm_pos = m; g_fxm_just = true;
+        }
+        /* double click on the name: the plugin's own window */
+        if (free && CheckCollisionPointRec(m, (Rectangle){ hr.x + 22, hr.y, maxw, DEV_HDR }) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            double t = GetTime();
+            if (g_fx_click_ch == ch && g_fx_click_k == k && t - g_fx_click_t < 0.4) { fx_open_window(s, ch, k); g_fx_click_t = -1; }
+            else { g_fx_click_t = t; g_fx_click_ch = ch; g_fx_click_k = k; }
+        }
+        /* the knobs */
+        float ky = box.y + DEV_HDR + 4;
+        if (!qp) {
+            const char *msg = failed ? "Could not load this plugin" : loading ? "Starting..." : fx->bypass ? "Off" : "Loading...";
+            ui_text(msg, (int)box.x + 10, (int)ky + 10, 12, failed ? FX_FAIL_COL : g_theme.text_dim);
+        } else if (np == 0) {
+            ui_text("No parameters", (int)box.x + 10, (int)ky + 10, 12, g_theme.text_dim);
+            if (has_ed) ui_text("open its window", (int)box.x + 10, (int)ky + 26, 11, g_theme.text_dim);
+        } else {
+            for (int i = 0; i < per_page; ++i) {
+                int pi = *pg * per_page + i;
+                if (pi >= np) break;
+                float kx = box.x + 6 + (i % cols) * DEV_CELL_W;
+                float kyy = ky + (i / cols) * DEV_CELL_H;
+                dev_knob(s, ch, k, qp, pi, kx, kyy, col, active);
+            }
+        }
+    }
+    /* "+": add a plugin / an instrument */
+    if (chp->fx_count < MAX_CH_FX) {
+        Rectangle pr = { dx, by + 6, 100, bh - 12 };
+        bool ph = free && CheckCollisionPointRec(m, pr);
+        DrawRectangleRounded(pr, R_SMALL, ph ? g_theme.cell_hover : g_theme.panel_bg);
+        DrawRectangleRoundedLines(pr, R_SMALL, 1, ph ? col : g_theme.grid_line);
+        int pw = ui_text_w("+", 24);
+        ui_text("+", (int)(pr.x + (pr.width - pw) / 2), (int)(pr.y + pr.height / 2 - 20), 24, ph ? g_theme.text : g_theme.text_dim);
+        const char *l1 = chp->fx_count == 0 ? "Add instrument" : "Add plugin";
+        int l1w = ui_text_w(l1, 10);
+        ui_text(l1, (int)(pr.x + (pr.width - l1w) / 2), (int)(pr.y + pr.height / 2 + 8), 10, g_theme.text_dim);
+        if (chp->fx_count == 0) {
+            int l2w = ui_text_w("or effect", 10);
+            ui_text("or effect", (int)(pr.x + (pr.width - l2w) / 2), (int)(pr.y + pr.height / 2 + 20), 10, g_theme.text_dim);
+        }
+        if (ph && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            g_fxp_ch = ch; g_fxp_pos = (Vector2){ pr.x, pr.y + 10 }; g_fxp_filter[0] = 0; g_fxp_scroll = 0; g_fxp_just = true;
+            plugins_count();
+        }
+    }
+    EndScissorMode();
+    if (total > w) {                                      /* a thin scroll bar */
+        float tw = w * w / total, tx = x + (w - tw) * (g_dev_scroll[ch] / (maxs > 0 ? maxs : 1));
+        DrawRectangle((int)tx, (int)(y + h - 3), (int)tw, 3, g_theme.text_dim);
+    }
+}
+
 static void draw_waveform_zone(Session *s,
                                float x, float y, float w, float h)
 {
     if (h < WAVEFORM_MIN_H) return;
+    {
+        int dch = device_panel_channel(s);                 /* 1.2: a selected channel -> its devices */
+        if (dch >= 0) { draw_device_panel(s, dch, x, y, w, h); return; }
+        if (g_selected_ch >= 0 && g_selected_scene >= 0 && session_is_midi(s, g_selected_ch, g_selected_scene)) {
+            draw_midi_editor(s, g_selected_ch, g_selected_scene, x, y, w, h);   /* 1.3: a MIDI clip -> the piano roll */
+            return;
+        }
+        g_me_focus = false;
+    }
 
     DrawRectangle((int)x, (int)y, (int)w, WAVE_HDR_H, g_theme.panel_bg);
 
@@ -4614,6 +6068,10 @@ static void draw_waveform_zone(Session *s,
     static float  zd_start_y = 0.0f, zd_last_x = 0.0f, zd_start_zoom = 1.0f, zd_ratio = 0.0f;
     static double zd_anchor = 0.0, zd_pan = 0.0;
     static float  zd_start_sec = 8.0f;
+    static Vector2 zd_p0;
+    static bool   zd_fresh = false;
+    static Vector2 zd_vm;          /* 1.3.3: a "virtual" mouse made of the movements: the cursor is hidden while
+                                    * dragging and does not stop at the screen edge; it comes back where it was */
 
     bool can_start = !g_ctx_open && !g_ti_active && !g_audio_dlg_open && g_dragging_loop_marker == 0;
     bool start_left   = click_ruler && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
@@ -4641,6 +6099,7 @@ static void draw_waveform_zone(Session *s,
     if (can_start && !zoom_dragging && (start_left || start_middle)) {
         zoom_dragging = true;
         zoom_btn = start_left ? MOUSE_BUTTON_LEFT : MOUSE_BUTTON_MIDDLE;
+        zd_vm = mouse; zd_p0 = mouse; zd_fresh = true;
         zd_start_y = mouse.y;
         zd_last_x = mouse.x;
         zd_start_zoom = zoom;
@@ -4654,8 +6113,18 @@ static void draw_waveform_zone(Session *s,
     }
 
     if (zoom_dragging) {
+        Vector2 md = GetMouseDelta();
+        if (!zd_fresh && !(IsMouseButtonReleased(zoom_btn) || !IsMouseButtonDown(zoom_btn))) {
+            zd_vm.x += md.x; zd_vm.y += md.y;
+            if (fabsf(zd_vm.x - zd_p0.x) + fabsf(zd_vm.y - zd_p0.y) > 3.0f) GfxMouseRelative(true);
+        }
+        zd_fresh = false;
+    }
+    if (zoom_dragging) {
+        Vector2 mouse = zd_vm;                       /* 1.3.3: below, "mouse" = the virtual mouse */
         if (IsMouseButtonReleased(zoom_btn) || !IsMouseButtonDown(zoom_btn)) {
             zoom_dragging = false;
+            GfxMouseRelative(false);                 /* the cursor appears again where the drag started */
         } else if (g_wave_follow) {                  /* follow: up/down = fewer/more seconds */
             float dy = zd_start_y - mouse.y;
             float sec = zd_start_sec * expf(-dy / 90.0f);
@@ -5264,7 +6733,8 @@ static int ctx_menu_build(Session *s, CtxItem *items, int max_items)
         break;
 
     case CTX_CLIP:
-        if (s && g_ctx_ch >= 0 && g_ctx_scene >= 0 && !session_is_note(s, g_ctx_ch, g_ctx_scene)) {
+        if (s && g_ctx_ch >= 0 && g_ctx_scene >= 0 && !session_is_note(s, g_ctx_ch, g_ctx_scene) &&
+            !session_is_midi(s, g_ctx_ch, g_ctx_scene)) {          /* (1.3: the queue is for audio clips) */
             /* queue: makes sense only while something is playing */
             items[n++] = (CtxItem){ session_any_playing(s) ? "Add to queue" : "Add to queue (nothing playing)",
                                     UI_ACTION_ADD_QUEUE, session_any_playing(s), false };
@@ -5280,11 +6750,14 @@ static int ctx_menu_build(Session *s, CtxItem *items, int max_items)
         items[n++] = (CtxItem){ "Paste", UI_ACTION_PASTE, g_clip_has, false };
         break;
 
-    case CTX_EMPTY:
+    case CTX_EMPTY: {
+        bool inst = s && g_ctx_ch >= 0 && fxchain_has_instrument(s, g_ctx_ch);   /* 1.3 */
+        items[n++] = (CtxItem){ inst ? "New MIDI clip" : "New MIDI clip (add an instrument first)", UI_ACTION_NEW_MIDI, inst, false };
         items[n++] = (CtxItem){ "New Note", UI_ACTION_NEW_NOTE, true, false };
         items[n++] = (CtxItem){ NULL, UI_ACTION_NONE, false, true };
         items[n++] = (CtxItem){ "Paste", UI_ACTION_PASTE, g_clip_has, false };
         break;
+    }
 
     case CTX_SCENE:
         items[n++] = (CtxItem){ "Delete Scene", UI_ACTION_DELETE_SCENE, true, false };
@@ -5402,6 +6875,15 @@ static void ctx_menu_draw(Session *s, int screen_w, int screen_h)
     if (clicked_index >= 0) {
         CtxItem *it = &items[clicked_index];
 
+        if (it->action == UI_ACTION_NEW_MIDI) {               /* 1.3: an empty MIDI clip of 1 bar, opened in the editor */
+            if (s && session_new_midi_clip(s, g_ctx_ch, g_ctx_scene, 4.0f, "MIDI") == 0) {
+                g_selected_ch = g_ctx_ch; g_selected_scene = g_ctx_scene;
+                g_ch_focus = false; chsel_clear();
+                ui_flash_message("New MIDI clip - double click in the editor below to add notes");
+            }
+            ctx_menu_close();
+            return;
+        }
         if (it->action == UI_ACTION_ADD_QUEUE) {
             if (s && session_queue_add(s, g_ctx_ch, g_ctx_scene)) {
                 char m[64];
@@ -8057,7 +9539,9 @@ static void ui_draw_world(Session *s)
         /* width handle: the right edge of the header (and a bit of the gap) */
         Rectangle grip = { cx + cwid - GAP - 6, grid_top, 6 + GAP, CLIP_HEADER_H };
         bool over_grip = free_ui && g_chres_ch < 0 && CheckCollisionPointRec(mouse, grip) && mouse.x < hdr_right;
-        if (free_ui &&
+        float btns = (cwid - GAP > 60 ? 24.0f : 0.0f) + (fxchain_has_instrument(s, c) && cwid - GAP > 82 ? 26.0f : 0.0f);   /* 1.4 */
+        bool on_btns = mouse.x > hdr_rect.x + hdr_rect.width - btns;
+        if (free_ui && !on_btns &&
             CheckCollisionPointRec(mouse, hdr_rect) &&
             IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && !g_midi_learn_mode) {
             if (!g_chsel[c]) chsel_only(c);                  /* step 36: right click selects the channel (several selected ones stay) */
@@ -8067,7 +9551,7 @@ static void ui_draw_world(Session *s)
                           (int)mouse.x, (int)mouse.y);
         }
         /* step 36: click on the header = selects the channel; drag = move */
-        if (free_ui && !over_grip && g_chres_ch < 0 && CheckCollisionPointRec(mouse, hdr_rect) &&
+        if (free_ui && !over_grip && !on_btns && g_chres_ch < 0 && CheckCollisionPointRec(mouse, hdr_rect) &&
             IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !g_midi_learn_mode && !g_drag_active) {
             chsel_only(c);
             cmark_clear();
@@ -8429,11 +9913,14 @@ static void ui_draw_world(Session *s)
     draw_route_popup(s);
     draw_edit_menu(s);
     draw_fx_slot_menu(s);
+    draw_rec_input_menu(s);                       /* 1.4 */
     draw_fx_picker(s);
     if (g_ti_active && g_ti_inline && xf_edit) {
         ui_text_input_update();
         ui_text_input_draw(screen_w, screen_h);
     }
+    /* 1.3.3: no button held -> the cursor is always visible again (whatever started the hidden dragging) */
+    if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_MIDDLE)) GfxMouseRelative(false);
     if (g_vf_id != 0 && !IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         if (g_vf_moved) GfxMouseRelative(false);
         g_vf_id = 0;
@@ -8462,9 +9949,35 @@ static void ui_draw_backdrop_world(Session *s)
     GfxInputSuppress(false);
 }
 
+/* 1.2: the MIDI keyboard follows the selection (like "auto-arm" in Ableton): selecting an instrument channel
+ * (its name or one of its clips) makes the keyboard play it. Selecting a channel without an instrument keeps the
+ * last one, so you can launch clips while you play. */
+static void midi_target_follow(Session *s)
+{
+    static int last = -2;
+    int cur = (g_ch_focus && g_chsel_anchor >= 0) ? g_chsel_anchor : g_selected_ch;
+    if (cur >= s->channel_count) cur = -1;
+    int tgt = session_get_midi_target(s);
+    if (tgt >= 0 && !fxchain_has_instrument(s, tgt) && !fxchain_slot_loading(s, tgt, 0)) {
+        bool any_row = tgt < s->channel_count && s->channels[tgt].fx_count > 0;
+        if (!any_row) { session_set_midi_target(s, -1); tgt = -1; }
+    }
+    bool has = cur >= 0 && fxchain_has_instrument(s, cur);
+    if ((cur != last && has) || (tgt < 0 && has)) session_set_midi_target(s, cur);
+    last = cur;
+}
+
 void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
 {
     g_ui_session = s;
+    midi_target_follow(s);
+    {   /* 1.4: the input of the card is needed only while a channel is armed (PipeWire opens it then) */
+        static int last = -1;
+        int any = 0;
+        for (int c = 0; c < s->channel_count && !any; ++c) any = session_is_armed(s, c);
+        if (any != last) { audio_input_want(any != 0); last = any; }
+    }
+    computer_keys(s);
     if (out_sel_ch)    *out_sel_ch = g_selected_ch;
     if (out_sel_scene) *out_sel_scene = g_selected_scene;
 

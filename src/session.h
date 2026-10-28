@@ -55,6 +55,12 @@ typedef enum { BTN_LEARN_NONE = 0, BTN_LEARN_MUTE, BTN_LEARN_SOLO, BTN_LEARN_CLI
 /* Maximum length of a clip/note/channel name IN BYTES (Cyrillic is 2 bytes per letter). */
 #define NAME_LEN 256
 
+/* 1.3: a MIDI clip = notes in beats. A published MidiSeq is never changed: an edit makes a new one and swaps the
+ * pointer (the audio thread may be reading the old one; it is freed a few audio blocks later). */
+typedef struct { float start, len; unsigned char key, vel, sel; } MNote;   /* sel: the editor's selection (not saved) */
+typedef struct MidiSeq { float length; int n; MNote note[]; } MidiSeq;   /* length in beats; notes sorted by start */
+#define MIDI_MAX_NOTES 20000
+
 typedef struct {
     WavFile        wav;            // metadata only (frame_count, sample_rate); samples == NULL
     ClipStream    *stream;         // streaming from disk
@@ -104,11 +110,36 @@ typedef struct {
     atomic_int     xf_dir;             // 0 = none, +1 = coming in (fade in), -1 = going out (fade out)
     long           xf_len, xf_pos;     // audio thread only: length and position of the transition (frames; pos<0 = not started yet)
     unsigned       xf_gen;             // stretch_gen at the start (a manual start/seek cancels it)
+    _Atomic float  xf_vis;             // 1.0.5: the crossfade gain right now (for the "ghost" fader), valid when xf_vis_on
+    atomic_bool    xf_vis_on;          // 1.0.5: true only while the crossfade is really moving
+    // --- 1.1: quantized launch ---
+    atomic_int     ql_state;           // 0 = nothing, 1 = launch, 2 = stop, 3 = restart - at the beat ql_beat
+    _Atomic double ql_beat;
+    atomic_bool    ql_restart_now;     // audio thread -> UI: restart this playing clip now (from the start)
+    atomic_bool    ql_stopped;         // the audio thread stopped it -> the UI finishes the stop (stream)
     atomic_size_t  aud_end;            // how far it really sounds (without the silence at the end); 0 = unknown
     unsigned       stretch_seen;       // audio thread only: the last stretch_gen seen
     bool           stretch_live;       // audio thread only: the stretch is in use (otherwise -> reset)
+    // --- warp switched on/off while playing (1.0.5): fade the old sound out, the new one in (no click) ---
+    bool           wsw_init;           // audio thread only: wsw_warp is valid
+    bool           wsw_warp;           // audio thread only: which path was heard in the previous block
+    bool           wsw_wait;           // audio thread only: waiting for the stretch's first sound, then fade it in
+    unsigned       wsw_fadein;         // audio thread only: remaining frames of that fade-in
+    unsigned       wsw_blocks;         // audio thread only: blocks waited for the first sound (safety limit)
 
     int            color;              // notes only: 0 = default colour, 1..N_PALETTE = palette colour + 1
+
+    // --- 1.3: MIDI clip (has_clip + is_midi, no stream) ---
+    atomic_bool    is_midi;
+    _Atomic(MidiSeq *) mseq;           // the notes (see MidiSeq)
+    _Atomic double mpos_vis;           // the playhead in beats (for the editor); written by the audio thread
+    atomic_uint    m_gen;              // +1 = start from the beginning (the audio thread resets its position)
+    _Atomic double m_seek;             // 1.3.1: the beat a start with generation m_seek_gen begins at (play from here)
+    atomic_uint    m_seek_gen;
+    double         mpos;               // audio thread only: the position in beats
+    unsigned       m_gen_seen;         // audio thread only
+    bool           m_live;             // audio thread only: it was playing in the previous block
+    float          m_off[128];         // audio thread only: when a sounding key ends (beats of the clip); <0 = silent
 
     char           name[NAME_LEN];
     char           path[1024];
@@ -149,6 +180,12 @@ typedef struct {
     _Atomic int    pan_midi_cc;
     atomic_bool    pan_midi_learn_armed;
 
+    // --- 1.4: recording ---
+    atomic_bool    armed;              // the record button of the channel (an empty cell then records)
+    atomic_int     rec_in_first;       // the first input of the sound card it records (0 = input 1)
+    atomic_bool    rec_in_stereo;      // two inputs (first, first+1) or one (mono, copied to L and R)
+    atomic_bool    monitor;            // the input is heard through the channel (and its plugins) while armed
+
     _Atomic int    mute_bind;          // MIDI button for Mute (0 = none)
     _Atomic int    solo_bind;          // MIDI button for Solo (0 = none)
 
@@ -159,6 +196,40 @@ typedef struct {
     ChFx           fx[MAX_CH_FX];
     _Atomic(struct FxChain *) fxchain; // the loaded plugins (step 34): written by fxchain_sync, read by the mixer
 } Channel;
+
+/* 1.4: one recording into a cell (audio from the sound card's input, or the MIDI notes played on an instrument channel).
+ * The UI starts and stops it; the audio thread does it exactly on the beat (launch quantization) and passes the audio /
+ * the notes through lock-free rings; the UI writes the file / builds the notes and, at the end, makes it a clip that
+ * goes on playing (looped) in time. */
+#define MAX_REC 8
+#define REC_RING_FRAMES (1u << 20)          /* ~21 s at 48 kHz between two UI frames - plenty */
+#define REC_MEV 2048
+enum { REC_IDLE = 0, REC_WAIT, REC_ON, REC_STOPPING, REC_DONE };
+typedef struct { double beat; unsigned char m[3]; } RecEv;
+typedef struct {
+    atomic_int     state;
+    int            ch, sc;
+    bool           midi;               // MIDI notes (instrument channel) or audio
+    _Atomic double start_beat;         // the beat it starts at (-1 = at once)
+    _Atomic double stop_beat;          // the beat it stops at (-1 = at once), valid in REC_STOPPING
+    int            in_first, in_count; // audio: which inputs
+    unsigned       latency;            // audio: frames to skip at the start / record after the stop (the delay of the card)
+    /* audio thread only */
+    double         beat0;              // the transport beat of the first frame
+    unsigned       skip, tail;
+    bool           stopped_at;         // the stop boundary has passed (now only the tail)
+    /* audio thread -> UI */
+    _Atomic double rec_beats;          // how long it has recorded (beats) - for the cell
+    atomic_ullong  frames;             // audio: frames put into the ring so far
+    atomic_ullong  after;              // frames since the stop boundary (the clip then starts in time)
+    atomic_bool    overflow;           // the ring was full (the UI did not keep up) - some audio is lost
+    _Atomic double final_beats;        // the length (beats) once it is DONE
+    float         *ring;               // audio: REC_RING_FRAMES * 2 floats (UI allocates)
+    atomic_uint    rw, rr;
+    RecEv          mev[REC_MEV];       // MIDI: the played messages with their beat (from the start)
+    atomic_uint    mw, mr;
+    void          *ui;                 // UI thread: the writer (file) / the notes being built
+} RecSlot;
 
 typedef struct {
     Channel        channels[MAX_CHANNELS];
@@ -194,7 +265,15 @@ typedef struct {
     atomic_int     btn_learn_ch;
     atomic_int     btn_learn_scene;
 
-    _Atomic float  tempo;              // project BPM (kept in the project; no longer shown)
+    _Atomic float  tempo;              // 1.1: the master BPM (top bar); clips with WARP on play at this tempo
+    // --- 1.1: launch quantization (like "Global Quantization" in Ableton/Bitwig) ---
+    _Atomic float  quant_beats;        // a clip launched while something plays waits for the next multiple of this many beats (0 = at once)
+    _Atomic double tp_beats;           // transport position in beats (from the first launched clip); written by the audio thread
+    atomic_bool    tp_running;         // the transport runs (from the first launched clip until everything stops)
+    atomic_bool    metronome;          // 1.3.1: clicks on every beat while the transport runs (accent on the 1st beat of the bar)
+    _Atomic double tp_start;           // 1.3.1: when the transport starts next, it starts at this beat (play from a beat)
+    atomic_bool    tp_reset;           // UI -> audio thread: start counting from 0 (a launch with nothing playing)
+    atomic_int     ql_pending;         // how many clips wait for a quantized launch/stop/restart (0 = the audio thread skips the scan)
 
     // --- Queue: clips that start one after another ---
     // Owned by the UI thread; the audio thread sees only q_anchor/q_next and starts q_next exactly when q_anchor ends.
@@ -208,6 +287,16 @@ typedef struct {
 
     // true = files with a different sample rate are converted into the cache; false (default) = they play as they are
     atomic_bool    convert_files;
+
+    // --- 1.2: playing instruments (see midiq.h) ---
+    atomic_int     midi_target;        // the channel the MIDI keyboard plays (the selected instrument channel), -1 = none
+    atomic_uint    midi_bound[4];      // notes 0..127 bound to buttons/clips (they do not play the instrument)
+    atomic_bool    midi_block;         // a "learn" is waiting: notes are not played
+    atomic_bool    midi_panic;         // UI -> audio: all notes off on every instrument
+
+    // --- 1.4: recording ---
+    RecSlot        rec[MAX_REC];
+    atomic_int     rec_active;         // how many slots are not IDLE (0 = the audio thread skips them)
 } Session;
 
 // --- Lifecycle ---
@@ -265,6 +354,8 @@ void session_clear_clip(Session *s, int ch, int scene);
 void session_toggle_clip(Session *s, int ch, int scene);
 // Plays the clip from a given frame (the Start marker is not touched). If it is already playing - only seeks there.
 void session_play_clip_from(Session *s, int ch, int scene, size_t frame);
+/* 1.3.1: a MIDI clip plays (at once) from this beat - the double click on the ruler of the MIDI editor */
+void session_midi_play_from(Session *s, int ch, int scene, double beat);
 void session_seek_clip(Session *s, int ch, int scene, size_t frame);
 void session_move_clip(Session *s,
                        int src_ch, int src_scene,
@@ -282,6 +373,30 @@ int  session_get_note_color(Session *s, int ch, int scene);
 void session_set_channel_width(Session *s, int ch, int width);              // 0 = default
 int  session_get_channel_width(Session *s, int ch);                         // always CH_WIDTH_MIN..CH_WIDTH_MAX
 bool session_is_note(Session *s, int ch, int scene);
+/* 1.3: MIDI clips */
+int  session_new_midi_clip(Session *s, int ch, int scene, float len_beats, const char *name);  /* 0 = ok */
+bool session_is_midi(Session *s, int ch, int scene);
+const MidiSeq *session_midi_get(Session *s, int ch, int scene);       /* main thread: read the current notes */
+void session_midi_set(Session *s, int ch, int scene, MidiSeq *seq);   /* main thread: takes ownership, publishes */
+MidiSeq *midiseq_new(int n, float length);                            /* n notes (uninitialized), malloc */
+MidiSeq *midiseq_dup(const MidiSeq *m, int extra);                    /* a copy with room for 'extra' more notes */
+void     midiseq_sort(MidiSeq *m);                                    /* by start, then key */
+char *session_midi_text(Session *s, int ch, int scene);               /* malloc: "midi_len=..\nmn=..\n" (project/undo) */
+int   session_midi_set_text(Session *s, int ch, int scene, const char *text);   /* makes the cell a MIDI clip */
+MidiSeq *midiseq_from_text(const char *text);                         /* NULL = no midi_len line */
+double session_midi_playhead(Session *s, int ch, int scene);          /* beats, -1 = not playing */
+void session_midi_reap(Session *s);                                   /* main thread: frees old MidiSeqs (every frame) */
+/* 1.4: recording (main thread) */
+void session_toggle_arm(Session *s, int ch);
+bool session_is_armed(Session *s, int ch);
+void session_set_rec_input(Session *s, int ch, int first, bool stereo);
+void session_set_monitor(Session *s, int ch, bool on);
+/* a click on a cell of an armed channel: starts recording into it (empty cell) or stops the recording there.
+ * wav_path: the file to record into (audio); latency: frames of the card's round trip. 0 = ok */
+int  session_rec_cell(Session *s, int ch, int scene, bool midi, const char *wav_path, unsigned latency, char *err, int esz);
+int  session_rec_state(Session *s, int ch, int scene, double *beats);   /* REC_* of that cell (REC_IDLE = none) */
+void session_rec_tick(Session *s);                       /* every frame: writes the file / the notes, finishes */
+void session_rec_stop_all(Session *s);                   /* stop every recording at once (e.g. Stop all) */
 
 // --- Delete ---
 void session_delete_channel(Session *s, int ch);
@@ -351,6 +466,8 @@ void session_set_solo_bind(Session *s, int ch, int bind);
 // Plugins on the channel (step 33). add returns the index or -1 (no room).
 int  session_fx_add(Session *s, int ch, const char *fmt, const char *name, const char *path);
 void session_fx_remove(Session *s, int ch, int idx);
+int  session_fx_insert(Session *s, int ch, int pos, const char *fmt, const char *name, const char *path);   /* 1.2 */
+void session_fx_move(Session *s, int ch, int from, int to);                                                 /* 1.2 */
 void session_fx_toggle_bypass(Session *s, int ch, int idx);
 void session_set_clip_bind(Session *s, int ch, int scene, int bind);
 // A new MIDI signal (kind = MIDI_BIND_NOTE / MIDI_BIND_CC; value = velocity / CC value).
@@ -362,6 +479,20 @@ void session_bind_to_text(int bind, char *out, size_t size);
 
 // --- Tempo ---
 void   session_set_tempo(Session *s, float bpm);           // clamps to BPM_MIN..BPM_MAX, rounds to 0.01
+// 1.1: launch quantization in beats (0 = launch at once, 1 = next beat, 4 = next bar, 8 = 2 bars ...)
+void   session_set_quantize(Session *s, float beats);
+float  session_get_quantize(Session *s);
+// the transport position in beats (bar = 4 beats); false = not running
+bool   session_transport(Session *s, double *beats);
+// 0 = nothing waits, 1 = waits to start, 2 = waits to stop, 3 = waits to restart
+int    session_clip_launch_state(Session *s, int ch, int scene);
+// UI thread, every frame: finishes what the audio thread did at the quantized moment
+void   session_quant_tick(Session *s);
+/* 1.2: instruments */
+void session_midi_tick(Session *s);                      /* main thread, every frame: which notes are bound to buttons */
+void session_set_midi_target(Session *s, int ch);        /* -1 = none */
+int  session_get_midi_target(Session *s);
+void session_midi_panic(Session *s);                     /* all notes off */
 float  session_get_tempo(Session *s);
 // The original tempo of the file (the manually corrected one if any; otherwise the detected one). 0 = unknown.
 float  session_clip_bpm_orig(Session *s, int ch, int scene);
@@ -376,6 +507,8 @@ void   session_set_clip_bpm_value(Session *s, int ch, int scene, float bpm);
 void   session_set_clip_bpm_fields(Session *s, int ch, int scene, float detected, float fix, float play);
 // Playback speed (1 = normal) — used by the mixer.
 double session_clip_speed(const Clip *cl);
+/* The stretch speed from the tempo fields, even when warp is already switched off (for fading out the old sound). */
+double session_clip_speed_warp(const Clip *cl);
 
 // --- Cutting without changing the file (step 27) ---
 // The clip's current parts (read only; valid until the next session_clip_apply_edits). NULL = no audio.

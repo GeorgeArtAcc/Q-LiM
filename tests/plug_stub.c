@@ -7,3 +7,5 @@ void qplug_process(QPlug *p, float *l, float *r, unsigned n) { (void)p; (void)l;
 int fxchain_state_for_save(Session *s, int ch, int k, void **data, size_t *len) { (void)s; (void)ch; (void)k; *data = NULL; *len = 0; return -1; }
 int fxstate_new(void) { return 0; }
 void fxstate_append(int ref, const void *data, size_t len) { (void)ref; (void)data; (void)len; }
+void qplug_midi(QPlug *p, const QMidiEv *ev, int n) { (void)p; (void)ev; (void)n; }
+bool qplug_wants_midi(QPlug *p) { (void)p; return false; }

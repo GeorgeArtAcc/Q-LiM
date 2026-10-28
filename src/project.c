@@ -101,6 +101,8 @@ static int save_to_file(Session *s, FILE *f, bool relative_paths)
     fprintf(f, "channel_count=%d\n", s->channel_count);
     fprintf(f, "scene_count=%d\n", s->scene_count);
     fprintf(f, "tempo=%.2f\n", session_get_tempo(s));
+    fprintf(f, "quantize=%g\n", (double)session_get_quantize(s));
+    if (atomic_load(&s->metronome)) fprintf(f, "metronome=1\n");
 
     float master_gain = atomic_load(&s->master_gain);
     int master_midi_cc = atomic_load(&s->master_midi_cc);
@@ -135,6 +137,9 @@ static int save_to_file(Session *s, FILE *f, bool relative_paths)
         fprintf(f, "route_l=%llu\n", (unsigned long long)session_route_get(s, c, 0));
         fprintf(f, "route_r=%llu\n", (unsigned long long)session_route_get(s, c, 1));
         fprintf(f, "mute_bind=%d\n", session_get_mute_bind(s, c));
+        /* 1.4: the recording input and monitoring of the channel */
+        fprintf(f, "rec_in=%d %d\n", atomic_load(&chp->rec_in_first), atomic_load(&chp->rec_in_stereo) ? 2 : 1);
+        if (atomic_load(&chp->monitor)) fprintf(f, "monitor=1\n");
         for (int k = 0; k < chp->fx_count; ++k) {         /* the plugins: fx=FORMAT|bypass|name|path */
             const ChFx *fx = &chp->fx[k];
             char nm[96], pt[512];
@@ -167,7 +172,14 @@ static int save_to_file(Session *s, FILE *f, bool relative_paths)
 
             fprintf(f, "[clip %d %d]\n", c, sc);
 
-            if (is_note) {
+            if (atomic_load(&cl->is_midi)) {            /* 1.3: a MIDI clip - its notes as text */
+                fprintf(f, "type=midi\n");
+                fprintf(f, "name=%s\n", cl->name);
+                fprintf(f, "loop=%d\n", loop_on ? 1 : 0);
+                char *mt = session_midi_text(s, c, sc);
+                if (mt) { fputs(mt, f); free(mt); }
+                fprintf(f, "bind=%d\n\n", atomic_load(&cl->bind));
+            } else if (is_note) {
                 fprintf(f, "type=note\n");
                 fprintf(f, "name=%s\n", cl->name);
                 fprintf(f, "color=%d\n\n", cl->color);
@@ -361,6 +373,19 @@ static bool parse_kv(const char *line, const char *key, char *out, size_t out_si
     return true;
 }
 
+/* 1.3: a MIDI clip from the project */
+static void load_midi(Session *s, int c, int sc, const char *name, bool loop_on, const char *text)
+{
+    if (c < 0 || c >= s->channel_count || sc < 0 || sc >= MAX_SCENES) return;
+    if (session_midi_set_text(s, c, sc, text && text[0] ? text : "midi_len=4\n") != 0) {
+        printf("project_load:   midi [%d][%d]: damaged notes, an empty clip instead\n", c, sc);
+        session_new_midi_clip(s, c, sc, 4.0f, name);
+    }
+    if (name && name[0]) session_rename_clip(s, c, sc, name);
+    atomic_store(&s->channels[c].clips[sc].loop, loop_on);
+    printf("project_load:   midi [%d][%d] = '%s'\n", c, sc, s->channels[c].clips[sc].name);
+}
+
 static void load_clip(Session *s, const char *project_dir,
                       int c, int sc,
                       bool is_note,
@@ -496,6 +521,8 @@ int project_load(Session *s, const char *path)
         fprintf(stderr, "project_load: cannot open '%s'\n", path);
         return 1;
     }
+    session_midi_panic(s);                         /* 1.2: no note keeps sounding from the old project */
+    session_set_midi_target(s, -1);
 
     char project_dir[1024];
     get_dirname(path, project_dir, sizeof(project_dir));
@@ -506,6 +533,8 @@ int project_load(Session *s, const char *path)
 
     if (s->sample_rate <= 0) s->sample_rate = 48000;
     session_set_tempo(s, 120.0f);                  /* old projects have no tempo */
+    session_set_quantize(s, 4.0f);                 /* 1.1: old projects: the next bar */
+    atomic_store(&s->metronome, false);            /* 1.3.1 */
     atomic_store(&s->master_pan, 0.0f);            /* old projects have no master balance/mute */
     atomic_store(&s->master_muted, false);
 
@@ -514,6 +543,7 @@ int project_load(Session *s, const char *path)
     int current_sc = -1;
 
     bool cur_is_note = false;
+    bool cur_is_midi = false;                 /* 1.3 */
     char cur_path[1024] = {0};
     char cur_name[NAME_LEN] = {0};
     size_t cur_position = 0;
@@ -548,7 +578,8 @@ int project_load(Session *s, const char *path)
 
         if (line[0] == '[') {
             if (current_ch >= 0 && current_sc >= 0) {
-                load_clip(s, project_dir,
+                if (cur_is_midi) load_midi(s, current_ch, current_sc, cur_name, cur_loop, cur_edits);
+                else load_clip(s, project_dir,
                           current_ch, current_sc,
                           cur_is_note,
                           cur_path, cur_name,
@@ -557,7 +588,7 @@ int project_load(Session *s, const char *path)
                           cur_start_marker, cur_end_marker,
                           cur_wave_zoom, cur_wave_scroll, cur_edits);
                 if (cur_is_note && cur_color) session_set_note_color(s, current_ch, current_sc, cur_color);
-                if (!cur_is_note) apply_clip_tempo(s, current_ch, current_sc, cur_bpm_det, cur_bpm_fix, cur_bpm_play, cur_warp);
+                if (!cur_is_note && !cur_is_midi) apply_clip_tempo(s, current_ch, current_sc, cur_bpm_det, cur_bpm_fix, cur_bpm_play, cur_warp);
             }
 
             if (in_channel_section && current_ch >= 0 &&
@@ -586,6 +617,7 @@ int project_load(Session *s, const char *path)
             current_ch = -1;
             current_sc = -1;
             cur_is_note = false;
+            cur_is_midi = false;
             cur_path[0] = '\0';
             cur_name[0] = '\0';
             cur_position = 0;
@@ -681,6 +713,10 @@ int project_load(Session *s, const char *path)
                 if (sr >= 8000 && sr <= 384000) s->sample_rate = sr;
             } else if (parse_kv(line, "tempo", val, sizeof(val))) {
                 session_set_tempo(s, (float)atof(val));
+            } else if (parse_kv(line, "metronome", val, sizeof(val))) {
+                atomic_store(&s->metronome, atoi(val) != 0);
+            } else if (parse_kv(line, "quantize", val, sizeof(val))) {
+                session_set_quantize(s, (float)atof(val));
             }
             continue;
         }
@@ -723,6 +759,11 @@ int project_load(Session *s, const char *path)
                 session_route_set(s, current_ch, 0, (RouteMask)strtoull(val, NULL, 10));
             } else if (parse_kv(line, "route_r", val, sizeof(val))) {
                 session_route_set(s, current_ch, 1, (RouteMask)strtoull(val, NULL, 10));
+            } else if (parse_kv(line, "rec_in", val, sizeof(val))) {      /* 1.4 */
+                int f1 = 0, n1 = 2;
+                if (sscanf(val, "%d %d", &f1, &n1) >= 1) session_set_rec_input(s, current_ch, f1, n1 != 1);
+            } else if (parse_kv(line, "monitor", val, sizeof(val))) {
+                session_set_monitor(s, current_ch, atoi(val) != 0);
             } else if (parse_kv(line, "mute_bind", val, sizeof(val))) {
                 session_set_mute_bind(s, current_ch, atoi(val));
             } else if (parse_kv(line, "solo_bind", val, sizeof(val))) {
@@ -757,6 +798,7 @@ int project_load(Session *s, const char *path)
         if (current_ch >= 0 && current_sc >= 0) {
             if (parse_kv(line, "type", val, sizeof(val))) {
                 cur_is_note = (strcmp(val, "note") == 0);
+                cur_is_midi = (strcmp(val, "midi") == 0);
             } else if (parse_kv(line, "path", val, sizeof(val))) {
                 snprintf(cur_path, sizeof(cur_path), "%s", val);
             } else if (parse_kv(line, "name", val, sizeof(val))) {
@@ -790,7 +832,8 @@ int project_load(Session *s, const char *path)
                 cur_bpm_play = (float)atof(val);
             } else if (parse_kv(line, "warp", val, sizeof(val))) {
                 cur_warp = atoi(val) != 0;
-            } else if (strncmp(line, "edit_len=", 9) == 0 || strncmp(line, "edit_seg=", 9) == 0) {
+            } else if (strncmp(line, "edit_len=", 9) == 0 || strncmp(line, "edit_seg=", 9) == 0 ||
+                       strncmp(line, "midi_len=", 9) == 0 || strncmp(line, "mn=", 3) == 0) {   /* 1.3: the notes too */
                 size_t ll = strlen(line);
                 char *ne = realloc(cur_edits, cur_edits_len + ll + 2);
                 if (ne) {
@@ -806,7 +849,8 @@ int project_load(Session *s, const char *path)
     }
 
     if (current_ch >= 0 && current_sc >= 0) {
-        load_clip(s, project_dir,
+        if (cur_is_midi) load_midi(s, current_ch, current_sc, cur_name, cur_loop, cur_edits);
+        else load_clip(s, project_dir,
                   current_ch, current_sc,
                   cur_is_note, cur_path, cur_name,
                   cur_position,
@@ -814,7 +858,7 @@ int project_load(Session *s, const char *path)
                           cur_start_marker, cur_end_marker,
                           cur_wave_zoom, cur_wave_scroll, cur_edits);
         if (cur_is_note && cur_color) session_set_note_color(s, current_ch, current_sc, cur_color);
-        if (!cur_is_note) apply_clip_tempo(s, current_ch, current_sc, cur_bpm_det, cur_bpm_fix, cur_bpm_play, cur_warp);
+        if (!cur_is_note && !cur_is_midi) apply_clip_tempo(s, current_ch, current_sc, cur_bpm_det, cur_bpm_fix, cur_bpm_play, cur_warp);
     }
 
     if (in_channel_section && current_ch >= 0 &&
@@ -1201,6 +1245,8 @@ bool project_has_current(void)
 void project_new(Session *s)
 {
     if (!s) return;
+    session_midi_panic(s);                         /* 1.2 */
+    session_set_midi_target(s, -1);
 
     session_release_all_clips(s);
 

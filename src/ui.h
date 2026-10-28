@@ -84,6 +84,7 @@ typedef enum {
     UI_ACTION_NEW_NOTE,
     UI_ACTION_COLOR,
     UI_ACTION_ADD_QUEUE,        /* handled directly in ui.c */
+    UI_ACTION_NEW_MIDI,         /* 1.3: handled directly in ui.c */
 } UiAction;
 
 typedef struct {
@@ -198,5 +199,11 @@ bool ui_any_modal_open(void);
 // step 32: selected scene (its button on the left) -> index, otherwise -1; selecting a scene row
 int  ui_selected_scene_row(void);
 void ui_select_scene_row(int sc);
+
+/* 1.3: the MIDI editor uses the arrow keys (main.c asks before it moves the clip selection) */
+bool ui_midi_take_arrows(Session *s);
+/* 1.2: playing an instrument from the computer keyboard */
+bool ui_computer_keys_on(void);
+void ui_toggle_computer_keys(void);
 
 #endif

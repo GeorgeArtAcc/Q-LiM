@@ -18,6 +18,7 @@ struct FxChain {
     int    nactive;                   /* how many of them are running */
     QPlug *p[MAX_CH_FX];
     bool   byp[MAX_CH_FX];            /* bypassed: loaded, but the audio goes around it */
+    bool   inst[MAX_CH_FX];           /* 1.2: an instrument (takes MIDI; no audio input or the scan says "instrument") */
     /* main thread only: */
     int    slot[MAX_CH_FX];           /* which row of ch->fx[] p[i] belongs to */
     char   id[MAX_CH_FX][520];
@@ -34,7 +35,9 @@ void fxchain_sync(Session *s);                    /* main thread, every frame */
 bool fxchain_slot_failed(Session *s, int ch, int k);
 bool fxchain_slot_loaded(Session *s, int ch, int k);
 bool fxchain_slot_loading(Session *s, int ch, int k);   /* step 35d: still starting up (Windows plugin) */
-void fxchain_shutdown(Session *s);                /* on exit (after the audio is stopped) */
+void fxchain_shutdown(Session *s);
+bool fxchain_has_instrument(Session *s, int ch);
+bool fxchain_slot_is_instrument(Session *s, int ch, int k);   /* 1.2: row k of the channel is a loaded instrument */  /* 1.2: a loaded plugin of the channel is an instrument (no audio input, takes MIDI) */                /* on exit (after the audio is stopped) */
 
 /* step 35 */
 QPlug *fxchain_find(Session *s, int ch, int k);   /* the loaded plugin on row k of the channel (or NULL) */

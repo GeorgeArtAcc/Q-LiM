@@ -254,6 +254,7 @@ static FxChain *build(Session *s, int c, FxChain *old, const char *sig, bool *wa
         int i = nc->n++;
         nc->p[i] = p;
         nc->byp[i] = fx->bypass;
+        nc->inst[i] = qplug_wants_midi(p) && (qplug_is_instrument(p) || plugins_is_instrument(fx->fmt, id));
         if (!fx->bypass) ++nc->nactive;
         nc->slot[i] = k;
         snprintf(nc->id[i], sizeof nc->id[i], "%s", id);
@@ -407,4 +408,22 @@ void fxchain_shutdown(Session *s)
     g_nlive = 0;
     for (int i = 0; i < g_nret; ++i) chain_free(g_ret[i].c);
     g_nret = 0;
+}
+
+/* 1.2: the channel has a loaded instrument: no audio input and takes MIDI (main thread) */
+bool fxchain_has_instrument(Session *s, int ch)
+{
+    if (!s || ch < 0 || ch >= s->channel_count) return false;
+    FxChain *c = chain_of(s, ch);
+    if (!c) return false;
+    for (int k = 0; k < c->n; ++k) if (c->p[k] && c->inst[k]) return true;
+    return false;
+}
+
+bool fxchain_slot_is_instrument(Session *s, int ch, int k)
+{
+    FxChain *f = chain_of(s, ch);
+    if (!f) return false;
+    for (int i = 0; i < f->n; ++i) if (f->slot[i] == k && !f->moved[i]) return f->inst[i];
+    return false;
 }

@@ -18,4 +18,8 @@ void mixer_render_channels(Session *s, float *const *outs, int nouts, unsigned l
 void mixer_render_master(Session *s, const float *in_l, const float *in_r, float *out_l, float *out_r,
                          unsigned long frames);
 
+/* 1.4: the sound card's input for the NEXT mixer_render / mixer_render_channels call (same thread, same frame
+ * count; interleaved, in_ch channels). in = NULL or in_ch = 0: no input (recording records silence, no monitoring). */
+void mixer_set_input(const float *in, int in_ch, unsigned long frames);
+
 #endif

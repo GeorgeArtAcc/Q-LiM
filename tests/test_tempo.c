@@ -70,9 +70,9 @@ int main(int argc, char **argv)
 
     /* 1) warp tick + 120 BPM -> the mixer must give 120 */
     session_set_clip_warp(s, 0, 0, true);
-    session_set_clip_bpm_value(s, 0, 0, 120.0f);
+    session_set_tempo(s, 120.0f);
     CHECK(fabsf(session_clip_bpm_play(s, 0, 0) - 120.0f) < 0.001f && fabsf(session_clip_bpm_orig(s, 0, 0) - 128.0f) < 0.05f,
-          "tick ON: value edit sets playing tempo 120, original stays %.2f", session_clip_bpm_orig(s, 0, 0));
+          "tick ON: clip follows master 120, original stays %.2f", session_clip_bpm_orig(s, 0, 0));
     atomic_store(&s->audio_running, false);
     session_toggle_clip(s, 0, 0);
     { struct timespec ts = { 0, 100000000L }; nanosleep(&ts, NULL); }
@@ -89,7 +89,7 @@ int main(int argc, char **argv)
     /* 2) a 440 Hz tone at 100 BPM, played at 125 BPM -> the pitch stays 440 */
     session_set_clip_bpm_fields(s, 1, 0, 100.0f, 0, 0);
     session_set_clip_warp(s, 1, 0, true);
-    session_set_clip_bpm_value(s, 1, 0, 125.0f);
+    session_set_tempo(s, 125.0f);
     session_toggle_clip(s, 1, 0);
     { struct timespec ts = { 0, 100000000L }; nanosleep(&ts, NULL); }
     y = render(s, 3.0, &n);
@@ -102,7 +102,7 @@ int main(int argc, char **argv)
     y = render(s, 1.0, &n); free(y);
     session_stop_all(s);
 
-    /* 3) the field with the warp tick off = correction of the original (e.g. 87 -> 174) */
+    /* 3) the clip field = correction of the original (e.g. 87 -> 174) */
     session_set_clip_bpm_value(s, 1, 0, 174.0f);
     CHECK(fabsf(session_clip_bpm_orig(s, 1, 0) - 174.0f) < 0.001f && session_clip_speed(&s->channels[1].clips[0]) == 1.0,
           "tick OFF: edit corrects the original tempo (174), speed unchanged");
@@ -116,15 +116,14 @@ int main(int argc, char **argv)
 
     /* 5) save and load */
     session_set_clip_warp(s, 0, 0, true);
-    session_set_clip_bpm_value(s, 0, 0, 124.5f);
     const char *pp = "/tmp/qlim_tempo_test.limproject";
     CHECK(project_save(s, pp) == 0, "project saved");
     project_new(s);
     CHECK(session_get_tempo(s) == 120.0f, "new project resets tempo to 120");
     CHECK(project_load(s, pp) == 0, "project loaded");
     CHECK(session_get_tempo(s) == 126.0f, "tempo restored (%.2f)", session_get_tempo(s));
-    CHECK(session_get_clip_warp(s, 0, 0) && fabsf(session_clip_bpm_play(s, 0, 0) - 124.5f) < 0.001f,
-          "clip tick + playing tempo restored (%.2f)", session_clip_bpm_play(s, 0, 0));
+    CHECK(session_get_clip_warp(s, 0, 0) && fabsf(session_clip_bpm_play(s, 0, 0) - 126.0f) < 0.001f,
+          "clip tick restored, plays at master (%.2f)", session_clip_bpm_play(s, 0, 0));
     CHECK(!session_clip_bpm_busy(s, 0, 0) && fabsf(session_clip_bpm_orig(s, 0, 0) - 128.0f) < 0.05f,
           "detected tempo comes from the file, no re-analysis (%.2f)", session_clip_bpm_orig(s, 0, 0));
     CHECK(fabsf(session_clip_bpm_orig(s, 1, 0) - 174.0f) < 0.001f, "corrected original restored");

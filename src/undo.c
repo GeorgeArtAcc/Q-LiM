@@ -140,7 +140,7 @@ void undo_shutdown(void)
 /* ================= Applying a snapshot ================= */
 
 typedef struct {
-    bool  present, note, loop;
+    bool  present, note, loop, midi;     /* midi (1.3): the notes are in 'edits' (midi_len= / mn= lines) */
     char  path[1024], name[NAME_LEN];
     size_t ls, le, sm, em;
     int   bind, color;
@@ -235,7 +235,7 @@ static bool parse_model(const char *snap, Model *m)
             }
         } else if (in_clip) {
             SClip *k = &MC(m, cc_, cs_);
-            if (kv(line, "type", &v)) k->note = strcmp(v, "note") == 0;
+            if (kv(line, "type", &v)) { k->note = strcmp(v, "note") == 0; k->midi = strcmp(v, "midi") == 0; }
             else if (kv(line, "path", &v)) copy_str(k->path, sizeof(k->path), v);
             else if (kv(line, "name", &v)) copy_str(k->name, sizeof(k->name), v);
             else if (kv(line, "loop", &v)) k->loop = atoi(v) != 0;
@@ -248,7 +248,8 @@ static bool parse_model(const char *snap, Model *m)
             else if (kv(line, "bpm_fix", &v)) k->bpm_fix = (float)atof(v);
             else if (kv(line, "bpm_play", &v)) k->bpm_play = (float)atof(v);
             else if (kv(line, "warp", &v)) k->warp = atoi(v) != 0;
-            else if (strncmp(line, "edit_len=", 9) == 0 || strncmp(line, "edit_seg=", 9) == 0) {
+            else if (strncmp(line, "edit_len=", 9) == 0 || strncmp(line, "edit_seg=", 9) == 0 ||
+                     strncmp(line, "midi_len=", 9) == 0 || strncmp(line, "mn=", 3) == 0) {
                 size_t ll = strlen(line);
                 char *ne = realloc(k->edits, k->edits_len + ll + 2);
                 if (ne) {
@@ -305,6 +306,9 @@ static bool cell_same_cur_snap(Session *s, int c, int sc, const SClip *k)
     bool note = atomic_load(&cl->is_note);
     if (note != k->note) return false;
     if (note) return strcmp(cl->name, k->name) == 0;
+    bool midi = atomic_load(&cl->is_midi);
+    if (midi != k->midi) return false;
+    if (midi) return strcmp(cl->name, k->name) == 0;
     return strcmp(cl->path, k->path) == 0 && strcmp(cl->name, k->name) == 0;
 }
 
@@ -332,6 +336,19 @@ static void apply_cell(Session *s, int c, int sc, const SClip *k)
     if (!k->present) {
         if (atomic_load(&cl->has_clip)) session_clear_clip(s, c, sc);
         session_set_clip_bind(s, c, sc, 0);
+        return;
+    }
+    if (k->midi) {                             /* 1.3: a MIDI clip - only what changed (a playing clip keeps playing) */
+        bool was = atomic_load(&cl->has_clip) && atomic_load(&cl->is_midi);
+        if (!was && atomic_load(&cl->has_clip)) session_clear_clip(s, c, sc);
+        char *cur = was ? session_midi_text(s, c, sc) : NULL;
+        if (!cur || !k->edits || strcmp(cur, k->edits) != 0)
+            if (session_midi_set_text(s, c, sc, k->edits ? k->edits : "midi_len=4\n") != 0)
+                session_new_midi_clip(s, c, sc, 4.0f, k->name);
+        free(cur);
+        if (k->name[0] && strcmp(cl->name, k->name) != 0) session_rename_clip(s, c, sc, k->name);
+        atomic_store(&cl->loop, k->loop);
+        session_set_clip_bind(s, c, sc, k->bind);
         return;
     }
     if (cell_same_cur_snap(s, c, sc, k)) {

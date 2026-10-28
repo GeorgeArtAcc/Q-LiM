@@ -39,6 +39,9 @@ static bool g_recovered_unsaved = false;      /* the work was recovered from an 
 // ============ MIDI ============
 // Everything MIDI is called from midi_poll() (the main thread), so it is safe to touch the session.
 
+/* 1.3: the clipboard "path" of a copied MIDI clip (its notes are in the clipboard edits text) */
+#define MIDI_CLIP_MARK "<midi clip>"
+
 static void on_midi_cc(int cc, int value, int channel, void *user_data)
 {
     (void)channel;
@@ -663,7 +666,7 @@ int main(int argc, char **argv)
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonReleased(MOUSE_BUTTON_LEFT) ||
             IsMouseButtonReleased(MOUSE_BUTTON_RIGHT) || IsMouseButtonReleased(MOUSE_BUTTON_MIDDLE) ||
             IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE) || IsKeyPressed(KEY_ENTER) ||
-            (mod_ctrl && (IsKeyPressed(KEY_V) || IsKeyPressed(KEY_X) || IsKeyPressed(KEY_E) || IsKeyPressed(KEY_I)))) {
+            (mod_ctrl && (IsKeyPressed(KEY_V) || IsKeyPressed(KEY_X) || IsKeyPressed(KEY_E) || IsKeyPressed(KEY_I) || IsKeyPressed(KEY_U)))) {
             undo_poke(GetTime());
         }
 
@@ -718,12 +721,15 @@ int main(int argc, char **argv)
                 }
             }
 
-            if (IsKeyPressed(KEY_UP))    ui_move_selection(session,  0, -1);
-            if (IsKeyPressed(KEY_DOWN))  ui_move_selection(session,  0, +1);
-            if (IsKeyPressed(KEY_LEFT))  ui_move_selection(session, -1,  0);
-            if (IsKeyPressed(KEY_RIGHT)) ui_move_selection(session, +1,  0);
+            if (!ui_midi_take_arrows(session)) {          /* 1.3: notes selected in the MIDI editor -> the arrows move them */
+                if (IsKeyPressed(KEY_UP))    ui_move_selection(session,  0, -1);
+                if (IsKeyPressed(KEY_DOWN))  ui_move_selection(session,  0, +1);
+                if (IsKeyPressed(KEY_LEFT))  ui_move_selection(session, -1,  0);
+                if (IsKeyPressed(KEY_RIGHT)) ui_move_selection(session, +1,  0);
+            }
 
-            if (IsKeyPressed(KEY_L) && !mod_ctrl) ui_toggle_library();
+            if (IsKeyPressed(KEY_L) && !mod_ctrl && !ui_computer_keys_on()) ui_toggle_library();
+            if (mod_ctrl && IsKeyPressed(KEY_K) && !mod_shift) ui_toggle_computer_keys();   /* 1.2 */
 
             // Ctrl+S
             if (mod_ctrl && IsKeyPressed(KEY_S) && !mod_shift) {
@@ -829,7 +835,10 @@ int main(int argc, char **argv)
                 if (sel_ch >= 0 && sel_sc >= 0) {
                     Clip *cl = &session->channels[sel_ch].clips[sel_sc];
                     if (atomic_load(&cl->has_clip)) {
-                        if (!atomic_load(&cl->is_note)) {
+                        if (atomic_load(&cl->is_midi)) {                    /* 1.3: a MIDI clip: its notes go with it */
+                            ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
+                            { char *mt_ = session_midi_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(mt_); free(mt_); }
+                        } else if (!atomic_load(&cl->is_note)) {
                             ui_clipboard_copy_clip(cl->path, cl->name);
                             { char *et_ = session_clip_edits_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
@@ -847,7 +856,10 @@ int main(int argc, char **argv)
                 if (sel_ch >= 0 && sel_sc >= 0) {
                     Clip *cl = &session->channels[sel_ch].clips[sel_sc];
                     if (atomic_load(&cl->has_clip)) {
-                        if (!atomic_load(&cl->is_note)) {
+                        if (atomic_load(&cl->is_midi)) {                    /* 1.3: a MIDI clip: its notes go with it */
+                            ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
+                            { char *mt_ = session_midi_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(mt_); free(mt_); }
+                        } else if (!atomic_load(&cl->is_note)) {
                             ui_clipboard_copy_clip(cl->path, cl->name);
                             { char *et_ = session_clip_edits_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
@@ -868,7 +880,9 @@ int main(int argc, char **argv)
                     char name[NAME_LEN];
                     ui_clipboard_get(path, sizeof(path), name, sizeof(name));
 
-                    if (path[0] == '\0' && name[0] != '\0') {
+                    if (strcmp(path, MIDI_CLIP_MARK) == 0) {                /* 1.3: a MIDI clip */
+                        if (session_midi_set_text(session, sel_ch, sel_sc, ui_clipboard_edits()) == 0 && name[0]) session_rename_clip(session, sel_ch, sel_sc, name);
+                    } else if (path[0] == '\0' && name[0] != '\0') {
                         session_set_note(session, sel_ch, sel_sc, name);
                         ui_flash_message("Pasted note");
                     } else if (path[0] != '\0') {
@@ -940,6 +954,9 @@ int main(int argc, char **argv)
         }
         session_poll_bpm(session);                 // the finished tempo detections from the background thread
         session_queue_tick(session);               // the queue: prepares the next one / cleans up
+        session_quant_tick(session);               // 1.1: quantized launch - finishes what the audio thread did
+        session_midi_tick(session);                // 1.2: notes bound to pads do not play the instruments
+        session_rec_tick(session);                 // 1.4: recordings -> files / notes; finished ones become clips
         health_watch(session);                     // xrun, overload... -> log
         if (ui_take_audio_refresh()) {
             /* PortAudio remembers the list from startup -> close it and open it again */
@@ -1095,7 +1112,10 @@ int main(int argc, char **argv)
                 if (act.ch >= 0 && act.scene >= 0) {
                     Clip *cl = &session->channels[act.ch].clips[act.scene];
                     if (atomic_load(&cl->has_clip)) {
-                        if (!atomic_load(&cl->is_note)) {
+                        if (atomic_load(&cl->is_midi)) {                    /* 1.3: a MIDI clip: its notes go with it */
+                            ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
+                            { char *mt_ = session_midi_text(session, act.ch, act.scene); ui_clipboard_set_edits(mt_); free(mt_); }
+                        } else if (!atomic_load(&cl->is_note)) {
                             ui_clipboard_copy_clip(cl->path, cl->name);
                             { char *et_ = session_clip_edits_text(session, act.ch, act.scene); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
@@ -1111,7 +1131,10 @@ int main(int argc, char **argv)
                 if (act.ch >= 0 && act.scene >= 0) {
                     Clip *cl = &session->channels[act.ch].clips[act.scene];
                     if (atomic_load(&cl->has_clip)) {
-                        if (!atomic_load(&cl->is_note)) {
+                        if (atomic_load(&cl->is_midi)) {                    /* 1.3: a MIDI clip: its notes go with it */
+                            ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
+                            { char *mt_ = session_midi_text(session, act.ch, act.scene); ui_clipboard_set_edits(mt_); free(mt_); }
+                        } else if (!atomic_load(&cl->is_note)) {
                             ui_clipboard_copy_clip(cl->path, cl->name);
                             { char *et_ = session_clip_edits_text(session, act.ch, act.scene); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
@@ -1128,7 +1151,9 @@ int main(int argc, char **argv)
                     char name[NAME_LEN];
                     ui_clipboard_get(path, sizeof(path), name, sizeof(name));
 
-                    if (path[0] == '\0' && name[0] != '\0') {
+                    if (strcmp(path, MIDI_CLIP_MARK) == 0) {                /* 1.3: a MIDI clip */
+                        if (session_midi_set_text(session, act.ch, act.scene, ui_clipboard_edits()) == 0 && name[0]) session_rename_clip(session, act.ch, act.scene, name);
+                    } else if (path[0] == '\0' && name[0] != '\0') {
                         session_set_note(session, act.ch, act.scene, name);
                     } else if (path[0] != '\0') {
                         if (session_set_clip(session, act.ch, act.scene, path) == 0) {

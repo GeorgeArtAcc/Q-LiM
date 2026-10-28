@@ -34,11 +34,18 @@ struct AEffect {
 #define VST_MAGIC 0x56737450      /* 'VstP' */
 enum { effOpen = 0, effClose = 1, effSetSampleRate = 10, effSetBlockSize = 11, effMainsChanged = 12,
        effEditGetRect = 13, effEditOpen = 14, effEditClose = 15, effEditIdle = 19, effGetChunk = 23, effSetChunk = 24,
-       effGetEffectName = 45, effGetProductString = 48, effStartProcess = 71, effStopProcess = 72 };
+       effGetEffectName = 45, effGetProductString = 48, effStartProcess = 71, effStopProcess = 72,
+       effGetParamLabel = 6, effGetParamDisplay = 7, effGetParamName = 8, effProcessEvents = 25, effCanDo = 51 };
 enum { effFlagsHasEditor = 1 << 0, effFlagsCanReplacing = 1 << 4, effFlagsProgramChunks = 1 << 5, effFlagsIsSynth = 1 << 8 };
 enum { amSizeWindow = 15 };
 typedef struct { int16_t top, left, bottom, right; } ERect;
-typedef struct { void *lib; AEffect *e; PlugWin *win; } V2;
+/* 1.2: MIDI events (VstEvents / VstMidiEvent, the binary layout of the SDK) */
+typedef struct { int32_t type, byteSize, deltaFrames, flags, noteLength, noteOffset; char midiData[4];
+                 char detune, noteOffVelocity, reserved1, reserved2; } VstMidiEvent;
+enum { kVstMidiType = 1, kVstMidiEventIsRealtime = 1 };
+typedef struct { int32_t numEvents; intptr_t reserved; void *events[QMIDI_MAX]; } VstEvents;
+typedef struct { void *lib; AEffect *e; PlugWin *win;
+                 VstEvents evs; VstMidiEvent ev[QMIDI_MAX]; int nev; } V2;
 enum { amAutomate = 0, amVersion = 1, amCurrentId = 2, amIdle = 3, amGetTime = 7, amGetSampleRate = 16,
        amGetBlockSize = 17, amGetCurrentProcessLevel = 23, amGetVendorString = 32, amGetProductString = 33,
        amGetVendorVersion = 34, amCanDo = 37, amGetLanguage = 38, amUpdateDisplay = 42 };
@@ -86,10 +93,56 @@ static AEffect *v2_load(const char *path, void **lib_out, char *err, int esz)
     return e;
 }
 
+static void v2_midi(void *h, const QMidiEv *ev, int n)
+{
+    V2 *v = h;
+    for (int i = 0; i < n && v->nev < QMIDI_MAX; ++i) {
+        VstMidiEvent *m = &v->ev[v->nev++];
+        memset(m, 0, sizeof *m);
+        m->type = kVstMidiType; m->byteSize = (int32_t)sizeof *m; m->deltaFrames = (int32_t)ev[i].frame;
+        m->flags = kVstMidiEventIsRealtime;
+        memcpy(m->midiData, ev[i].d, 3);
+    }
+}
+
 static void v2_process(void *h, float **in, float **out, unsigned n)
 {
     V2 *v = h;
+    if (v->nev > 0) {                                   /* 1.2: MIDI goes in just before the audio */
+        v->evs.numEvents = v->nev;
+        v->evs.reserved = 0;
+        for (int i = 0; i < v->nev; ++i) {
+            if (v->ev[i].deltaFrames >= (int32_t)n) v->ev[i].deltaFrames = (int32_t)n - 1;
+            v->evs.events[i] = &v->ev[i];
+        }
+        v->e->dispatcher(v->e, effProcessEvents, 0, 0, &v->evs, 0);
+        v->nev = 0;
+    }
     v->e->processReplacing(v->e, in, out, (int32_t)n);
+}
+
+/* 1.2: parameters */
+static int v2_param_count(void *h) { V2 *v = h; return v->e->numParams > 0 ? v->e->numParams : 0; }
+static bool v2_param_name(void *h, int i, char *name, int nsz)
+{
+    V2 *v = h;
+    char b[256] = "";                                   /* the SDK says 8 chars; many plugins write more */
+    v->e->dispatcher(v->e, effGetParamName, i, 0, b, 0);
+    b[255] = 0;
+    snprintf(name, (size_t)nsz, "%s", b);
+    return true;
+}
+static float v2_param_get(void *h, int i) { V2 *v = h; return v->e->getParameter(v->e, i); }
+static void v2_param_set(void *h, int i, float x) { V2 *v = h; v->e->setParameter(v->e, i, x); }
+static void v2_param_text(void *h, int i, char *out, int sz)
+{
+    V2 *v = h;
+    char d[256] = "", l[256] = "";
+    v->e->dispatcher(v->e, effGetParamDisplay, i, 0, d, 0);
+    v->e->dispatcher(v->e, effGetParamLabel, i, 0, l, 0);
+    d[255] = l[255] = 0;
+    char *s = d; while (*s == ' ') ++s;
+    if (*s) snprintf(out, (size_t)sz, l[0] ? "%s %s" : "%s", s, l);
 }
 
 static bool v2_has_editor(void *h) { return (((V2 *)h)->e->flags & effFlagsHasEditor) != 0; }
@@ -200,6 +253,10 @@ int vst2_open(const char *id, double rate, int maxb, QInst *out, char *err, int 
     out->process = v2_process; out->destroy = v2_destroy;
     out->has_editor = v2_has_editor; out->ed_open = v2_ed_open; out->ed_close = v2_ed_close; out->ed_idle = v2_ed_idle;
     out->get_state = v2_get_state; out->set_state = v2_set_state;
+    bool wants = (e->flags & effFlagsIsSynth) || e->dispatcher(e, effCanDo, 0, 0, (void *)"receiveVstMidiEvent", 0) > 0;
+    if (wants) out->midi = v2_midi;
+    out->param_count = v2_param_count; out->param_name = v2_param_name; out->param_get = v2_param_get;
+    out->param_set = v2_param_set; out->param_text = v2_param_text;
     return 0;
 }
 

@@ -73,11 +73,16 @@ static struct {
     __typeof__(&lilv_free) lfree;
     __typeof__(&lilv_port_get_symbol) port_get_symbol;
     __typeof__(&lilv_world_load_resource) world_load_resource;
+    /* 1.2: MIDI port and parameter names */
+    __typeof__(&lilv_port_supports_event) port_supports_event;
+    __typeof__(&lilv_port_get_name) port_get_name;
+    __typeof__(&lilv_port_has_property) port_has_property;
 } L;
 
 static int        g_lstate = 0;          /* 0 = not tried, 1 = present, -1 = no liblilv */
 static LilvWorld *g_world;
 static LilvNode  *n_audio, *n_control, *n_atom, *n_cv, *n_input, *n_output, *n_instr, *n_x11ui;
+static LilvNode  *n_midi_ev, *n_integer, *n_toggled, *n_enum, *n_not_gui;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int lv_load(char *err, int esz)
@@ -109,6 +114,8 @@ static int lv_load(char *err, int esz)
     LD(ui_get_uri, "lilv_ui_get_uri"); LD(ui_is_a, "lilv_ui_is_a"); LD(ui_get_binary_uri, "lilv_ui_get_binary_uri");
     LD(ui_get_bundle_uri, "lilv_ui_get_bundle_uri"); LD(file_uri_parse, "lilv_file_uri_parse"); LD(lfree, "lilv_free");
     LD(port_get_symbol, "lilv_port_get_symbol"); LD(world_load_resource, "lilv_world_load_resource");
+    LD(port_supports_event, "lilv_port_supports_event"); LD(port_get_name, "lilv_port_get_name");
+    LD(port_has_property, "lilv_port_has_property");
 #undef LD
     g_world = L.world_new();
     n_audio = L.new_uri(g_world, LV2_CORE__AudioPort);
@@ -119,6 +126,11 @@ static int lv_load(char *err, int esz)
     n_output = L.new_uri(g_world, LV2_CORE__OutputPort);
     n_instr = L.new_uri(g_world, LV2_CORE__InstrumentPlugin);
     n_x11ui = L.new_uri(g_world, LV2_UI__X11UI);
+    n_midi_ev = L.new_uri(g_world, "http://lv2plug.in/ns/ext/midi#MidiEvent");
+    n_integer = L.new_uri(g_world, LV2_CORE__integer);
+    n_toggled = L.new_uri(g_world, LV2_CORE__toggled);
+    n_enum = L.new_uri(g_world, LV2_CORE__enumeration);
+    n_not_gui = L.new_uri(g_world, "http://lv2plug.in/ns/ext/port-props#notOnGUI");
     g_lstate = 1;
     return 1;
 }
@@ -234,6 +246,13 @@ typedef struct {
     float *ui_last;                                  /* the values last sent to the interface */
     LV2UI_Resize ui_resize;
     LV2_Extension_Data_Feature ext_data;
+    /* 1.2 */
+    int midi_port;                                   /* index into atom_in[] of the MIDI input, -1 = none */
+    LV2_URID u_midi;
+    QMidiEv mev[QMIDI_MAX]; int nmev;
+    int *par; int npar;                              /* the port numbers of the visible controls */
+    float *pmin, *pmax; unsigned char *pkind;        /* 0 = float, 1 = integer, 2 = toggle */
+    char **pname;
 } LV;
 
 static void seq_clear(LV *v, uint8_t *b)
@@ -269,6 +288,23 @@ static void lv_process(void *h, float **in, float **out, unsigned n)
         }
         aring_drop(v->to_plug);
     }
+    /* 1.2: MIDI from the keyboard (after the interface messages, which are at time 0) */
+    if (v->nmev > 0 && v->midi_port >= 0) {
+        LV2_Atom_Sequence *sq = (LV2_Atom_Sequence *)v->atom_in[v->midi_port];
+        for (int k = 0; k < v->nmev; ++k) {
+            uint32_t need = (uint32_t)sizeof(LV2_Atom_Event) + 8u;
+            if (sizeof(LV2_Atom) + sq->atom.size + need > ATOM_CAP) break;
+            LV2_Atom_Event *ev = (LV2_Atom_Event *)((uint8_t *)&sq->body + sq->atom.size);
+            ev->time.frames = v->mev[k].frame < n ? v->mev[k].frame : n - 1;
+            unsigned char st = v->mev[k].d[0] & 0xF0;
+            ev->body.size = (st == 0xC0 || st == 0xD0) ? 2 : 3;
+            ev->body.type = v->u_midi;
+            memset(ev + 1, 0, 8);
+            memcpy(ev + 1, v->mev[k].d, ev->body.size);
+            sq->atom.size += need;
+        }
+    }
+    v->nmev = 0;
     lilv_instance_run(v->inst, n);
     for (int i = 0; i < v->nai; ++i) seq_clear(v, v->atom_in[i]);
     /* events from the plugin -> to the interface (only if it is open) */
@@ -281,6 +317,47 @@ static void lv_process(void *h, float **in, float **out, unsigned n)
             }
         }
     }
+}
+
+static void lv_midi(void *h, const QMidiEv *ev, int n)
+{
+    LV *v = h;
+    for (int i = 0; i < n && v->nmev < QMIDI_MAX; ++i) v->mev[v->nmev++] = ev[i];
+}
+
+/* 1.2: parameters = the control input ports (main thread; a float write is atomic enough for the audio) */
+static int lv_param_count(void *h) { return ((LV *)h)->npar; }
+static bool lv_param_name(void *h, int i, char *name, int nsz)
+{
+    LV *v = h;
+    if (i < 0 || i >= v->npar) return false;
+    snprintf(name, (size_t)nsz, "%s", v->pname[i]);
+    return true;
+}
+static float lv_param_get(void *h, int i)
+{
+    LV *v = h;
+    if (i < 0 || i >= v->npar) return 0.0f;
+    float r = v->pmax[i] - v->pmin[i];
+    return r > 0.0f ? (v->ctrl[v->par[i]] - v->pmin[i]) / r : 0.0f;
+}
+static void lv_param_set(void *h, int i, float x)
+{
+    LV *v = h;
+    if (i < 0 || i >= v->npar) return;
+    float val = v->pmin[i] + x * (v->pmax[i] - v->pmin[i]);
+    if (v->pkind[i] == 1) val = floorf(val + 0.5f);
+    if (v->pkind[i] == 2) val = x >= 0.5f ? v->pmax[i] : v->pmin[i];
+    v->ctrl[v->par[i]] = val;
+}
+static void lv_param_text(void *h, int i, char *out, int sz)
+{
+    LV *v = h;
+    if (i < 0 || i >= v->npar) return;
+    float val = v->ctrl[v->par[i]];
+    if (v->pkind[i] == 2) snprintf(out, (size_t)sz, "%s", val > v->pmin[i] ? "On" : "Off");
+    else if (v->pkind[i] == 1) snprintf(out, (size_t)sz, "%d", (int)lrintf(val));
+    else snprintf(out, (size_t)sz, fabsf(val) >= 100.0f ? "%.0f" : fabsf(val) >= 10.0f ? "%.1f" : "%.2f", val);
 }
 
 /* ---- interface (ui:X11UI) ---- */
@@ -543,6 +620,8 @@ static void lv_destroy(void *h)
     for (int i = 0; i < v->nao; ++i) free(v->atom_out[i]);
     for (int i = 0; i < v->nports; ++i) if (v->cv && v->cv[i]) free(v->cv[i]);
     free(v->atom_in); free(v->atom_out); free(v->atom_out_idx); free(v->atom_in_idx); free(v->cv);
+    for (int i = 0; i < v->npar; ++i) free(v->pname[i]);
+    free(v->par); free(v->pmin); free(v->pmax); free(v->pkind); free(v->pname);
     for (int i = 0; i < v->nports; ++i) free(v->sym ? v->sym[i] : NULL);
     free(v->sym); free(v->ctrl_in); free(v->is_ctrl); free(v->ui_last);
     free(v->to_plug); free(v->to_ui);
@@ -620,6 +699,11 @@ int lv2_open(const char *id, double rate, int maxb, QInst *out, char *err, int e
     v->sym = calloc((size_t)np, sizeof(char *));
     v->to_plug = calloc(1, sizeof(ARing));
     v->to_ui = calloc(1, sizeof(ARing));
+    v->midi_port = -1;
+    v->u_midi = urid_map(NULL, "http://lv2plug.in/ns/ext/midi#MidiEvent");
+    v->par = calloc((size_t)np + 1, sizeof(int)); v->pmin = calloc((size_t)np + 1, sizeof(float));
+    v->pmax = calloc((size_t)np + 1, sizeof(float)); v->pkind = calloc((size_t)np + 1, 1);
+    v->pname = calloc((size_t)np + 1, sizeof(char *));
     for (int i = 0; i < np; ++i) {
         const LilvPort *pt = L.plugin_get_port_by_index(p, (uint32_t)i);
         bool in = L.port_is_a(p, pt, n_input);
@@ -634,10 +718,20 @@ int lv2_open(const char *id, double rate, int maxb, QInst *out, char *err, int e
             if (isnan(d)) d = isnan(mins[i]) ? 0.0f : mins[i];
             v->ctrl[i] = d;
             lilv_instance_connect_port(v->inst, (uint32_t)i, &v->ctrl[i]);
+            if (in && !L.port_has_property(p, pt, n_not_gui) && !isnan(mins[i]) && !isnan(maxs[i]) && maxs[i] > mins[i]) {
+                int k = v->npar++;
+                v->par[k] = i; v->pmin[k] = mins[i]; v->pmax[k] = maxs[i];
+                v->pkind[k] = L.port_has_property(p, pt, n_toggled) ? 2
+                            : (L.port_has_property(p, pt, n_integer) || L.port_has_property(p, pt, n_enum)) ? 1 : 0;
+                LilvNode *pn = L.port_get_name(p, pt);
+                v->pname[k] = strdup(pn ? L.node_as_string(pn) : v->sym[i]);
+                if (pn) L.node_free(pn);
+            }
         } else if (L.port_is_a(p, pt, n_atom)) {
             uint8_t *b = calloc(1, ATOM_CAP);
             if (in) {
                 seq_clear(v, b);
+                if (v->midi_port < 0 && L.port_supports_event(p, pt, n_midi_ev)) v->midi_port = v->nai;
                 v->atom_in_idx[v->nai] = i;
                 v->atom_in[v->nai++] = b;
             } else {
@@ -656,6 +750,9 @@ int lv2_open(const char *id, double rate, int maxb, QInst *out, char *err, int e
     out->process = lv_process; out->destroy = lv_destroy;
     out->has_editor = lv_has_editor; out->ed_open = lv_ed_open; out->ed_close = lv_ed_close; out->ed_idle = lv_ed_idle;
     out->get_state = lv_get_state; out->set_state = lv_set_state;
+    if (v->midi_port >= 0) out->midi = lv_midi;
+    out->param_count = lv_param_count; out->param_name = lv_param_name; out->param_get = lv_param_get;
+    out->param_set = lv_param_set; out->param_text = lv_param_text;
     return 0;
 }
 

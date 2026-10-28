@@ -31,6 +31,10 @@ int  pwb_graph_open(const char *target, int rate, int quantum, int nch, const ch
     return -1;
 }
 bool pwb_graph_is_open(void) { return false; }
+void     pwb_input_enable(bool on) { (void)on; }
+int      pwb_input_channels(void) { return 0; }
+unsigned pwb_input_latency_frames(void) { return 0; }
+int      pwb_input_take(float *dst, uint32_t n) { (void)dst; (void)n; return 0; }
 int  pwb_graph_sync(int nch, const char *const *names, PwbRoute *routes, PwbRoute *master, bool quiet)
 {
     (void)nch; (void)names; (void)routes; (void)master; (void)quiet;

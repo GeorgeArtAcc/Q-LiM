@@ -60,6 +60,11 @@ static double    g_pw_paused_since = 0;
  * it used to be set only after the start, and the first callbacks could write with the wrong stride (when switching
  * from a card with many outputs to one with fewer — outside the buffer). */
 static atomic_int g_cb_ch = 2;
+/* 1.4: the input (recording): how many input channels the stream has, and the round trip delay in frames */
+static atomic_int g_in_ch = 0;
+static unsigned   g_rt_frames = 0;
+static double     g_out_lat = 0.0;     /* 1.3.1: the output delay the driver reports (s) */
+static char       g_in_name[256];
 
 static int pa_callback(const void *input, void *output,
                        unsigned long frame_count,
@@ -67,10 +72,12 @@ static int pa_callback(const void *input, void *output,
                        PaStreamCallbackFlags status_flags,
                        void *user_data)
 {
-    (void)input; (void)time_info; (void)user_data;
+    (void)time_info; (void)user_data;
     atomic_fetch_add_explicit(&g_cb_count, 1u, memory_order_relaxed);
     if (status_flags & (paOutputUnderflow | paOutputOverflow)) dsp_meter_xrun();
     uint64_t t0 = dsp_meter_now_ns();
+    int ich = atomic_load_explicit(&g_in_ch, memory_order_acquire);
+    if (input && ich > 0) mixer_set_input((const float *)input, ich, frame_count);   /* 1.4 */
     mixer_render(g_session, (float *)output, frame_count, atomic_load_explicit(&g_cb_ch, memory_order_acquire));
     dsp_meter_end(t0, frame_count, g_config.sample_rate);
     return paContinue;
@@ -168,11 +175,18 @@ static int usable_channels(const PaDeviceInfo *info)
 }
 
 /* PipeWire calls this on its real-time thread - the same as pa_callback */
+static float g_pw_in[8192 * 2];                  /* 1.4: the input of this cycle */
+static void pw_input(uint32_t frames)
+{
+    if (frames <= 8192 && pwb_input_take(g_pw_in, frames) > 0) mixer_set_input(g_pw_in, 2, frames);
+}
+
 static void pw_render(float *out, uint32_t frames, int ch, void *user)
 {
     (void)user;
     atomic_fetch_add_explicit(&g_cb_count, 1u, memory_order_relaxed);
     uint64_t t0 = dsp_meter_now_ns();
+    pw_input(frames);
     mixer_render(g_session, out, frames, ch);
     dsp_meter_end(t0, frames, g_config.sample_rate);
 }
@@ -183,6 +197,7 @@ static void pwg_channels(float *const *outs, int nouts, uint32_t frames, void *u
     (void)user;
     atomic_fetch_add_explicit(&g_cb_count, 1u, memory_order_relaxed);
     uint64_t t0 = dsp_meter_now_ns();
+    pw_input(frames);
     mixer_render_channels(g_session, outs, nouts, frames);
     dsp_meter_end(t0, frames, g_config.sample_rate);
 }
@@ -436,12 +451,45 @@ int audio_init(Session *session, const AudioConfig *config)
                 out_params.device = device;
                 out_params.channelCount = use_ch;
                 out_params.sampleFormat = paFloat32;
-                out_params.suggestedLatency = dev->defaultLowOutputLatency;
+                /* 1.3.1: the delay follows the buffer chosen in Edit -> Audio (before, the driver's "low" default was
+                 * used, which on ALSA/PulseAudio devices is often 20-40 ms whatever the buffer was) */
+                double want_lat = (double)g_config.buffer_size / (double)g_config.sample_rate;
+                out_params.suggestedLatency = want_lat;
                 out_params.hostApiSpecificStreamInfo = NULL;
 
                 atomic_store(&g_cb_ch, use_ch);
-                err = Pa_OpenStream(&g_stream, NULL, &out_params, g_config.sample_rate, g_config.buffer_size,
-                                    paClipOff, pa_callback, NULL);
+                /* 1.4: with the input too (recording) - the same device, or the default input of the same driver */
+                PaStreamParameters in_params;
+                memset(&in_params, 0, sizeof in_params);
+                PaDeviceIndex in_dev = paNoDevice;
+                if (dev->maxInputChannels > 0) in_dev = device;
+                else {
+                    const PaHostApiInfo *ha = Pa_GetHostApiInfo(dev->hostApi);
+                    if (ha && ha->defaultInputDevice != paNoDevice) in_dev = ha->defaultInputDevice;
+                }
+                const PaDeviceInfo *idev = in_dev != paNoDevice ? Pa_GetDeviceInfo(in_dev) : NULL;
+                atomic_store(&g_in_ch, 0);
+                err = paInvalidDevice;
+                if (idev && idev->maxInputChannels > 0) {
+                    int ich = idev->maxInputChannels > 16 ? 16 : idev->maxInputChannels;
+                    if (is_virtual_device(idev) && ich > 2) ich = 2;
+                    in_params.device = in_dev;
+                    in_params.channelCount = ich;
+                    in_params.sampleFormat = paFloat32;
+                    in_params.suggestedLatency = want_lat;
+                    err = Pa_OpenStream(&g_stream, &in_params, &out_params, g_config.sample_rate, g_config.buffer_size,
+                                        paClipOff, pa_callback, NULL);
+                    if (err == paNoError) {
+                        atomic_store(&g_in_ch, ich);
+                        snprintf(g_in_name, sizeof g_in_name, "%s", idev->name);
+                        printf(">>> Audio input: %s (%d channels)\n", idev->name, ich);
+                    } else {
+                        printf(">>> Audio input could not be opened with the output (%s) - playing without recording\n", Pa_GetErrorText(err));
+                    }
+                }
+                if (err != paNoError)
+                    err = Pa_OpenStream(&g_stream, NULL, &out_params, g_config.sample_rate, g_config.buffer_size,
+                                        paClipOff, pa_callback, NULL);
                 if (err != paNoError && use_ch > 2) {
                     /* the card did not open all of its outputs (busy/limited) -> try stereo */
                     fprintf(stderr, "Opening %d channels failed (%s), trying 2\n", use_ch, Pa_GetErrorText(err));
@@ -456,6 +504,13 @@ int audio_init(Session *session, const AudioConfig *config)
                     if (err != paNoError) { Pa_CloseStream(g_stream); g_stream = NULL; }
                 }
                 if (err == paNoError) {
+                    const PaStreamInfo *si = Pa_GetStreamInfo(g_stream);
+                    g_rt_frames = 0;
+                    g_out_lat = si ? si->outputLatency : 0.0;
+                    printf(">>> Audio: buffer %d frames, output delay %.1f ms (driver)\n", g_config.buffer_size, g_out_lat * 1000.0);
+                    if (si && atomic_load(&g_in_ch) > 0)
+                        g_rt_frames = (unsigned)((si->inputLatency + si->outputLatency) * (double)g_config.sample_rate + 0.5);
+                    if (g_rt_frames > (unsigned)g_config.sample_rate) g_rt_frames = 0;   /* nonsense from the driver */
                     g_config.output_channels = use_ch;
                     g_config.device_index = device;
                     {   /* remember the names too (see AudioConfig) */
@@ -514,6 +569,7 @@ void audio_shutdown(void)
         if (atomic_load(&g_lost)) Pa_AbortStream(g_stream); else Pa_StopStream(g_stream);
         Pa_CloseStream(g_stream);
         g_stream = NULL;
+        atomic_store(&g_in_ch, 0);
     }
     if (g_session) atomic_store(&g_session->audio_running, false);
     atomic_store(&g_lost, false);
@@ -702,7 +758,38 @@ void audio_health_poll(void)
 }
 
 bool audio_is_lost(void) { return atomic_load(&g_lost); }
+
+/* 1.4: recording */
+int audio_input_channels(void)
+{
+    if (g_use_pw) return pwb_input_channels();
+    return g_stream ? atomic_load(&g_in_ch) : 0;
+}
+unsigned audio_roundtrip_frames(void)
+{
+    if (g_use_pw) return pwb_input_latency_frames();
+    return g_rt_frames;
+}
+const char *audio_input_name(void) { return g_use_pw ? "PipeWire default input" : g_in_name; }
+void audio_input_want(bool on) { if (g_use_pw) pwb_input_enable(on); }
 const char *audio_lost_name(void) { return g_lost_name; }
+
+bool audio_actual_buffer(int *frames, double *out_ms)
+{
+    *frames = 0; *out_ms = 0.0;
+    if (g_use_pw) {
+        PwbStatus st;
+        pwb_get_status(&st);
+        if (st.state != 3 || st.graph_rate == 0 || st.quantum == 0) return false;
+        *frames = (int)st.quantum;
+        *out_ms = st.quantum * 1000.0 / st.graph_rate;
+        return true;
+    }
+    if (!g_stream) return false;
+    *frames = g_config.buffer_size;
+    *out_ms = g_out_lat * 1000.0;
+    return true;
+}
 
 bool audio_engine_status_text(char *out, int size)
 {

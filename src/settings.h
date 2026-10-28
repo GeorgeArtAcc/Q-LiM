@@ -20,4 +20,6 @@ int settings_load_audio(AudioConfig *config);
 // Returns 0 on success.
 int settings_save_audio(const AudioConfig *config);
 
+int  settings_ensure_dir(const char *path);   /* mkdir -p (0 = ok) */
+
 #endif

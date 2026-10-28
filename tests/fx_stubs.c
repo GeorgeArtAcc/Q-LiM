@@ -7,3 +7,4 @@ bool plugins_resolve(const char *fmt, const char *p, const char *name, char *out
 bool plugins_scanning(int *a, int *b, char *c, int d) { (void)a; (void)b; (void)c; (void)d; return false; }
 int plugins_generation(void) { return 0; }
 void *GfxSdlWindow(void) { return NULL; }
+bool plugins_is_instrument(const char *fmt, const char *id) { (void)fmt; (void)id; return false; }

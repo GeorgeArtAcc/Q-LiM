@@ -10,7 +10,7 @@
 
 // ============ Helpers ============
 
-static int ensure_dir_recursive(const char *path)
+int settings_ensure_dir(const char *path)
 {
     char tmp[1024];
     snprintf(tmp, sizeof(tmp), "%s", path);
@@ -132,7 +132,7 @@ int settings_save_audio(const AudioConfig *config)
     snprintf(dir, sizeof(dir), "%s", path);
     char *slash = strrchr(dir, '/');
     if (slash) *slash = '\0';
-    ensure_dir_recursive(dir);
+    settings_ensure_dir(dir);
 
     char tmp[1100];
     FILE *f = safe_open(path, tmp, sizeof tmp);

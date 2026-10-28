@@ -15,10 +15,25 @@
 
 typedef struct QPlug QPlug;
 
+/* 1.2: MIDI for instruments - a raw MIDI message (note on/off, CC, pitch bend...) at a frame of the block */
+typedef struct { unsigned frame; unsigned char d[3]; } QMidiEv;
+#define QMIDI_MAX 256
+
 /* Loads and activates the plugin (main thread). NULL + err on error. */
 QPlug *qplug_load(const char *fmt, const char *id, double rate, int max_block, char *err, int err_size);
-/* The RT thread: n <= max_block frames, in place. */
+/* The RT thread: n <= max_block frames, in place. An instrument without audio inputs ADDS its sound to l/r. */
 void   qplug_process(QPlug *p, float *l, float *r, unsigned n);
+/* 1.2, RT thread: MIDI for the next qplug_process (the events of one block, sorted by frame) */
+void   qplug_midi(QPlug *p, const QMidiEv *ev, int n);
+bool   qplug_wants_midi(QPlug *p);         /* the format can take MIDI (instruments; also some effects) */
+bool   qplug_is_instrument(QPlug *p);      /* no audio input (a synth): its sound is added */
+
+/* 1.2: parameters (for the device panel, like Bitwig). Main thread. Values are normalized 0..1. */
+int    qplug_param_count(QPlug *p);
+bool   qplug_param_name(QPlug *p, int i, char *name, int nsz);
+float  qplug_param_get(QPlug *p, int i);
+void   qplug_param_set(QPlug *p, int i, float v);           /* a mono plugin run twice: both instances */
+void   qplug_param_text(QPlug *p, int i, char *out, int sz);  /* the current value as the plugin shows it */
 /* Main thread (after the RT thread no longer uses it). Also closes its window. */
 void   qplug_free(QPlug *p);
 
@@ -61,6 +76,14 @@ typedef struct {
     /* state */
     int  (*get_state)(void *h, void **data, size_t *len);
     int  (*set_state)(void *h, const void *data, size_t len);
+    /* 1.2: MIDI (RT thread; the events are used by the next process call) - NULL = takes no MIDI */
+    void (*midi)(void *h, const QMidiEv *ev, int n);
+    /* 1.2: parameters (main thread; normalized 0..1). index = 0..param_count-1 of the VISIBLE parameters */
+    int  (*param_count)(void *h);
+    bool (*param_name)(void *h, int i, char *name, int nsz);
+    float (*param_get)(void *h, int i);
+    void (*param_set)(void *h, int i, float v);
+    void (*param_text)(void *h, int i, char *out, int sz);
 } QInst;
 
 int vst2_open(const char *id, double rate, int maxb, QInst *out, char *err, int esz);

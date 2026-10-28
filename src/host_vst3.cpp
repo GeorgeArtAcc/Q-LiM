@@ -16,6 +16,7 @@
 #include "pluginterfaces/vst/ivstmessage.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "pluginterfaces/base/funknown.cpp"
 
 extern "C" {
@@ -241,6 +242,32 @@ public:
 };
 static QNoEvents g_noevents;
 
+/* 1.2: the MIDI notes of one block for an instrument */
+class QEvents : public IEventList {
+public:
+    Event ev[QMIDI_MAX];
+    int n = 0;
+    int32 PLUGIN_API getEventCount() SMTG_OVERRIDE { return n; }
+    tresult PLUGIN_API getEvent(int32 i, Event &e) SMTG_OVERRIDE { if (i < 0 || i >= n) return kResultFalse; e = ev[i]; return kResultOk; }
+    tresult PLUGIN_API addEvent(Event &) SMTG_OVERRIDE { return kResultFalse; }
+    tresult PLUGIN_API queryInterface(const TUID, void **obj) SMTG_OVERRIDE { *obj = nullptr; return kNoInterface; }
+    uint32 PLUGIN_API addRef() SMTG_OVERRIDE { return 1; }
+    uint32 PLUGIN_API release() SMTG_OVERRIDE { return 1; }
+};
+
+/* UTF-16 (String128) -> UTF-8 */
+static void s16_to_utf8(const TChar *s, char *out, int sz)
+{
+    int o = 0;
+    for (int i = 0; s[i] && i < 128 && o < sz - 4; ++i) {
+        unsigned c = (unsigned)(uint16_t)s[i];
+        if (c < 0x80) out[o++] = (char)c;
+        else if (c < 0x800) { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+        else { out[o++] = (char)(0xE0 | (c >> 12)); out[o++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[o++] = (char)(0x80 | (c & 0x3F)); }
+    }
+    if (sz > 0) out[o < sz ? o : sz - 1] = 0;
+}
+
 /* ---- modules (.so): loaded once each, with a usage counter ---- */
 typedef bool (*ModEntry)(void *);
 typedef bool (*ModExit)();
@@ -440,6 +467,13 @@ struct V3 {
     PlugWin *win;
     Spsc<1024> to_audio, to_ui;
     PChanges in_ch, out_ch;
+    /* 1.2: MIDI and the parameters of the device panel */
+    bool has_ev_in;                 /* the plugin has a MIDI (event) input */
+    QEvents evs;
+    QMidiEv mq[QMIDI_MAX]; int nmq;
+    std::vector<int32> cc_map;      /* [ch*130 + cc] -> ParamID (or -1): MIDI CC / pitch bend / aftertouch through IMidiMapping */
+    std::vector<ParamID> par;       /* the visible parameters */
+    std::vector<int32> par_k;       /* their index in the controller (for getParameterInfo) */
     std::atomic<bool> dead{false};   /* the plugin threw an error (e.g. yabridge lost its connection to Wine) - it is silent now */
 };
 
@@ -493,6 +527,36 @@ static void v3_process_inner(V3 *v, float **in, float **out, unsigned n)
         PQueue *q = v->in_ch.find_or_add(e.id, &idx);
         if (q) { q->v = e.v; q->npts = 1; }
     }
+    /* 1.2: MIDI: notes -> events; CC / pitch bend / aftertouch -> the parameters the plugin maps them to */
+    v->evs.n = 0;
+    for (int k = 0; k < v->nmq; ++k) {
+        const QMidiEv &m = v->mq[k];
+        unsigned st = m.d[0] & 0xF0, ch = m.d[0] & 0x0F;
+        int32 off = (int32)(m.frame < n ? m.frame : n - 1);
+        if ((st == 0x90 || st == 0x80) && v->has_ev_in && v->evs.n < QMIDI_MAX) {
+            Event &ev = v->evs.ev[v->evs.n++];
+            memset(&ev, 0, sizeof ev);
+            ev.busIndex = 0; ev.sampleOffset = off; ev.flags = Event::kIsLive;
+            if (st == 0x90 && m.d[2] > 0) {
+                ev.type = Event::kNoteOnEvent;
+                ev.noteOn.channel = (int16)ch; ev.noteOn.pitch = m.d[1]; ev.noteOn.velocity = m.d[2] / 127.0f;
+                ev.noteOn.noteId = -1;
+            } else {
+                ev.type = Event::kNoteOffEvent;
+                ev.noteOff.channel = (int16)ch; ev.noteOff.pitch = m.d[1]; ev.noteOff.velocity = m.d[2] / 127.0f;
+                ev.noteOff.noteId = -1;
+            }
+        } else if (!v->cc_map.empty() && (st == 0xB0 || st == 0xE0 || st == 0xD0)) {
+            int cc = st == 0xB0 ? m.d[1] : st == 0xE0 ? (int)kPitchBend : (int)kAfterTouch;
+            int32 pid = v->cc_map[ch * 130 + cc];
+            if (pid < 0) continue;
+            double val = st == 0xB0 ? m.d[2] / 127.0 : st == 0xD0 ? m.d[1] / 127.0 : ((m.d[2] << 7) | m.d[1]) / 16383.0;
+            int32 idx;
+            PQueue *q = v->in_ch.find_or_add((ParamID)pid, &idx);
+            if (q) { q->v = val; q->npts = 1; }
+        }
+    }
+    v->nmq = 0;
     v->out_ch.clear();
     ProcessData d;
     d.processMode = kRealtime;
@@ -503,13 +567,66 @@ static void v3_process_inner(V3 *v, float **in, float **out, unsigned n)
     d.outputs = v->nob ? v->ob : nullptr;
     d.inputParameterChanges = &v->in_ch;
     d.outputParameterChanges = &v->out_ch;
-    d.inputEvents = &g_noevents;
+    d.inputEvents = v->has_ev_in ? (IEventList *)&v->evs : (IEventList *)&g_noevents;
     d.outputEvents = &g_noevents;
     d.processContext = &v->ctx;
     v->proc->process(d);
     v->ctx.projectTimeSamples += n;
     for (int i = 0; i < v->out_ch.n; ++i)                            /* meters etc. -> to the window */
         if (v->out_ch.q[i].npts) v->to_ui.push(PEv{ v->out_ch.q[i].id, v->out_ch.q[i].v });
+}
+
+static void v3_midi(void *h, const QMidiEv *ev, int n)
+{
+    V3 *v = (V3 *)h;
+    for (int i = 0; i < n && v->nmq < QMIDI_MAX; ++i) v->mq[v->nmq++] = ev[i];
+}
+
+/* 1.2: parameters through the controller (main thread) */
+static int v3_param_count(void *h) { return (int)((V3 *)h)->par.size(); }
+static bool v3_param_name(void *h, int i, char *name, int nsz)
+{
+    V3 *v = (V3 *)h;
+    if (!v->ctrl || i < 0 || i >= (int)v->par.size() || v->dead) return false;
+    bool ok = false;
+    GUARD_BEGIN
+    ParameterInfo pi;
+    if (v->ctrl->getParameterInfo(v->par_k[i], pi) == kResultOk && pi.id == v->par[i]) {
+        s16_to_utf8(pi.title, name, nsz);
+        if (!name[0]) s16_to_utf8(pi.shortTitle, name, nsz);
+        ok = true;
+    }
+    GUARD_END(v, "parameter name")
+    return ok;
+}
+static float v3_param_get(void *h, int i)
+{
+    V3 *v = (V3 *)h;
+    if (!v->ctrl || i < 0 || i >= (int)v->par.size() || v->dead) return 0.0f;
+    float r = 0.0f;
+    GUARD_BEGIN
+    r = (float)v->ctrl->getParamNormalized(v->par[i]);
+    GUARD_END(v, "parameter")
+    return r;
+}
+static void v3_param_set(void *h, int i, float x)
+{
+    V3 *v = (V3 *)h;
+    if (!v->ctrl || i < 0 || i >= (int)v->par.size() || v->dead) return;
+    GUARD_BEGIN
+    v->ctrl->setParamNormalized(v->par[i], x);
+    v->to_audio.push(PEv{ v->par[i], x });
+    GUARD_END(v, "parameter")
+}
+static void v3_param_text(void *h, int i, char *out, int sz)
+{
+    V3 *v = (V3 *)h;
+    if (!v->ctrl || i < 0 || i >= (int)v->par.size() || v->dead) return;
+    GUARD_BEGIN
+    String128 s;
+    memset(s, 0, sizeof s);
+    if (v->ctrl->getParamStringByValue(v->par[i], v->ctrl->getParamNormalized(v->par[i]), s) == kResultOk) s16_to_utf8(s, out, sz);
+    GUARD_END(v, "parameter text")
 }
 
 static void v3_main_idle(void *h)
@@ -794,6 +911,37 @@ extern "C" int vst3_open(const char *id, double rate, int maxb, QInst *out, char
     out->has_editor = v3_has_editor; out->ed_open = v3_ed_open; out->ed_close = v3_ed_close;
     out->main_idle = v3_main_idle;
     out->get_state = v3_get_state; out->set_state = v3_set_state;
+    /* 1.2: MIDI input (the first event bus) and the CC mapping; the visible parameters */
+    if (comp->getBusCount(kEvent, kInput) > 0) {
+        comp->activateBus(kEvent, kInput, 0, true);
+        v->has_ev_in = true;
+    }
+    if (v->ctrl) {
+        IMidiMapping *mm = nullptr;
+        if (v->ctrl->queryInterface(IMidiMapping::iid, (void **)&mm) == kResultOk && mm) {
+            v->cc_map.assign(16 * 130, -1);
+            bool any = false;
+            for (int ch = 0; ch < 16; ++ch)
+                for (int cc = 0; cc < 130; ++cc) {
+                    ParamID pid;
+                    if (mm->getMidiControllerAssignment(0, (int16)ch, (CtrlNumber)cc, pid) == kResultTrue) { v->cc_map[ch * 130 + cc] = (int32)pid; any = true; }
+                }
+            if (!any) v->cc_map.clear();
+            mm->release();
+        }
+        int nc = v->ctrl->getParameterCount();
+        for (int k = 0; k < nc; ++k) {
+            ParameterInfo pi;
+            if (v->ctrl->getParameterInfo(k, pi) != kResultOk) continue;
+            if (pi.flags & (ParameterInfo::kIsReadOnly | ParameterInfo::kIsHidden | ParameterInfo::kIsBypass)) continue;
+            if (!(pi.flags & ParameterInfo::kCanAutomate) && (pi.flags & ParameterInfo::kIsProgramChange)) continue;
+            v->par.push_back(pi.id);
+            v->par_k.push_back(k);
+        }
+    }
+    if (v->has_ev_in) out->midi = v3_midi;
+    out->param_count = v3_param_count; out->param_name = v3_param_name; out->param_get = v3_param_get;
+    out->param_set = v3_param_set; out->param_text = v3_param_text;
     return 0;
 }
 

@@ -84,4 +84,10 @@ int  pwb_graph_hw_ports(void);
 /* version of the loaded library ("" if not loaded) */
 const char *pwb_library_version(void);
 
+/* 1.4: the input (the system's default input, stereo) - open only while wanted (a channel is armed) */
+void     pwb_input_enable(bool on);
+int      pwb_input_channels(void);                /* 2 while open, else 0 */
+unsigned pwb_input_latency_frames(void);
+int      pwb_input_take(float *dst, uint32_t n);  /* RT: the input for this cycle (stereo); returns channels, 0 = none */
+
 #endif

@@ -27,7 +27,7 @@ RB := ../third_party/rubberband
 rb.o: $(RB)/single/RubberBandSingle.cpp
 	g++ -std=c++14 -O3 -ffast-math -w -c $< -o $@
 
-TEMPO_SRC := test_tempo.c $(SRC)/session.c $(SRC)/mixer.c $(SRC)/stream.c $(SRC)/stream_sndfile.c \
+TEMPO_SRC := test_tempo.c $(SRC)/session.c $(SRC)/mixer.c $(SRC)/midiq.c $(SRC)/smf.c $(SRC)/stream.c $(SRC)/stream_sndfile.c \
              $(SRC)/stream_resample.c $(SRC)/peaks.c $(SRC)/wav.c $(SRC)/diskinfo.c $(SRC)/project.c \
              $(SRC)/undo.c $(SRC)/bpm.c $(SRC)/stretch.c $(SRC)/edit.c plug_stub.c
 test_tempo: $(TEMPO_SRC) rb.o
@@ -35,7 +35,15 @@ test_tempo: $(TEMPO_SRC) rb.o
 	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(TEMPO_SRC))) rb.o $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
+REC_SRC := test_rec.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_rec: $(REC_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(REC_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(REC_SRC))) rb.o $(LIBS) -o $@
 QUEUE_SRC := test_queue.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+QUANT_SRC := test_quant.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_quant: $(QUANT_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(QUANT_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(QUANT_SRC))) rb.o $(LIBS) -o $@
 test_queue: $(QUEUE_SRC) rb.o
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(QUEUE_SRC)
 	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(QUEUE_SRC))) rb.o $(LIBS) -o $@
@@ -75,6 +83,12 @@ stress: fuzz_engine fuzz_project test_edge gen_odd_audio $(DATA)/tone.wav
 	cd /tmp && CONCURRENT=1 $(CURDIR)/fuzz_engine 6000 2 $(ODD)/*.wav $(DATA)/t_128_house.wav $(DATA)/qa.wav > /tmp/qlim_stress.log 2>&1; r=$$?; grep -aE "^(ok|FAIL|EDGE|FUZZ|ENGINE)|ERROR: AddressSanitizer|runtime error" /tmp/qlim_stress.log; exit $$r
 
 LOOP_SRC := test_loop.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+WARPSW_SRC := test_warpsw.c $(filter-out test_tempo.c,$(TEMPO_SRC))
+test_warpsw: $(WARPSW_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(WARPSW_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(WARPSW_SRC))) rb.o $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
 test_loop: $(LOOP_SRC) rb.o
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(LOOP_SRC)
 	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(LOOP_SRC))) rb.o $(LIBS) -o $@
@@ -140,6 +154,30 @@ test_fxslow: $(FXS_SRC) rb.o waitplug/slowplug.c
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
 	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXS_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
+# 1.2: instruments (MIDI in, parameters): make inst INSTDIR=<folder with the DPF Kars/Nekobi plugins>
+INST_SRC := test_inst.c fx_stubs.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_inst: $(INST_SRC)
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -c $(INST_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(INST_SRC))) host_vst3.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+INSTMIX_SRC := test_instmix.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_instmix: $(INSTMIX_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(INSTMIX_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(INSTMIX_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+MIDICLIP_SRC := test_midiclip.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_midiclip: $(MIDICLIP_SRC) rb.o
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(MIDICLIP_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(MIDICLIP_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+inst: test_inst test_instmix test_midiclip
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_inst $(INSTDIR) | grep -E "^(ok|FAIL|INST|      )"
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_instmix $(INSTDIR) | grep -E "^(ok|FAIL|INSTMIX)"
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_midiclip $(INSTDIR) | grep -E "^(ok|FAIL|MIDICLIP)"
+
 fx: test_fx test_fxrace test_fxwait test_fxslow
 	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_fx $(QTEST) | grep -E "^(ok|FAIL|FX)"
 	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_fxrace $(QTEST) | grep -E "^(ok|FAIL|FXRACE)|ERROR|SUMMARY"
@@ -149,7 +187,7 @@ fx: test_fx test_fxrace test_fxwait test_fxslow
 test_applog: test_applog.c $(SRC)/applog.c
 	gcc $(CFLAGS) $^ -lpthread -o $@
 
-test: test_applog test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_stretch test_bpm test_tempo test_queue test_xfade test_loop $(DATA)/tone.wav
+test: test_applog test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_stretch test_bpm test_tempo test_queue test_quant test_rec test_xfade test_loop test_warpsw $(DATA)/tone.wav
 	./test_applog
 	./test_edit | grep -E "^(ok|FAIL|EDIT)"
 	./fuzz_edit 1500
@@ -162,10 +200,13 @@ test: test_applog test_edit fuzz_edit test_trimrace test_cut test_level test_gra
 	cd /tmp && $(CURDIR)/test_tempo $(DATA)/t_128_house.wav $(DATA)/tone.wav | grep -E "^(ok|FAIL|TEMPO)"
 	python3 gen_queue_audio.py $(DATA)
 	cd /tmp && $(CURDIR)/test_queue $(DATA)/qa.wav $(DATA)/qb.wav | grep -E "^(ok|FAIL|QUEUE)"
+	cd /tmp && $(CURDIR)/test_quant $(DATA)/qa.wav $(DATA)/qb.wav | grep -E "^(ok|FAIL|QUANT)"
+	cd /tmp && $(CURDIR)/test_rec | grep -E "^(ok|FAIL|REC)"
 	python3 gen_xfade_audio.py $(DATA)
 	cd /tmp && $(CURDIR)/test_xfade $(DATA)/xa.wav $(DATA)/xb.wav | grep -E "^(ok|FAIL|XFADE|   )"
 	python3 gen_sine.py $(DATA)
 	cd /tmp && $(CURDIR)/test_loop $(DATA)/sine48.wav $(DATA)/sine44.wav | grep -E "^(ok|FAIL|LOOP)"
+	cd /tmp && $(CURDIR)/test_warpsw $(DATA)/sine48.wav | grep -E "^(ok|FAIL|WARPSW)"
 
 # Direct PipeWire output (step 25): no sound, only checks that it runs and with what buffer.
 #   make pwcheck                                   (the default system output)
@@ -177,4 +218,4 @@ pwcheck: test_pw
 	./test_pw check $(or $(PW_OUT),-) $(or $(PW_RATE),48000) $(or $(PW_BUF),256)
 
 clean:
-	rm -f test_pw test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_applog test_stretch test_bpm test_tempo test_queue test_xfade test_loop test_fx test_fxrace test_fxwait test_fxslow fuzz_engine fuzz_project test_edge gen_odd_audio *.o
+	rm -f test_pw test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_applog test_stretch test_bpm test_tempo test_queue test_quant test_rec test_xfade test_loop test_warpsw test_fx test_fxrace test_fxwait test_fxslow test_inst test_instmix test_midiclip fuzz_engine fuzz_project test_edge gen_odd_audio *.o

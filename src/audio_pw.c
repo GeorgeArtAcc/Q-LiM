@@ -676,6 +676,115 @@ static SinkSlot *find_sink_locked(const char *name)
     return NULL;
 }
 
+/* ================= 1.4: the input (capture) =================
+ * A second stream from the system's default input (2 channels). It runs only while a channel is armed
+ * (pwb_input_enable). Its process callback puts the audio into a ring; the output side takes the same number of
+ * frames per cycle (pwb_input_take), so the input arrives with one cycle of delay. */
+#define IN_RING 32768u                                   /* frames (power of 2) */
+static struct { struct pw_stream *stream; struct spa_hook hook; atomic_bool want, open; } I;
+static float       g_iring[IN_RING * 2];
+static atomic_uint g_iw, g_ir;
+
+static void in_process(void *data)
+{
+    (void)data;
+    struct pw_buffer *b = P.stream_dequeue_buffer(I.stream);
+    if (!b) return;
+    struct spa_data *d = &b->buffer->datas[0];
+    if (d->data && d->chunk && d->chunk->size > 0) {
+        const float *src = (const float *)((const uint8_t *)d->data + d->chunk->offset);
+        uint32_t n = d->chunk->size / (uint32_t)(sizeof(float) * 2);
+        unsigned w = atomic_load_explicit(&g_iw, memory_order_relaxed), r = atomic_load_explicit(&g_ir, memory_order_acquire);
+        for (uint32_t i = 0; i < n && w - r < IN_RING; ++i, ++w) {
+            g_iring[(w % IN_RING) * 2] = src[i * 2];
+            g_iring[(w % IN_RING) * 2 + 1] = src[i * 2 + 1];
+        }
+        atomic_store_explicit(&g_iw, w, memory_order_release);
+    }
+    P.stream_queue_buffer(I.stream, b);
+}
+
+static const struct pw_stream_events in_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .process = in_process,
+};
+
+/* 1.3.1: the buffer chosen in Edit -> Audio. node.latency alone is only a wish (another program, or the system
+ * default, may keep the graph at 1024); node.force-quantum (PipeWire 0.3.65+, ignored by older ones) makes the whole
+ * graph run with it while Q-LiM plays - the same thing pw-jack does when a JACK program sets its buffer. */
+static int g_req_quantum;
+
+static void in_open_locked(int rate)
+{
+    if (I.stream || !C.core) return;
+    struct pw_properties *props = P.properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Production",
+        PW_KEY_APP_NAME, "Q-LiM", PW_KEY_NODE_NAME, "Q-LiM input", PW_KEY_NODE_DESCRIPTION, "Q-LiM input", NULL);
+    P.properties_setf(props, PW_KEY_NODE_RATE, "1/%d", rate);
+    if (g_req_quantum > 0) P.properties_setf(props, PW_KEY_NODE_LATENCY, "%d/%d", g_req_quantum, rate);
+    I.stream = P.stream_new(C.core, "Q-LiM input", props);
+    if (!I.stream) return;
+    P.stream_add_listener(I.stream, &I.hook, &in_events, NULL);
+    uint8_t pod_buf[512];
+    struct spa_pod_builder bld = SPA_POD_BUILDER_INIT(pod_buf, sizeof pod_buf);
+    struct spa_audio_info_raw info;
+    memset(&info, 0, sizeof info);
+    info.format = SPA_AUDIO_FORMAT_F32;
+    info.rate = (uint32_t)rate;
+    info.channels = 2;
+    info.position[0] = SPA_AUDIO_CHANNEL_FL; info.position[1] = SPA_AUDIO_CHANNEL_FR;
+    const struct spa_pod *params[1] = { spa_format_audio_raw_build(&bld, SPA_PARAM_EnumFormat, &info) };
+    atomic_store(&g_iw, 0u); atomic_store(&g_ir, 0u);
+    if (P.stream_connect(I.stream, PW_DIRECTION_INPUT, PW_ID_ANY,
+                         PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS, params, 1) < 0) {
+        spa_hook_remove(&I.hook); P.stream_destroy(I.stream); I.stream = NULL;
+        printf(">>> PipeWire input: could not connect\n");
+        return;
+    }
+    atomic_store(&I.open, true);
+    printf(">>> PipeWire input opened (the system's default input)\n");
+}
+
+static void in_close_locked(void)
+{
+    if (!I.stream) return;
+    atomic_store(&I.open, false);
+    spa_hook_remove(&I.hook);
+    P.stream_destroy(I.stream);
+    I.stream = NULL;
+    printf(">>> PipeWire input closed\n");
+}
+
+void pwb_input_enable(bool on)
+{
+    atomic_store(&I.want, on);
+    if (!g_connected || !C.loop) return;
+    if (on == atomic_load(&I.open)) return;
+    P.tl_lock(C.loop);
+    if (on) in_open_locked(S.rate > 0 ? S.rate : 48000); else in_close_locked();
+    P.tl_unlock(C.loop);
+}
+int pwb_input_channels(void) { return atomic_load(&I.open) ? 2 : 0; }
+unsigned pwb_input_latency_frames(void)
+{
+    unsigned q = atomic_load(&g_quantum);
+    return q ? q * 3 : 0;                            /* out + in + the ring: about three cycles */
+}
+
+/* RT (the output side): n frames of the input (stereo) into dst; 0 if there is none */
+int pwb_input_take(float *dst, uint32_t n)
+{
+    if (!atomic_load_explicit(&I.open, memory_order_acquire)) return 0;
+    unsigned r = atomic_load_explicit(&g_ir, memory_order_relaxed), w = atomic_load_explicit(&g_iw, memory_order_acquire);
+    unsigned have = w - r;
+    if (have > n * 4 + 2048) { r = w - n * 2; have = n * 2; }   /* it ran ahead (clock drift / a gap): keep the delay small */
+    uint32_t k = have < n ? have : n;
+    for (uint32_t i = 0; i < k; ++i, ++r) { dst[i * 2] = g_iring[(r % IN_RING) * 2]; dst[i * 2 + 1] = g_iring[(r % IN_RING) * 2 + 1]; }
+    for (uint32_t i = k; i < n; ++i) { dst[i * 2] = 0.0f; dst[i * 2 + 1] = 0.0f; }
+    atomic_store_explicit(&g_ir, r, memory_order_release);
+    return 2;
+}
+
 int pwb_open(const char *target, int rate, int quantum, int channels,
              PwbRenderFn fn, void *user, int *out_channels, char *err, int err_size)
 {
@@ -715,6 +824,9 @@ int pwb_open(const char *target, int rate, int quantum, int channels,
         PW_KEY_NODE_ALWAYS_PROCESS, "true",
         NULL);
     P.properties_setf(props, PW_KEY_NODE_LATENCY, "%d/%d", quantum, rate);   /* the desired buffer */
+    P.properties_setf(props, "node.force-quantum", "%d", quantum);             /* ... and really use it (1.3.1) */
+    P.properties_set(props, "node.lock-quantum", "true");
+    g_req_quantum = quantum;
     P.properties_setf(props, PW_KEY_NODE_RATE, "1/%d", rate);                /* request that the graph switches to our rate */
     if (explicit_target) {
         P.properties_set(props, PW_KEY_TARGET_OBJECT, sl->s.name);
@@ -777,6 +889,7 @@ int pwb_open(const char *target, int rate, int quantum, int channels,
     end = now_ns() + 1500000000ull;
     while (atomic_load(&g_state) == 2 && atomic_load(&g_callbacks) == 0 && now_ns() < end) P.tl_timed_wait(C.loop, 1);
     printf(">>> PipeWire node id %u -> %s\n", P.stream_get_node_id(S.stream), S.target_desc);
+    if (atomic_load(&I.want)) in_open_locked(rate);     /* 1.4: a channel is armed */
     P.tl_unlock(C.loop);
     if (out_channels) *out_channels = ch;
     return 0;
@@ -786,6 +899,7 @@ static void disconnect_all(void)
 {
     if (!C.loop) { g_connected = false; return; }
     P.tl_stop(C.loop);                    /* the thread stops -> no more events, no lock needed */
+    in_close_locked();                    /* 1.4 */
     if (S.stream) { spa_hook_remove(&S.hook); P.stream_destroy(S.stream); S.stream = NULL; }
     graph_teardown_filters();
     for (int i = 0; i < PWB_MAX_SINKS; ++i) {
@@ -1105,6 +1219,8 @@ static struct pw_properties *node_props(const char *name, const char *desc)
         NULL);
     P.properties_set(pr, PW_KEY_NODE_GROUP, G.group);   /* the two nodes - always in one cycle, with one clock */
     P.properties_setf(pr, PW_KEY_NODE_LATENCY, "%d/%d", G.quantum, G.rate);
+    P.properties_setf(pr, "node.force-quantum", "%d", G.quantum);              /* 1.3.1: see g_req_quantum */
+    P.properties_set(pr, "node.lock-quantum", "true");
     P.properties_setf(pr, PW_KEY_NODE_RATE, "1/%d", G.rate);
     return pr;
 }
@@ -1390,7 +1506,7 @@ int pwb_graph_open(const char *target, int rate, int quantum, int nch, const cha
     S.rate = rate;
     snprintf(S.target_desc, sizeof S.target_desc, "%s", sl->s.desc);
     G.chfn = chfn; G.mfn = mfn; G.user = user;
-    G.rate = rate; G.quantum = quantum;
+    G.rate = rate; G.quantum = quantum; g_req_quantum = quantum;
     snprintf(G.group, sizeof G.group, "qlim-%ld", (long)getpid());
     G.target_node = sl->s.id;
     G.ch_node = G.m_node = SPA_ID_INVALID;
@@ -1446,6 +1562,7 @@ int pwb_graph_open(const char *target, int rate, int quantum, int nch, const cha
     if (hw <= 0) hw = sl->s.channels > 0 ? sl->s.channels : 2;
     printf(">>> PipeWire graph: nodes 'Q-LiM' (id %u, %d channels) and 'Q-LiM Master' (id %u) -> %s (%d inputs)\n",
            G.ch_node, nch, G.m_node, S.target_desc, hw);
+    if (atomic_load(&I.want)) in_open_locked(rate);     /* 1.4: a channel is armed */
     P.tl_unlock(C.loop);
     if (out_hw_ports) *out_hw_ports = hw;
     return 0;

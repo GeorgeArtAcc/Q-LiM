@@ -10,7 +10,8 @@
 #include <sys/stat.h>
 
 static const char *k_ext[] = { "wav", "flac", "ogg", "oga", "opus", "mp3", "aif", "aiff", "aifc", "m4a", "aac",
-                               "wma", "mp2", "au", "caf", "w64", "wv", "ape", "mka", NULL };
+                               "wma", "mp2", "au", "caf", "w64", "wv", "ape", "mka",
+                               "mid", "midi", NULL };      /* 1.3: MIDI files become MIDI clips */
 
 int dropfiles_is_audio(const char *path)
 {

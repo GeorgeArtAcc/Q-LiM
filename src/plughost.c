@@ -96,11 +96,65 @@ static void run_chunk(QPlug *p, float *l, float *r, unsigned n)
         }
         for (int c = 0; c < a->nout; ++c) memset(p->bo[c], 0, n * sizeof(float));
         a->process(a->h, p->bi, p->bo, n);
-        memcpy(l, p->bo[0], n * sizeof(float));
-        memcpy(r, p->bo[a->nout >= 2 ? 1 : 0], n * sizeof(float));
+        const float *ol = p->bo[0], *orr = p->bo[a->nout >= 2 ? 1 : 0];
+        if (a->nin == 0) {                                /* 1.2: instrument - its sound is added to what came in */
+            for (unsigned i = 0; i < n; ++i) { l[i] += ol[i]; r[i] += orr[i]; }
+        } else {
+            memcpy(l, ol, n * sizeof(float));
+            memcpy(r, orr, n * sizeof(float));
+        }
     }
     clean(l, n);
     clean(r, n);
+}
+
+void qplug_midi(QPlug *p, const QMidiEv *ev, int n)
+{
+    if (!p || n <= 0) return;
+    for (int i = 0; i < p->ninst; ++i) if (p->in[i].midi) p->in[i].midi(p->in[i].h, ev, n);
+}
+bool qplug_wants_midi(QPlug *p) { return p && p->in[0].midi != NULL; }
+bool qplug_is_instrument(QPlug *p) { return p && p->in[0].nin == 0; }
+
+int qplug_param_count(QPlug *p) { return p && p->in[0].param_count ? p->in[0].param_count(p->in[0].h) : 0; }
+bool qplug_param_name(QPlug *p, int i, char *name, int nsz)
+{
+    if (nsz > 0) name[0] = 0;
+    return p && p->in[0].param_name ? p->in[0].param_name(p->in[0].h, i, name, nsz) : false;
+}
+float qplug_param_get(QPlug *p, int i) { return p && p->in[0].param_get ? p->in[0].param_get(p->in[0].h, i) : 0.0f; }
+void qplug_param_set(QPlug *p, int i, float v)
+{
+    if (!p) return;
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    for (int k = 0; k < p->ninst; ++k) if (p->in[k].param_set) p->in[k].param_set(p->in[k].h, i, v);
+    qplug_note_edit();
+}
+void qplug_param_text(QPlug *p, int i, char *out, int sz)
+{
+    if (sz > 0) out[0] = 0;
+    if (p && p->in[0].param_text) p->in[0].param_text(p->in[0].h, i, out, sz);
+    if (sz > 0 && !out[0]) { snprintf(out, (size_t)sz, "%.0f%%", 100.0 * qplug_param_get(p, i)); return; }
+    /* "75.000000 %" -> "75 %", "0.010000 s" -> "0.01 s": a number with too many digits is shortened */
+    char *end;
+    while (*out == ' ') memmove(out, out + 1, strlen(out));
+    double x = strtod(out, &end);
+    if (end != out && (*end == 0 || *end == ' ') && strlen(out) > 1) {
+        char unit[64];
+        snprintf(unit, sizeof unit, "%s", end);
+        double ax = fabs(x);
+        int dec = ax >= 100.0 ? 0 : ax >= 10.0 ? 1 : 2;
+        char num[48];
+        snprintf(num, sizeof num, "%.*f", dec, x);
+        if (strchr(num, '.')) {                       /* drop the zeros at the end: 75.0 -> 75, 0.50 -> 0.5 */
+            size_t L = strlen(num);
+            while (L > 0 && num[L - 1] == '0') num[--L] = 0;
+            if (L > 0 && num[L - 1] == '.') num[--L] = 0;
+        }
+        if (!strcmp(num, "-0")) strcpy(num, "0");
+        snprintf(out, (size_t)sz, "%s%s", num, unit);
+    }
 }
 
 void qplug_process(QPlug *p, float *l, float *r, unsigned n)

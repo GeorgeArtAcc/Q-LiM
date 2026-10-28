@@ -599,18 +599,7 @@ static void parse_lines(const char *lines, Lists *L)
         int nf = 0;
         for (char *t = line; t && nf < 8; ) { f[nf++] = t; t = strchr(t, '\t'); if (t) *t++ = 0; }
         if (!strcmp(f[0], "PLUG") && nf >= 5) {
-            bool inst = !strcmp(f[4], "inst");
-            if (inst) {
-                PluginProblem *np = realloc(L->pr, sizeof *np * (size_t)(L->npr + 1));
-                if (!np) continue;
-                L->pr = np;
-                PluginProblem *q = &L->pr[L->npr++];
-                snprintf(q->fmt, sizeof q->fmt, "%s", f[1]);
-                snprintf(q->name, sizeof q->name, "%s", f[2]);
-                snprintf(q->path, sizeof q->path, "%s", f[3]);
-                snprintf(q->reason, sizeof q->reason, "instrument (needs MIDI notes) - not supported yet");
-                continue;
-            }
+            bool inst = !strcmp(f[4], "inst");        /* 1.2: instruments are usable (they get MIDI) */
             if (strlen(f[3]) >= PLUGIN_PATH_LEN) continue;
             bool dup = false;
             for (int i = 0; i < L->npl; ++i) if (!strcmp(L->pl[i].fmt, f[1]) && !strcmp(L->pl[i].path, f[3])) dup = true;
@@ -622,7 +611,7 @@ static void parse_lines(const char *lines, Lists *L)
             snprintf(p->fmt, sizeof p->fmt, "%s", f[1]);
             snprintf(p->name, sizeof p->name, "%s", f[2]);
             snprintf(p->path, sizeof p->path, "%s", f[3]);
-            p->inst = false;
+            p->inst = inst;
         } else if (!strcmp(f[0], "ERR") && nf >= 5) {
             PluginProblem *np = realloc(L->pr, sizeof *np * (size_t)(L->npr + 1));
             if (!np) continue;
@@ -782,4 +771,15 @@ int plugins_scan_child_main(int argc, char **argv)
     qplug_scan_child(argv[2], argv[3]);
     fflush(stdout);
     _exit(0);                         /* no destructors: some plugins crash on exit */
+}
+
+/* 1.2: the scan marked this plugin as an instrument (main thread) */
+bool plugins_is_instrument(const char *fmt, const char *id)
+{
+    int n = plugins_count();
+    for (int i = 0; i < n; ++i) {
+        const PluginInfo *p = plugins_get(i);
+        if (p && p->inst && !strcmp(p->fmt, fmt) && !strcmp(p->path, id)) return true;
+    }
+    return false;
 }

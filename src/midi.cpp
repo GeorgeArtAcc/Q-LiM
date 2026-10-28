@@ -25,6 +25,9 @@
 #endif
 
 #include <atomic>
+extern "C" {
+#include "midiq.h"
+}
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -68,7 +71,14 @@ void push_event(unsigned char type, unsigned char ch, unsigned char a, unsigned 
 
 void rt_callback(double, std::vector<unsigned char> *msg, void *)
 {
-    if (!msg || msg->size() < 3) return;
+    if (!msg || msg->empty()) return;
+    /* 1.2: every channel message also goes to the instruments (the audio thread gives it to the armed channel) */
+    {
+        unsigned char s0 = (*msg)[0];
+        if (s0 >= 0x80 && s0 < 0xF0)
+            midiq_push(MIDIQ_HW, s0, msg->size() > 1 ? (*msg)[1] : 0, msg->size() > 2 ? (*msg)[2] : 0);
+    }
+    if (msg->size() < 3) return;
     unsigned char st = (*msg)[0];
     unsigned char kind = st & 0xF0;
     unsigned char ch = st & 0x0F;

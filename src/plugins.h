@@ -30,7 +30,7 @@ typedef struct {
     char reason[200];
 } PluginProblem;
 
-/* The usable effects. Instruments (they want MIDI) are in "Problems" for now.
+/* The usable plugins: effects and (1.2) instruments (PluginInfo.inst).
  * The first query starts a scan in the background (plugins_start() starts it at startup). */
 void              plugins_start(void);
 int               plugins_count(void);
@@ -38,7 +38,8 @@ const PluginInfo *plugins_get(int i);
 int                  plugins_problem_count(void);
 const PluginProblem *plugins_problem_get(int i);
 
-void plugins_rescan(bool full);              /* full = without the cache (checks everything again) */
+void plugins_rescan(bool full);
+bool plugins_is_instrument(const char *fmt, const char *id);   /* 1.2: the scan says "instrument" */              /* full = without the cache (checks everything again) */
 bool plugins_scanning(int *done, int *total, char *current, int csz);
 int  plugins_generation(void);               /* grows with every new scan (for redrawing) */
 /* By id (or an old entry from step 33: only the bundle path) finds the full id. false = not found. */

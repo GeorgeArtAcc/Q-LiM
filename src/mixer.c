@@ -2,6 +2,7 @@
 #include "mixer.h"
 #include "stream.h"
 #include "fxchain.h"
+#include "midiq.h"
 #include <math.h>
 #include <string.h>
 
@@ -77,6 +78,18 @@ static size_t clip_read(Clip *cl, float *out, unsigned n)
         cl->stretch_live = true;
     }
     return stretch_process(st, session_clip_speed(cl), out, n, pull_stream, cl->stream);
+}
+
+/* The same, but through the path chosen by the caller (used for the last block of the OLD path when warp
+ * is switched on/off while playing: it is faded out, then the new path is faded in). */
+static size_t clip_read_path(Clip *cl, float *out, unsigned n, bool via_stretch)
+{
+    Stretch *st = cl->stretch;
+    if (via_stretch && st && cl->stretch_live)
+        return stretch_process(st, session_clip_speed_warp(cl), out, n, pull_stream, cl->stream);
+    if (!via_stretch && !(cl->stretch_live && st)) return stream_read(cl->stream, out, n);
+    memset(out, 0, (size_t)n * 2 * sizeof(float));      /* the old path is not available any more: silence */
+    return n;
 }
 
 /* Has the clip ended: with stretch on a background thread — when the tail has been played too. */
@@ -162,6 +175,7 @@ static Clip *q_at(Session *s, int idx)
 
 #define DC_TAIL   128     /* ~2.7 ms: fade-out of stopped/skipped audio */
 #define DC_FADEIN 64      /* ~1.3 ms: fade-in at the start of started/skipped audio */
+#define WSW_FADEIN 480    /* ~10 ms: fade-in of the new sound after warp is switched on/off while playing */
 
 static void queue_launch(Session *s, unsigned n)
 {
@@ -228,6 +242,138 @@ static void queue_launch(Session *s, unsigned n)
     atomic_store(&s->q_launched, nx + 1);
 }
 
+/* ===== 1.1: quantized launch (audio thread) =====
+ * The clips that wait (ql_state) start/stop/restart exactly at their beat: inside this block at the right sample. */
+static void ql_audio_stop(Clip *o)
+{
+    atomic_store(&o->playing, false);
+    atomic_store(&o->paused, false);
+    if (o->stretch) stretch_release(o->stretch);
+    atomic_store(&o->ql_stopped, true);               /* the UI finishes it (stream) */
+}
+
+static void ql_process(Session *s, unsigned n)
+{
+    if (atomic_load_explicit(&s->ql_pending, memory_order_acquire) <= 0) return;
+    float T = atomic_load(&s->tempo);
+    if (!(T > 0.0f)) T = 120.0f;
+    double fpb = 60.0 * (double)(s->sample_rate > 0 ? s->sample_rate : 48000) / (double)T;   /* frames per beat */
+    double tp = atomic_load(&s->tp_beats);
+    for (int c = 0; c < s->channel_count; ++c) {
+        Channel *ch = &s->channels[c];
+        for (int sc = 0; sc < s->scene_count; ++sc) {
+            Clip *cl = &ch->clips[sc];
+            int st = atomic_load_explicit(&cl->ql_state, memory_order_acquire);
+            if (!st) continue;
+            double fu = floor((atomic_load(&cl->ql_beat) - tp) * fpb + 0.5);   /* nearest sample (the beat count is a sum of doubles) */
+            if (fu >= (double)n) continue;                 /* not in this block yet */
+            if (!atomic_compare_exchange_strong(&cl->ql_state, &st, 0)) continue;
+            atomic_fetch_sub(&s->ql_pending, 1);
+            unsigned off = fu > 0.0 ? (unsigned)fu : 0;
+            if (off >= n) off = n - 1;
+            if (st == 1) {
+                if (!atomic_load(&cl->has_clip) || (!cl->stream && !atomic_load(&cl->is_midi))) continue;
+                for (int k = 0; k < s->scene_count; ++k) {  /* one clip per channel: what played here stops now */
+                    Clip *o = &ch->clips[k];
+                    if (o != cl && atomic_load(&o->playing)) ql_audio_stop(o);
+                }
+                cl->start_offset = off;
+                cl->q_launch = false;
+                atomic_store(&cl->ended, false);
+                atomic_store(&cl->playing, true);
+            } else if (st == 2) {
+                ql_audio_stop(cl);
+            } else if (st == 3 && atomic_load(&cl->is_midi)) {  /* 1.3: a MIDI clip restarts exactly here */
+                atomic_fetch_add(&cl->m_gen, 1);
+                cl->start_offset = off;
+            } else if (st == 3) {
+                atomic_store(&cl->ql_restart_now, true);    /* a playing clip from the start: the UI seeks it */
+            }
+        }
+    }
+}
+
+/* the transport: runs while something plays (pause = it stands), back to 0 when everything has stopped */
+static void transport_advance(Session *s, unsigned n)
+{
+    if (atomic_exchange(&s->tp_reset, false)) { atomic_store(&s->tp_running, false); atomic_store(&s->tp_beats, 0.0); }
+    bool any = false, paused = false;
+    for (int c = 0; c < s->channel_count && !any; ++c)
+        for (int sc = 0; sc < s->scene_count; ++sc) {
+            Clip *cl = &s->channels[c].clips[sc];
+            if (!atomic_load_explicit(&cl->playing, memory_order_relaxed)) {
+                if (atomic_load_explicit(&cl->paused, memory_order_relaxed)) paused = true;
+                continue;
+            }
+            any = true; break;
+        }
+    if (!any && atomic_load_explicit(&s->rec_active, memory_order_relaxed) > 0)   /* 1.4: a recording runs the count too */
+        for (int i = 0; i < MAX_REC && !any; ++i) { int st = atomic_load(&s->rec[i].state); any = st == REC_ON || st == REC_STOPPING; }
+    if (any) {
+        float T = atomic_load(&s->tempo);
+        if (!(T > 0.0f)) T = 120.0f;
+        double fpb = 60.0 * (double)(s->sample_rate > 0 ? s->sample_rate : 48000) / (double)T;
+        if (atomic_load(&s->tp_running)) atomic_store(&s->tp_beats, atomic_load(&s->tp_beats) + (double)n / fpb);
+        else {
+            double st = atomic_exchange(&s->tp_start, 0.0);   /* 1.3.1: a MIDI clip played from a beat: the count follows it */
+            atomic_store(&s->tp_beats, st + (double)n / fpb); atomic_store(&s->tp_running, true);
+        }
+    } else if (!paused && atomic_load(&s->ql_pending) <= 0) {
+        atomic_store(&s->tp_running, false);
+        atomic_store(&s->tp_beats, 0.0);
+    }
+}
+
+/* ===== 1.3.1: the metronome =====
+ * A short "tick" on every beat of the transport (higher and louder on the 1st beat of the bar), added to the master
+ * output after its volume (so it is heard even with the master turned down; it is not in the meters). The beats of
+ * this block are [tp_beats - n/fpb, tp_beats): in both modes this runs right after transport_advance for the same
+ * frames (graph mode: the master node runs in the same cycle as the channels). */
+static long long s_met_last = -1;                       /* the last beat that clicked */
+static double    s_met_ph, s_met_w;                     /* sine phase / step */
+static unsigned  s_met_left, s_met_pos;                 /* frames still to play / already played of the tick */
+static float     s_met_amp;
+static double    s_met_end = -1.0;                      /* graph mode: the beat at the end of this part of the cycle */
+#define MET_LEN_S 0.045
+
+static void metro_add(Session *s, float *oL, float *oR, unsigned n)
+{
+    int sr = s->sample_rate > 0 ? s->sample_rate : 48000;
+    bool on = atomic_load_explicit(&s->metronome, memory_order_relaxed);
+    bool run = atomic_load_explicit(&s->tp_running, memory_order_relaxed);
+    if (!run) s_met_last = -1;
+    long long kfire = -1; unsigned ffire = 0;
+    if (on && run) {
+        float T = atomic_load(&s->tempo);
+        if (!(T > 0.0f)) T = 120.0f;
+        double bpf = (double)T / (60.0 * (double)sr);
+        double b1 = s_met_end >= 0.0 ? s_met_end : atomic_load(&s->tp_beats), b0 = b1 - (double)n * bpf;
+        long long k = (long long)ceil(b0 - 1e-7);
+        if (k < 0) k = 0;
+        if (k <= s_met_last) k = s_met_last + 1;
+        if ((double)k < b1 - 1e-9) {
+            double fr = ((double)k - b0) / bpf;
+            kfire = k; ffire = fr <= 0.0 ? 0 : fr >= n ? n - 1 : (unsigned)fr;
+            s_met_last = k;
+        }
+    }
+    for (unsigned i = 0; i < n; ++i) {
+        if (kfire >= 0 && i == ffire) {
+            bool acc = kfire % 4 == 0;
+            s_met_w = 2.0 * M_PI * (acc ? 1760.0 : 1320.0) / (double)sr;
+            s_met_amp = acc ? 0.55f : 0.35f;
+            s_met_ph = 0.0; s_met_pos = 0; s_met_left = (unsigned)(MET_LEN_S * sr);
+        }
+        if (!s_met_left) continue;
+        double t = (double)s_met_pos / (double)sr;
+        double env = (t < 0.001 ? t / 0.001 : 1.0) * exp(-t / 0.011);   /* 1 ms attack (no click), fast decay */
+        float v = (float)(sin(s_met_ph) * env) * s_met_amp;
+        s_met_ph += s_met_w;
+        ++s_met_pos; --s_met_left;
+        oL[i] += v; oR[i] += v;
+    }
+}
+
 /* Master: volume (smoothed), balance, metering. Input L/R -> output oL/oR (no clipping). May write into the same buffers. */
 static void master_block(Session *s, const float *inL, const float *inR, float *oL, float *oR, unsigned n,
                          float *master_peak, float *mpk_l, float *mpk_r)
@@ -271,6 +417,7 @@ static void master_block(Session *s, const float *inL, const float *inR, float *
     atomic_store(&s->master_smooth_gain, mc);
     atomic_store(&s->master_smooth_pan, mp);
     if (clip) atomic_store(&s->master_clipped, true);
+    metro_add(s, oL, oR, n);
 }
 
 static inline float clip1(float v)
@@ -281,11 +428,312 @@ static inline float clip1(float v)
 
 /* gouts != NULL -> graph mode (PipeWire, step 28): every channel (after volume/pan/mute) goes into its
  * 2 buffers gouts[2c], gouts[2c+1] (from position goff); the routing and the master are links in the graph -> not done here. */
+/* ===== 1.2: MIDI for the instruments =====
+ * At the start of a block the audio thread takes everything that came (keyboard, computer keys) and sorts it per
+ * channel: a note-on goes to the armed channel (midi_target) and that channel is remembered for the note, so its
+ * note-off goes to the SAME channel even if another channel was selected meanwhile (no hanging notes). */
+static QMidiEv s_chev[MAX_CHANNELS][QMIDI_MAX];
+static int     s_chn[MAX_CHANNELS];
+static signed char s_held[16][128];              /* channel + 1 that got the note-on, 0 = not held */
+
+static void ch_ev_at(int c, unsigned frame, const unsigned char *m)
+{
+    if (c < 0 || c >= MAX_CHANNELS || s_chn[c] >= QMIDI_MAX) return;
+    QMidiEv *e = &s_chev[c][s_chn[c]++];
+    e->frame = frame;
+    memcpy(e->d, m, 3);
+}
+static void ch_ev(int c, const unsigned char *m) { ch_ev_at(c, 0, m); }
+
+/* ===== 1.3: MIDI clips =====
+ * Every block: the notes of a playing MIDI clip that fall into this block become MIDI events for its channel, at the
+ * exact frame (the beat comes from the master tempo). The keys that sound are remembered (m_off = their end), so
+ * stopping, looping or editing never leaves a hanging note. */
+static void mclip_off(int c, Clip *cl, int key, unsigned frame)
+{
+    unsigned char o[3] = { 0x80, (unsigned char)key, 0 };
+    ch_ev_at(c, frame, o);
+    cl->m_off[key] = -1.0f;
+}
+static void mclip_all_off(int c, Clip *cl, unsigned frame)
+{
+    for (int k = 0; k < 128; ++k) if (cl->m_off[k] >= 0.0f) mclip_off(c, cl, k, frame);
+}
+
+static void mclip_block(Session *s, int c, Clip *cl, unsigned n)
+{
+    bool here = atomic_load_explicit(&cl->has_clip, memory_order_acquire) && atomic_load(&cl->is_midi);
+    bool pl = here && atomic_load(&cl->playing);
+    if (!pl) {
+        if (cl->m_live) { mclip_all_off(c, cl, 0); cl->m_live = false; }
+        return;
+    }
+    MidiSeq *m = atomic_load_explicit(&cl->mseq, memory_order_acquire);
+    if (!m) return;
+    unsigned f = cl->start_offset;
+    cl->start_offset = 0;
+    if (f >= n) f = n - 1;
+    unsigned g = atomic_load(&cl->m_gen);
+    if (g != cl->m_gen_seen) {                          /* a new start: from the beginning */
+        mclip_all_off(c, cl, f);
+        cl->m_gen_seen = g;
+        cl->mpos = atomic_load(&cl->m_seek_gen) == g ? atomic_load(&cl->m_seek) : 0.0;   /* 1.3.1: play from a beat */
+    }
+    if (!cl->m_live) for (int k = 0; k < 128; ++k) cl->m_off[k] = -1.0f;   /* first block after a stop / pause */
+    cl->m_live = true;
+    float T = atomic_load(&s->tempo);
+    if (!(T > 0.0f)) T = 120.0f;
+    double bpf = (double)T / (60.0 * (double)(s->sample_rate > 0 ? s->sample_rate : 48000));   /* beats per frame */
+    double L = m->length > 0.25f ? m->length : 0.25;
+    bool loop = atomic_load(&cl->loop);
+    double pos = cl->mpos;
+    if (pos >= L) pos = 0.0;
+    while (f < n) {
+        double end = pos + (double)(n - f) * bpf;
+        bool wrap = end >= L;
+        double seg = wrap ? L : end;
+#define FR(b) ({ double fr_ = (double)f + ((b) - pos) / bpf; unsigned u_ = fr_ <= (double)f ? f : (unsigned)fr_; u_ >= n ? n - 1 : u_; })
+        for (int k = 0; k < 128; ++k)                   /* notes that end inside this part */
+            if (cl->m_off[k] >= 0.0f && cl->m_off[k] < seg) mclip_off(c, cl, k, FR((double)cl->m_off[k]));
+        int lo = 0, hi = m->n;                          /* the first note that starts at pos or later */
+        while (lo < hi) { int mid = (lo + hi) / 2; if ((double)m->note[mid].start < pos) lo = mid + 1; else hi = mid; }
+        for (int i = lo; i < m->n && (double)m->note[i].start < seg; ++i) {
+            const MNote *q = &m->note[i];
+            unsigned fr = FR((double)q->start);
+            if (cl->m_off[q->key] >= 0.0f) mclip_off(c, cl, q->key, fr);   /* the same key again: end the old one first */
+            unsigned char on[3] = { 0x90, q->key, q->vel ? q->vel : 1 };
+            ch_ev_at(c, fr, on);
+            double e2 = (double)q->start + (double)q->len;
+            cl->m_off[q->key] = (float)(e2 < L ? e2 : L);
+        }
+        if (!wrap) { pos = end; break; }
+        unsigned fb = FR(L);                            /* the end of the clip inside this block */
+#undef FR
+        mclip_all_off(c, cl, fb);
+        if (!loop) {                                    /* plays once, then stops by itself */
+            atomic_store(&cl->ended, true);
+            atomic_store(&cl->playing, false);
+            cl->m_live = false;
+            pos = 0.0;
+            break;
+        }
+        pos = 0.0;
+        if (fb <= f) fb = f + 1;                        /* always forward */
+        f = fb;
+    }
+    cl->mpos = pos;
+    atomic_store_explicit(&cl->mpos_vis, pos, memory_order_relaxed);
+}
+
+static void sort_ev(QMidiEv *e, int n)                  /* by frame, keeping the order of equal ones */
+{
+    for (int i = 1; i < n; ++i) {
+        QMidiEv x = e[i];
+        int j = i - 1;
+        while (j >= 0 && e[j].frame > x.frame) { e[j + 1] = e[j]; --j; }
+        e[j + 1] = x;
+    }
+}
+
+static void midi_route(Session *s)
+{
+    int nch = s->channel_count;
+    for (int c = 0; c < nch; ++c) s_chn[c] = 0;
+    if (atomic_exchange(&s->midi_panic, false)) {         /* all notes off + pedal up, on every channel */
+        for (int mc = 0; mc < 16; ++mc)                    /* first a real note-off for every held note (some plugins ignore CC 123) */
+            for (int k = 0; k < 128; ++k)
+                if (s_held[mc][k]) { unsigned char o[3] = { (unsigned char)(0x80 | mc), (unsigned char)k, 0 }; ch_ev(s_held[mc][k] - 1, o); }
+        for (int c = 0; c < nch; ++c)
+            for (int mc = 0; mc < 16; ++mc) {
+                unsigned char a[3] = { (unsigned char)(0xB0 | mc), 64, 0 }, b[3] = { (unsigned char)(0xB0 | mc), 123, 0 };
+                ch_ev(c, a); ch_ev(c, b);
+            }
+        memset(s_held, 0, sizeof s_held);
+        for (int c = 0; c < nch; ++c)                      /* 1.3: the keys held by MIDI clips too */
+            for (int sc = 0; sc < s->scene_count; ++sc) {
+                Clip *cl = &s->channels[c].clips[sc];
+                if (cl->m_live) mclip_all_off(c, cl, 0);
+            }
+        return;                     /* new notes wait for the next block: "all notes off" must not cut them (VST3 order) */
+    }
+    unsigned char raw[512][4];
+    int n = midiq_pop(raw, 512);
+    if (n <= 0) return;
+    int armed = atomic_load(&s->midi_target);
+    if (armed >= nch) armed = -1;
+    bool block = atomic_load(&s->midi_block);
+    for (int i = 0; i < n; ++i) {
+        unsigned char *m = raw[i];
+        unsigned st = m[0] & 0xF0, mc = m[0] & 0x0F, key = m[1] & 0x7F;
+        int direct = m[3] ? m[3] - 1 : -1;               /* 1.3: the editor's preview goes to its own channel */
+        if (direct >= nch) continue;
+        int tgt = direct >= 0 ? direct : armed;
+        if (st == 0x90 && m[2] > 0) {
+            bool bound = direct < 0 && ((atomic_load_explicit(&s->midi_bound[key >> 5], memory_order_relaxed) >> (key & 31)) & 1u);
+            if (bound || (block && direct < 0) || tgt < 0) continue;   /* a pad bound to a clip/button does not play notes */
+            if (s_held[mc][key] && s_held[mc][key] - 1 != tgt) {   /* still sounding on another channel: end it there */
+                unsigned char off[3] = { (unsigned char)(0x80 | mc), (unsigned char)key, 0 };
+                ch_ev(s_held[mc][key] - 1, off);
+            }
+            s_held[mc][key] = (signed char)(tgt + 1);
+            ch_ev(tgt, m);
+        } else if (st == 0x80 || st == 0x90) {
+            int c = s_held[mc][key] - 1;
+            s_held[mc][key] = 0;
+            if (c >= 0 && c < nch) ch_ev(c, m);
+        } else if (tgt >= 0) {
+            if (st == 0xB0 && (key == 123 || key == 120)) {        /* "all notes off" from the keyboard: forget the held ones */
+                for (int k = 0; k < 128; ++k) if (s_held[mc][k] - 1 == tgt) s_held[mc][k] = 0;
+            }
+            ch_ev(tgt, m);                                         /* CC (pedal, mod wheel), pitch bend, aftertouch... */
+        }
+    }
+}
+
+/* ===== 1.4: the sound card's input and recording ===== */
+static const float *s_in = NULL;                 /* the input of this callback (interleaved), NULL = none */
+static int          s_in_ch = 0;
+static unsigned     s_in_off = 0;                /* where the current sub-block starts in it */
+static unsigned     s_in_frames = 0;
+
+void mixer_set_input(const float *in, int in_ch, unsigned long frames)
+{
+    s_in = in_ch > 0 ? in : NULL;
+    s_in_ch = in_ch;
+    s_in_frames = (unsigned)frames;
+    s_in_off = 0;
+}
+
+/* input k of frame i of the current sub-block (0 if there is no such input) */
+static inline float in_at(unsigned i, int k)
+{
+    if (!s_in || k < 0 || k >= s_in_ch || s_in_off + i >= s_in_frames) return 0.0f;
+    return s_in[(size_t)(s_in_off + i) * (size_t)s_in_ch + (size_t)k];
+}
+
+static void rec_push_audio(RecSlot *r, unsigned a, unsigned b)   /* frames [a, b) of the sub-block, after the skip */
+{
+    if (b <= a) return;
+    unsigned cnt = b - a;
+    unsigned drop = r->skip < cnt ? r->skip : cnt;
+    r->skip -= drop;
+    a += drop;
+    if (b <= a) return;
+    unsigned w = atomic_load_explicit(&r->rw, memory_order_relaxed), rd = atomic_load_explicit(&r->rr, memory_order_acquire);
+    for (unsigned i = a; i < b; ++i) {
+        if (w - rd >= REC_RING_FRAMES) { atomic_store(&r->overflow, true); break; }
+        float l = in_at(i, r->in_first);
+        float rr = r->in_count > 1 ? in_at(i, r->in_first + 1) : l;
+        size_t at = (size_t)(w % REC_RING_FRAMES) * 2;
+        r->ring[at] = l; r->ring[at + 1] = rr;
+        ++w;
+    }
+    atomic_fetch_add_explicit(&r->frames, (unsigned long long)(w - atomic_load_explicit(&r->rw, memory_order_relaxed)), memory_order_relaxed);
+    atomic_store_explicit(&r->rw, w, memory_order_release);
+}
+
+static void rec_process(Session *s, unsigned n)
+{
+    if (atomic_load_explicit(&s->rec_active, memory_order_acquire) <= 0) return;
+    float T = atomic_load(&s->tempo);
+    if (!(T > 0.0f)) T = 120.0f;
+    double fpb = 60.0 * (double)(s->sample_rate > 0 ? s->sample_rate : 48000) / (double)T;
+    bool running = atomic_load(&s->tp_running) && !atomic_load(&s->tp_reset);
+    double tp = running ? atomic_load(&s->tp_beats) : 0.0;
+    for (int i = 0; i < MAX_REC; ++i) {
+        RecSlot *r = &s->rec[i];
+        int st = atomic_load_explicit(&r->state, memory_order_acquire);
+        if (st == REC_DONE) { atomic_fetch_add(&r->after, n); continue; }   /* the UI will start the clip in time */
+        if (st < REC_WAIT || st > REC_STOPPING) continue;
+        if (r->ch < 0 || r->ch >= s->channel_count) continue;
+        unsigned f0 = 0;
+        if (st == REC_WAIT) {
+            double sb = atomic_load(&r->start_beat);
+            if (sb < 0.0 || !running) { f0 = 0; r->beat0 = tp; }
+            else {
+                double fu = floor((sb - tp) * fpb + 0.5);
+                if (fu >= (double)n) continue;           /* not yet */
+                f0 = fu > 0.0 ? (unsigned)fu : 0;
+                r->beat0 = sb;
+            }
+            r->skip = r->latency;
+            r->tail = 0;
+            r->stopped_at = false;
+            atomic_store(&r->state, REC_ON);
+            st = REC_ON;
+        }
+        /* where it ends in this block */
+        unsigned fs = n;
+        bool stop_now = false;
+        if (st == REC_STOPPING && !r->stopped_at) {
+            double eb = atomic_load(&r->stop_beat);
+            if (eb < 0.0) { fs = f0; stop_now = true; }
+            else {
+                double fu = floor((eb - tp) * fpb + 0.5);
+                if (fu < (double)n) { fs = fu > (double)f0 ? (unsigned)fu : f0; stop_now = true; }
+            }
+            if (stop_now) {
+                double end_beat = eb >= 0.0 ? eb : tp + (double)fs / fpb;
+                double len = end_beat - r->beat0;
+                if (len < 1.0 / 64.0) len = 1.0 / 64.0;
+                atomic_store(&r->final_beats, len);
+                r->stopped_at = true;
+                r->tail = r->latency;
+            }
+        }
+        if (!r->stopped_at || stop_now)
+            atomic_store_explicit(&r->rec_beats, tp + (double)(stop_now ? fs : n) / fpb - r->beat0, memory_order_relaxed);
+        if (r->midi) {
+            /* the messages the keyboard sent to this channel in this block (they are in its list, frame order) */
+            int c = r->ch;
+            for (int k = 0; k < s_chn[c]; ++k) {
+                const QMidiEv *e = &s_chev[c][k];
+                if (e->frame < f0 || (r->stopped_at && e->frame >= fs)) continue;
+                unsigned stt = e->d[0] & 0xF0;
+                if (stt != 0x80 && stt != 0x90) continue;
+                unsigned w = atomic_load_explicit(&r->mw, memory_order_relaxed);
+                if (w - atomic_load_explicit(&r->mr, memory_order_acquire) >= REC_MEV) break;
+                RecEv *ev = &r->mev[w % REC_MEV];
+                ev->beat = tp + (double)e->frame / fpb - r->beat0;
+                memcpy(ev->m, e->d, 3);
+                atomic_store_explicit(&r->mw, w + 1, memory_order_release);
+            }
+            if (r->stopped_at) {                         /* the clip plays on from the stop, in time */
+                Clip *cl = &s->channels[c].clips[r->sc];
+                if (atomic_load(&cl->has_clip) && atomic_load(&cl->is_midi)) {
+                    cl->start_offset = fs < n ? fs : n - 1;
+                    atomic_fetch_add(&cl->m_gen, 1);
+                    atomic_store(&cl->ended, false);
+                    atomic_store(&cl->playing, true);
+                }
+                atomic_store(&r->after, (unsigned long long)(n - fs));
+                atomic_store(&r->state, REC_DONE);
+            }
+            continue;
+        }
+        /* audio */
+        if (!r->ring) continue;
+        if (!r->stopped_at) { rec_push_audio(r, f0, n); continue; }
+        unsigned a = stop_now ? f0 : 0, b = stop_now ? fs : 0;
+        rec_push_audio(r, a, b);                          /* until the stop... */
+        unsigned from = stop_now ? fs : 0;
+        unsigned k = n - from < r->tail ? n - from : r->tail;
+        rec_push_audio(r, from, from + k);                /* ...and the delay of the card after it */
+        r->tail -= k;
+        atomic_fetch_add(&r->after, (unsigned long long)(n - from));
+        if (r->tail == 0) atomic_store(&r->state, REC_DONE);
+    }
+}
+
 static void render_sub(Session *s, float *out, unsigned n, int out_ch,
                        bool any_solo, float *master_peak, float *mpk_l, float *mpk_r,
                        float *const *gouts, int ngo, size_t goff)
 {
     queue_launch(s, n);
+    midi_route(s);                                      /* 1.2 */
+    ql_process(s, n);                                   /* 1.1 */
+    rec_process(s, n);                                  /* 1.4: before the beat moves on */
+    transport_advance(s, n);                            /* 1.1: tp_beats = the end of this block */
 
     memset(s_mixL, 0, n * sizeof(float));
     memset(s_mixR, 0, n * sizeof(float));
@@ -300,6 +748,10 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
         int na = 0;
         for (int sc = 0; sc < s->scene_count; ++sc) {
             Clip *cl = &ch->clips[sc];
+            if (cl->m_live || (atomic_load(&cl->is_midi) && atomic_load(&cl->has_clip))) {   /* 1.3: a MIDI clip -> notes */
+                mclip_block(s, c, cl, n);
+                continue;
+            }
             if (!atomic_load(&cl->has_clip) || atomic_load(&cl->is_note) || !cl->stream) {
                 cl->dc_was_playing = false; cl->dc_tail = 0;
                 continue;
@@ -308,6 +760,8 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
             if (!pl) {
                 /* just stopped (stop/pause/another clip in the channel): the old audio fades out smoothly over ~2.7 ms instead of abruptly */
                 if (cl->dc_was_playing) { cl->dc_was_playing = false; cl->dc_tail = DC_TAIL; }
+                cl->wsw_wait = false; cl->wsw_blocks = 0;
+                atomic_store(&cl->xf_vis_on, false);
                 if (cl->dc_tail == 0) continue;
             }
             tail_only[na] = !pl;
@@ -317,7 +771,9 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
         /* channel with plugins (step 34): the clips -> sum -> the plugins -> volume/pan.
          * The plugins also run when there is no clip (echo/reverb tails). Without plugins - the old path, as before. */
         FxChain *fxc = atomic_load_explicit(&ch->fxchain, memory_order_acquire);
-        bool fxm = fxc && fxc->nactive > 0;
+        bool plug = fxc && fxc->nactive > 0;
+        bool mon = s_in && atomic_load_explicit(&ch->armed, memory_order_relaxed) && atomic_load_explicit(&ch->monitor, memory_order_relaxed);
+        bool fxm = plug || mon;                         /* 1.4: the input is heard through the channel (and its plugins) */
 
         if (na == 0 && !fxm) {
             /* silent channel: do not spend CPU; the knobs simply "jump" to the target */
@@ -342,7 +798,25 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
             Clip *cl = &ch->clips[idx[k]];
             size_t got;
             bool tail_alone = tail_only[k];
-            if (!tail_alone) {
+            /* warp switched on/off while playing: this block still plays the OLD path and fades it out */
+            bool wnow = atomic_load_explicit(&cl->warp, memory_order_acquire) && cl->stretch;
+            bool wswitch = !tail_alone && cl->dc_was_playing && cl->wsw_init && wnow != cl->wsw_warp && !cl->start_offset;
+            if (wswitch) {
+                got = clip_read_path(cl, s_blk, n, cl->wsw_warp);
+                if (got < n) memset(s_blk + got * 2, 0, (size_t)(n - got) * 2 * sizeof(float));
+                for (unsigned i = 0; i < n; ++i) {
+                    float g = 0.5f + 0.5f * cosf(((float)i + 0.5f) / (float)n * (float)M_PI);
+                    s_blk[i * 2 + 0] *= g; s_blk[i * 2 + 1] *= g;
+                }
+                got = n;
+                cl->dc_gen = atomic_load(&cl->stretch_gen);      /* not a "restart": no extra fade */
+                cl->dc_tail = 0; cl->dc_fadein = 0;
+                cl->wsw_warp = wnow;
+                cl->wsw_wait = true;                               /* the new path fades in once it sounds */
+                cl->wsw_fadein = WSW_FADEIN;
+            }
+            if (!tail_alone && !wswitch) { cl->wsw_warp = wnow; cl->wsw_init = true; }
+            if (!tail_alone && !wswitch) {
                 /* new start or seek (stretch_gen changed): the old audio fades out, the new one fades in */
                 unsigned gen = atomic_load(&cl->stretch_gen);
                 bool restarted = cl->dc_was_playing && gen != cl->dc_gen;
@@ -354,7 +828,9 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
                 cl->dc_gen = gen;
                 cl->dc_was_playing = true;
             }
-            if (tail_alone) {
+            if (wswitch) {
+                /* already read above */
+            } else if (tail_alone) {
                 memset(s_blk, 0, (size_t)n * 2 * sizeof(float));
                 got = 0;
             } else if (cl->start_offset) {               /* started by the queue in the middle of the block */
@@ -368,6 +844,23 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
 
             /* no clicks: fade-in of the new audio + fade-out of the old one (from its last value) */
             if (got < n) memset(s_blk + got * 2, 0, (size_t)(n - got) * 2 * sizeof(float));
+            if (cl->wsw_wait && !wswitch) {
+                /* after a warp switch: silence until the new path really sounds (Rubber Band needs a few ms),
+                 * then a smooth fade-in from that sample on */
+                unsigned i0 = 0;
+                if (cl->wsw_fadein == WSW_FADEIN) {
+                    while (i0 < n && fabsf(s_blk[i0 * 2]) < 1e-6f && fabsf(s_blk[i0 * 2 + 1]) < 1e-6f) ++i0;
+                }
+                for (unsigned i = i0; i < n && cl->wsw_fadein; ++i) {
+                    float t = ((float)(WSW_FADEIN - cl->wsw_fadein) + 0.5f) / (float)WSW_FADEIN;
+                    float g = 0.5f - 0.5f * cosf(t * (float)M_PI);
+                    s_blk[i * 2 + 0] *= g; s_blk[i * 2 + 1] *= g;
+                    cl->wsw_fadein--;
+                }
+                if (!cl->wsw_fadein) cl->wsw_wait = false;
+                else if (i0 >= n && ++cl->wsw_blocks > 40) { cl->wsw_wait = false; cl->wsw_blocks = 0; }   /* safety */
+                if (!cl->wsw_wait) cl->wsw_blocks = 0;
+            }
             if (cl->dc_fadein && got > 0) {
                 unsigned st = DC_FADEIN - cl->dc_fadein;
                 size_t lim = got < cl->dc_fadein ? got : cl->dc_fadein;
@@ -429,6 +922,15 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
                     atomic_store(&cl->xf_dir, 0);
                     if (xdir < 0) fade_done = true;            /* fully faded out -> stops (the silence after it is not needed) */
                 }
+                /* for the ghost fader: the gain at the end of this block, only while the fade really moves */
+                long pe = cl->xf_pos;
+                if (pe > 0 && pe < cl->xf_len) {
+                    float t = (float)((double)pe / (double)cl->xf_len) * (float)(M_PI * 0.5);
+                    atomic_store(&cl->xf_vis, xdir > 0 ? sinf(t) : cosf(t));
+                    atomic_store(&cl->xf_vis_on, true);
+                } else atomic_store(&cl->xf_vis_on, false);
+            } else if (atomic_load_explicit(&cl->xf_vis_on, memory_order_relaxed)) {
+                atomic_store(&cl->xf_vis_on, false);
             }
 
             for (size_t i = 0; i < got; ++i) {
@@ -472,7 +974,18 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
         }
 
         if (fxm) {
-            for (int k = 0; k < fxc->n; ++k) if (!fxc->byp[k]) qplug_process(fxc->p[k], s_fxl, s_fxr, n);
+            if (mon) {                                       /* 1.4: monitoring: the input into the channel */
+                int f = atomic_load_explicit(&ch->rec_in_first, memory_order_relaxed);
+                bool st2 = atomic_load_explicit(&ch->rec_in_stereo, memory_order_relaxed);
+                for (unsigned i = 0; i < n; ++i) {
+                    float l = in_at(i, f), r = st2 ? in_at(i, f + 1) : l;
+                    s_fxl[i] += l; s_fxr[i] += r;
+                }
+            }
+            if (s_chn[c] > 1) sort_ev(s_chev[c], s_chn[c]);
+            if (plug && s_chn[c] > 0)                        /* 1.2: MIDI for the instrument(s) of this channel */
+                for (int k = 0; k < fxc->n; ++k) if (!fxc->byp[k] && qplug_wants_midi(fxc->p[k])) qplug_midi(fxc->p[k], s_chev[c], s_chn[c]);
+            if (plug) for (int k = 0; k < fxc->n; ++k) if (!fxc->byp[k]) qplug_process(fxc->p[k], s_fxl, s_fxr, n);
             for (unsigned i = 0; i < n; ++i) {
                 float l = s_fxl[i], r = s_fxr[i];
                 if (audible) {
@@ -529,7 +1042,13 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
     }
 }
 
+static void render_impl(Session *s, float *out, unsigned long frame_count, int out_ch);
 void mixer_render(Session *s, float *out, unsigned long frame_count, int out_ch)
+{
+    render_impl(s, out, frame_count, out_ch);
+    s_in = NULL;                                     /* 1.4: the input is for one call only */
+}
+static void render_impl(Session *s, float *out, unsigned long frame_count, int out_ch)
 {
     if (out_ch < 2) out_ch = 2;
     memset(out, 0, frame_count * (unsigned long)out_ch * sizeof(float));
@@ -554,6 +1073,7 @@ void mixer_render(Session *s, float *out, unsigned long frame_count, int out_ch)
         while (done < frame_count) {
             unsigned n = (unsigned)(frame_count - done);
             if (n > MAX_BLOCK) n = MAX_BLOCK;
+            s_in_off = (unsigned)done;                       /* 1.4: the input of this sub-block */
             render_sub(s, out + done * (unsigned long)out_ch, n, out_ch,
                        any_solo, &master_peak, &mpk_l, &mpk_r, NULL, 0, 0);
             done += n;
@@ -591,7 +1111,13 @@ static void decay_store(_Atomic float *atom, float val)
     atomic_store(atom, val > o * PEAK_DECAY ? val : o * PEAK_DECAY);
 }
 
+static void render_channels_impl(Session *s, float *const *outs, int nouts, unsigned long frame_count);
 void mixer_render_channels(Session *s, float *const *outs, int nouts, unsigned long frame_count)
+{
+    render_channels_impl(s, outs, nouts, frame_count);
+    s_in = NULL;
+}
+static void render_channels_impl(Session *s, float *const *outs, int nouts, unsigned long frame_count)
 {
     for (int k = 0; k < nouts; ++k) if (outs[k]) memset(outs[k], 0, frame_count * sizeof(float));
     if (!s) return;
@@ -610,6 +1136,7 @@ void mixer_render_channels(Session *s, float *const *outs, int nouts, unsigned l
         while (done < frame_count) {
             unsigned n = (unsigned)(frame_count - done);
             if (n > MAX_BLOCK) n = MAX_BLOCK;
+            s_in_off = (unsigned)done;
             render_sub(s, NULL, n, 2, any_solo, &dummy_m, &dummy_l, &dummy_r, outs, nouts, done);
             done += n;
         }
@@ -639,8 +1166,16 @@ void mixer_render_master(Session *s, const float *in_l, const float *in_r, float
     while (done < frame_count) {
         unsigned n = (unsigned)(frame_count - done);
         if (n > MAX_BLOCK) n = MAX_BLOCK;
+        {   /* 1.3.1: the metronome needs the beat at the end of THIS part (tp_beats = the end of the whole cycle) */
+            float T = atomic_load(&s->tempo);
+            if (!(T > 0.0f)) T = 120.0f;
+            double bpf = (double)T / (60.0 * (double)(s->sample_rate > 0 ? s->sample_rate : 48000));
+            s_met_end = atomic_load(&s->tp_beats) - (double)(frame_count - done - n) * bpf;
+            if (s_met_end < 0.0) s_met_end = 0.0;
+        }
         master_block(s, in_l ? in_l + done : s_zero, in_r ? in_r + done : s_zero, s_gl, s_gr, n,
                      &master_peak, &mpk_l, &mpk_r);
+        s_met_end = -1.0;
         for (unsigned i = 0; i < n; ++i) {
             if (out_l) out_l[done + i] = clip1(s_gl[i]);
             if (out_r) out_r[done + i] = clip1(s_gr[i]);

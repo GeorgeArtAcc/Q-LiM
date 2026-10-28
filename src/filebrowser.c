@@ -29,7 +29,9 @@ bool fb_is_audio_file(const char *name)
     return has_ext(name, ".wav") ||
            has_ext(name, ".flac") ||
            has_ext(name, ".ogg") ||
-           has_ext(name, ".mp3");
+           has_ext(name, ".mp3") ||
+           has_ext(name, ".mid") ||            /* 1.3: MIDI files -> MIDI clips */
+           has_ext(name, ".midi");
 }
 
 // ============ Init ============

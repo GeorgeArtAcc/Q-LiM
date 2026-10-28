@@ -4,7 +4,7 @@ LLVM ?= $(WIN)/llvm-mingw-20241217-msvcrt-ubuntu-20.04-x86_64
 CXX := $(LLVM)/bin/x86_64-w64-mingw32-clang++
 SNDFILE := $(WIN)/libsndfile-1.2.2-win64
 DEFS := -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 -DHAVE_RUBBERBAND -DUNICODE -D_UNICODE
-TSRC := ../src/session.c ../src/mixer.c ../src/stream.c ../src/stream_sndfile.c ../src/stream_resample.c ../src/peaks.c \
+TSRC := ../src/session.c ../src/mixer.c ../src/midiq.c ../src/smf.c ../src/stream.c ../src/stream_sndfile.c ../src/stream_resample.c ../src/peaks.c \
         ../src/wav.c ../src/project.c ../src/undo.c ../src/bpm.c ../src/stretch.c ../src/edit.c \
         ../src/win/compat.c ../src/win/diskinfo_win.c plug_stub.c
 TFLAGS := -std=c11 -O2 -include ../src/win/compat.h $(DEFS) -I../src -I$(SNDFILE)/include -I../third_party/rubberband \
@@ -17,6 +17,26 @@ $(T)/rb.o: ../third_party/rubberband/single/RubberBandSingle.cpp
 $(T)/%.exe: %.c $(TSRC) $(T)/rb.o
 	@mkdir -p $(T)
 	$(CXX) -x c $(TFLAGS) $< $(TSRC) -x none $(T)/rb.o $(TLIBS) -o $@
-tests: $(T)/fuzz_engine.exe $(T)/test_edit.exe $(T)/fuzz_edit.exe $(T)/test_cut.exe $(T)/test_level.exe
+tests: $(T)/fuzz_engine.exe $(T)/test_edit.exe $(T)/fuzz_edit.exe $(T)/test_cut.exe $(T)/test_level.exe $(T)/test_quant.exe $(T)/test_rec.exe
 	cp $(SNDFILE)/bin/sndfile.dll $(LLVM)/x86_64-w64-mingw32/bin/libc++.dll $(LLVM)/x86_64-w64-mingw32/bin/libunwind.dll \
 	   $(LLVM)/x86_64-w64-mingw32/bin/libwinpthread-1.dll $(T)/
+
+# 1.2: instruments (CLAP, VST2, VST3 - Windows has no LV2):  make -f Makefile.win inst  (then run test_inst.exe <folder>)
+SDLW := $(WIN)/SDL2-2.30.10/x86_64-w64-mingw32
+ISRC := ../src/plughost.c ../src/host_vst2.c ../src/host_clap.c ../src/win/stubs_win.c ../src/win/plugwin_win.c ../src/win/compat.c inst_stubs.c
+IFLAGS := -std=c11 -O2 -include ../src/win/compat.h $(DEFS) -I../src -I../src/win/include -I$(SNDFILE)/include -I$(SDLW)/include/SDL2 -I../third_party/lv2 -I../third_party/lilv \
+          -I../third_party/clap/include -I../third_party/vst3 -w
+$(T)/test_inst.exe: test_inst.c $(ISRC) ../src/host_vst3.cpp
+	@mkdir -p $(T)
+	$(CXX) -std=c++17 -O2 -include ../src/win/compat.h $(DEFS) -I../src -I../src/win/include -I$(SNDFILE)/include -I../third_party/vst3 -w -c ../src/host_vst3.cpp -o $(T)/host_vst3.o
+	$(CXX) -x c $(IFLAGS) test_inst.c $(ISRC) -x none $(T)/host_vst3.o -lole32 -luuid -lshell32 -lpsapi -luser32 -lgdi32 -lcomdlg32 -ladvapi32 -L$(SDLW)/lib -lSDL2 $(SNDFILE)/lib/sndfile.lib -lpthread -o $@
+	cp $(SDLW)/bin/SDL2.dll $(T)/
+inst: $(T)/test_inst.exe
+
+# 1.3: MIDI clips with a real instrument (the Windows build of DISTRHO Kars): make -f Makefile.win midiclip
+MSRC := $(filter-out plug_stub.c,$(TSRC)) ../src/win/stubs_win.c ../src/fxchain.c ../src/plughost.c ../src/host_vst2.c ../src/host_clap.c ../src/win/plugwin_win.c ../tests/fx_stubs.c
+$(T)/test_midiclip.exe: test_midiclip.c $(MSRC) ../src/host_vst3.cpp $(T)/rb.o
+	@mkdir -p $(T)
+	$(CXX) -std=c++17 -O2 -include ../src/win/compat.h $(DEFS) -I../src -I../src/win/include -I$(SNDFILE)/include -I../third_party/vst3 -w -c ../src/host_vst3.cpp -o $(T)/host_vst3.o
+	$(CXX) -x c $(TFLAGS) -I../src/win/include -I$(SDLW)/include/SDL2 test_midiclip.c $(MSRC) -x none $(T)/host_vst3.o $(T)/rb.o $(TLIBS) -luuid -lgdi32 -ladvapi32 -L$(SDLW)/lib -lSDL2 -o $@
+midiclip: $(T)/test_midiclip.exe

@@ -1,10 +1,14 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 #define _POSIX_C_SOURCE 200809L
 #include "session.h"
+#include "smf.h"
+#include <sndfile.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+static _Atomic float g_master_tempo = 120.0f;       /* 1.1: what WARP clips follow (= s->tempo) */
 #include <time.h>
 
 // wav_convert_to_cache() is in wav.c
@@ -44,6 +48,8 @@ static void audio_barrier(Session *s)
         wait_tick();
     }
 }
+
+static void rec_abort_all(Session *s);              /* 1.4: see below */
 
 // The disk thread asks this callback for the clip's start/end/loop.
 static void clip_region_cb(void *ud, StreamRegion *out)
@@ -112,6 +118,11 @@ static void clip_release_stream(Clip *cl)
         cl->peaks = NULL;
     }
     memset(&cl->wav, 0, sizeof(cl->wav));
+    {   /* 1.3: the MIDI notes (the audio thread no longer sees this clip - see the callers) */
+        MidiSeq *m = atomic_exchange(&cl->mseq, NULL);
+        free(m);
+        atomic_store(&cl->is_midi, false);
+    }
 }
 
 // The Clip structs are copied on move/delete -> the streams must know the new address.
@@ -132,6 +143,15 @@ static void rebind_all_locked(Session *s)
 
 static void clip_start(Clip *cl, size_t from)
 {
+    if (atomic_load(&cl->is_midi)) {                    /* 1.3: a MIDI clip starts from its beginning */
+        (void)from;
+        atomic_store(&cl->xf_dir, 0);
+        atomic_store(&cl->paused, false);
+        atomic_store(&cl->ended, false);
+        atomic_fetch_add(&cl->m_gen, 1);
+        atomic_store(&cl->playing, true);
+        return;
+    }
     if (!cl->stream) return;
     atomic_store(&cl->xf_dir, 0);                       // manual play cancels the crossfade
     atomic_store(&cl->paused, false);
@@ -142,8 +162,11 @@ static void clip_start(Clip *cl, size_t from)
     atomic_store(&cl->playing, true);
 }
 
+static Session *g_ql_session;                       /* for clip_stop: the counter of waiting launches */
+
 static void clip_stop(Clip *cl)
 {
+    if (atomic_exchange(&cl->ql_state, 0) && g_ql_session) atomic_fetch_sub(&g_ql_session->ql_pending, 1);
     atomic_store(&cl->playing, false);
     atomic_store(&cl->paused, false);
     if (cl->stretch) stretch_release(cl->stretch);          // the background thread stops reading
@@ -160,6 +183,7 @@ static void clip_discard(Session *s, Clip *cl)
         audio_barrier(s);
         clip_release_stream(cl);
     }
+    if (atomic_exchange(&cl->ql_state, 0)) atomic_fetch_sub(&s->ql_pending, 1);   /* 1.1 */
     int keep_bind = atomic_load(&cl->bind);     // the pad stays bound to the cell when the clip is replaced
     mix_lock(s);                                // the audio thread does not look at the cell while it is being reset
     memset(cl, 0, sizeof(*cl));
@@ -251,6 +275,16 @@ void session_init(Session *s, int sample_rate)
     atomic_store(&s->audio_cycles, 0);
     atomic_store(&s->audio_running, false);
     atomic_store(&s->tempo, 120.0f);
+    atomic_store(&g_master_tempo, 120.0f);
+    atomic_store(&s->quant_beats, 4.0f);               /* 1.1: default = the next bar */
+    atomic_store(&s->tp_beats, 0.0);
+    atomic_store(&s->tp_running, false);
+    atomic_store(&s->ql_pending, 0);
+    g_ql_session = s;
+    atomic_store(&s->midi_target, -1);
+    for (int i = 0; i < 4; ++i) atomic_store(&s->midi_bound[i], 0u);
+    atomic_store(&s->midi_block, false);
+    atomic_store(&s->midi_panic, false);
     s->queue_len = 0;
     s->last_started = -1;
     atomic_store(&s->q_anchor, -1);
@@ -260,6 +294,7 @@ void session_init(Session *s, int sample_rate)
 
 void session_release_all_clips(Session *s)
 {
+    rec_abort_all(s);                               /* 1.4: the cells move - a running recording ends here */
     if (!s) return;
     session_queue_clear(s);
     for (int c = 0; c < s->channel_count; ++c)
@@ -308,6 +343,7 @@ void session_channel_init(Channel *c, int idx, const char *name)
     atomic_store(&c->solo_bind, 0);
     atomic_store(&c->route_l, ROUTE_DEFAULT_L);
     atomic_store(&c->route_r, ROUTE_DEFAULT_R);
+    atomic_store(&c->rec_in_stereo, true);           /* 1.4: records inputs 1+2 by default */
     /* step 36h: the first channel is in the Q-LiM orange, then colours that look good next to it */
     static const int ORDER[8] = { 4, 1, 2, 5, 3, 7, 0, 6 };
     c->color_id = ORDER[idx % 8];
@@ -551,6 +587,19 @@ static int open_clip_source(Session *s, const char *path, int sr,
 
 int session_set_clip(Session *s, int ch, int scene, const char *wav_path)
 {
+    if (smf_is_midi_path(wav_path)) {                /* 1.3: a .mid file -> a MIDI clip with its notes */
+        char err[160];
+        MidiSeq *m = smf_load(wav_path, err, sizeof err);
+        if (!m) { printf("session_set_clip: '%s': %s\n", wav_path, err); return 1; }
+        const char *b = strrchr(wav_path, '/');
+        char nm[NAME_LEN];
+        snprintf(nm, sizeof nm, "%s", b ? b + 1 : wav_path);
+        char *dot = strrchr(nm, '.');
+        if (dot) *dot = 0;
+        if (session_new_midi_clip(s, ch, scene, m->length, nm) != 0) { free(m); return 1; }
+        session_midi_set(s, ch, scene, m);
+        return 0;
+    }
     if (!s || ch < 0 || ch >= s->channel_count) return 1;
     if (scene < 0 || scene >= MAX_SCENES) return 1;
 
@@ -689,6 +738,173 @@ int session_set_note(Session *s, int ch, int scene, const char *text)
     return 0;
 }
 
+/* ===== 1.3: MIDI clips ===== */
+MidiSeq *midiseq_new(int n, float length)
+{
+    if (n < 0) n = 0;
+    MidiSeq *m = malloc(sizeof(MidiSeq) + sizeof(MNote) * (size_t)(n > 0 ? n : 1));
+    if (!m) return NULL;
+    m->length = length > 0.0f ? length : 4.0f;
+    m->n = n;
+    return m;
+}
+
+MidiSeq *midiseq_dup(const MidiSeq *src, int extra)
+{
+    int n = src ? src->n : 0;
+    MidiSeq *m = midiseq_new(n + (extra > 0 ? extra : 0), src ? src->length : 4.0f);
+    if (!m) return NULL;
+    m->n = n;
+    if (n) memcpy(m->note, src->note, sizeof(MNote) * (size_t)n);
+    return m;
+}
+
+static int mnote_cmp(const void *a, const void *b)
+{
+    const MNote *x = a, *y = b;
+    if (x->start != y->start) return x->start < y->start ? -1 : 1;
+    return (int)x->key - (int)y->key;
+}
+void midiseq_sort(MidiSeq *m) { if (m && m->n > 1) qsort(m->note, (size_t)m->n, sizeof(MNote), mnote_cmp); }
+
+/* old note lists wait here until the audio thread has certainly finished with them */
+#define MRET_N 256
+static struct { MidiSeq *m; Session *s; unsigned cyc; } g_mret[MRET_N];
+static int g_nmret;
+
+void session_midi_reap(Session *s)
+{
+    for (int i = 0; i < g_nmret; ) {
+        bool done = g_mret[i].s != s ? false
+                  : (!atomic_load(&s->audio_running) || atomic_load(&s->audio_cycles) - g_mret[i].cyc >= 2);
+        if (done) { free(g_mret[i].m); g_mret[i] = g_mret[--g_nmret]; }
+        else ++i;
+    }
+}
+
+static void midi_retire(Session *s, MidiSeq *old)
+{
+    if (!old) return;
+    if (!atomic_load(&s->audio_running)) { free(old); return; }
+    if (g_nmret >= MRET_N) { audio_barrier(s); session_midi_reap(s); }
+    if (g_nmret >= MRET_N) { audio_barrier(s); free(old); return; }
+    g_mret[g_nmret].m = old; g_mret[g_nmret].s = s; g_mret[g_nmret].cyc = atomic_load(&s->audio_cycles);
+    g_nmret++;
+}
+
+int session_new_midi_clip(Session *s, int ch, int scene, float len_beats, const char *name)
+{
+    if (!s || ch < 0 || ch >= s->channel_count || scene < 0 || scene >= MAX_SCENES) return 1;
+    MidiSeq *m = midiseq_new(0, len_beats);
+    if (!m) return 1;
+    Clip *cl = &s->channels[ch].clips[scene];
+    clip_discard(s, cl);
+    for (int k = 0; k < 128; ++k) cl->m_off[k] = -1.0f;
+    atomic_store(&cl->mseq, m);
+    atomic_store(&cl->is_midi, true);
+    atomic_store(&cl->is_note, false);
+    atomic_store(&cl->playing, false);
+    atomic_store(&cl->paused, false);
+    atomic_store(&cl->loop, true);                   /* a MIDI clip loops by default (like in Ableton/Bitwig) */
+    atomic_store(&cl->mpos_vis, -1.0);
+    snprintf(cl->name, sizeof cl->name, "%s", name && name[0] ? name : "MIDI");
+    cl->path[0] = 0;
+    atomic_store(&cl->has_clip, true);
+    printf("session_new_midi_clip: [%d][%d] '%s' (%.0f beats)\n", ch, scene, cl->name, (double)m->length);
+    return 0;
+}
+
+bool session_is_midi(Session *s, int ch, int scene)
+{
+    if (!s || ch < 0 || ch >= s->channel_count || scene < 0 || scene >= MAX_SCENES) return false;
+    Clip *cl = &s->channels[ch].clips[scene];
+    return atomic_load(&cl->has_clip) && atomic_load(&cl->is_midi);
+}
+
+const MidiSeq *session_midi_get(Session *s, int ch, int scene)
+{
+    if (!session_is_midi(s, ch, scene)) return NULL;
+    return atomic_load(&s->channels[ch].clips[scene].mseq);
+}
+
+void session_midi_set(Session *s, int ch, int scene, MidiSeq *seq)
+{
+    if (!seq) return;
+    if (!session_is_midi(s, ch, scene)) { free(seq); return; }
+    if (seq->length < 0.25f) seq->length = 0.25f;
+    if (seq->length > 4096.0f) seq->length = 4096.0f;
+    if (seq->n > MIDI_MAX_NOTES) seq->n = MIDI_MAX_NOTES;
+    midiseq_sort(seq);
+    MidiSeq *old = atomic_exchange(&s->channels[ch].clips[scene].mseq, seq);
+    if (old != seq) midi_retire(s, old);
+}
+
+double session_midi_playhead(Session *s, int ch, int scene)
+{
+    if (!session_is_midi(s, ch, scene)) return -1.0;
+    Clip *cl = &s->channels[ch].clips[scene];
+    if (!atomic_load(&cl->playing)) return -1.0;
+    return atomic_load(&cl->mpos_vis);
+}
+
+/* text form (project file and undo): "midi_len=16\nmn=0 0.5 60 100\n..." (start length key velocity) */
+char *session_midi_text(Session *s, int ch, int scene)
+{
+    const MidiSeq *m = session_midi_get(s, ch, scene);
+    if (!m) return NULL;
+    size_t cap = 64 + (size_t)m->n * 40, len = 0;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    len += (size_t)snprintf(out + len, cap - len, "midi_len=%g\n", (double)m->length);
+    for (int i = 0; i < m->n; ++i)
+        len += (size_t)snprintf(out + len, cap - len, "mn=%g %g %d %d\n", (double)m->note[i].start, (double)m->note[i].len,
+                                m->note[i].key, m->note[i].vel);
+    return out;
+}
+
+MidiSeq *midiseq_from_text(const char *text)
+{
+    if (!text) return NULL;
+    float length = -1.0f;
+    int cnt = 0;
+    for (const char *p = text; p && *p; p = strchr(p, '\n'), p = p ? p + 1 : NULL) {
+        if (!strncmp(p, "midi_len=", 9)) length = (float)atof(p + 9);
+        else if (!strncmp(p, "mn=", 3)) ++cnt;
+    }
+    if (length <= 0.0f) return NULL;
+    if (cnt > MIDI_MAX_NOTES) cnt = MIDI_MAX_NOTES;
+    MidiSeq *m = midiseq_new(cnt, length);
+    if (!m) return NULL;
+    m->n = 0;
+    for (const char *p = text; p && *p && m->n < cnt; p = strchr(p, '\n'), p = p ? p + 1 : NULL) {
+        if (strncmp(p, "mn=", 3)) continue;
+        double a, b; int k, v;
+        if (sscanf(p + 3, "%lf %lf %d %d", &a, &b, &k, &v) != 4) continue;
+        if (k < 0 || k > 127 || b <= 0.0 || a < 0.0) continue;
+        if (v < 1) v = 1;
+        if (v > 127) v = 127;
+        MNote *q = &m->note[m->n++];
+        q->start = (float)a; q->len = (float)b; q->key = (unsigned char)k; q->vel = (unsigned char)v; q->sel = 0;
+    }
+    midiseq_sort(m);
+    return m;
+}
+
+int session_midi_set_text(Session *s, int ch, int scene, const char *text)
+{
+    MidiSeq *m = midiseq_from_text(text);
+    if (!m) return 1;
+    if (!session_is_midi(s, ch, scene)) {
+        char nm[NAME_LEN] = "MIDI";
+        if (s && ch >= 0 && ch < s->channel_count && scene >= 0 && scene < MAX_SCENES &&
+            atomic_load(&s->channels[ch].clips[scene].has_clip))
+            snprintf(nm, sizeof nm, "%s", s->channels[ch].clips[scene].name);
+        if (session_new_midi_clip(s, ch, scene, m->length, nm) != 0) { free(m); return 1; }
+    }
+    session_midi_set(s, ch, scene, m);
+    return 0;
+}
+
 bool session_is_note(Session *s, int ch, int scene)
 {
     if (!s || ch < 0 || ch >= s->channel_count) return false;
@@ -712,6 +928,86 @@ void session_clear_clip(Session *s, int ch, int scene)
 }
 
 // Pressing a clip: if it is playing -> restart; otherwise stop the others on the channel and play this one.
+/* ===== 1.1: quantized launch =====
+ * While the transport runs (something plays) and quantization is on, a launch does not happen at once: the clip is
+ * prepared (stream at the start, Rubber Band computing ahead) and the AUDIO thread starts it exactly at the next
+ * multiple of quant_beats (sample accurate, see mixer.c ql_process). The beat grid comes from the master tempo. */
+static size_t ql_pull(void *ud, float *out, size_t n) { return stream_read((ClipStream *)ud, out, n); }
+
+/* the beat of the next boundary, or -1 = launch at once (no quantization or nothing plays) */
+static double ql_target(Session *s)
+{
+    float q = atomic_load(&s->quant_beats);
+    if (q <= 0.0f || !atomic_load(&s->tp_running) || !session_any_playing(s)) {
+        if (!session_any_playing(s)) atomic_store(&s->tp_reset, true);   /* nothing plays: this launch is beat 1 */
+        return -1.0;
+    }
+    double tp = atomic_load(&s->tp_beats);
+    double b = ceil(tp / (double)q - 1e-9) * (double)q;
+    if (b < tp) b = tp;
+    return b;
+}
+
+static void ql_schedule(Session *s, Clip *cl, int state, double beat)
+{
+    atomic_store(&cl->ql_beat, beat);
+    if (atomic_exchange(&cl->ql_state, state) == 0) atomic_fetch_add(&s->ql_pending, 1);
+}
+
+/* the clip waits silently, ready to sound at once (as the queue prepares its next clip) */
+static void ql_prepare(Clip *cl)
+{
+    atomic_store(&cl->paused, false);
+    atomic_store(&cl->ended, false);
+    atomic_store(&cl->xf_dir, 0);
+    cl->start_offset = 0;
+    if (atomic_load(&cl->is_midi)) { atomic_fetch_add(&cl->m_gen, 1); return; }   /* 1.3: nothing to read ahead */
+    unsigned g = atomic_fetch_add(&cl->stretch_gen, 1) + 1;
+    stream_start(cl->stream, STREAM_FROM_START);
+    atomic_store(&cl->position, stream_position(cl->stream));
+    if (atomic_load(&cl->warp) && cl->stretch && stretch_threaded(cl->stretch)) {
+        cl->stretch_seen = g;
+        cl->stretch_live = true;
+        stretch_prepare(cl->stretch, session_clip_speed(cl), ql_pull, cl->stream);
+    }
+}
+
+/* a newer press in the same channel wins: the older waiting launches of that channel are cancelled */
+static void ql_cancel_channel(Session *s, int ch, const Clip *keep)
+{
+    for (int sc = 0; sc < MAX_SCENES; ++sc) {
+        Clip *o = &s->channels[ch].clips[sc];
+        if (o == keep) continue;
+        int st = atomic_load(&o->ql_state);
+        if (!st) continue;
+        if (atomic_exchange(&o->ql_state, 0)) atomic_fetch_sub(&s->ql_pending, 1);
+        if (st == 1 && !atomic_load(&o->playing)) {
+            if (o->stretch) stretch_release(o->stretch);
+            if (o->stream) stream_stop(o->stream);
+        }
+    }
+}
+
+/* launch (or restart) one clip at the beat qb */
+static void ql_launch_clip(Session *s, int ch, Clip *cl, double qb)
+{
+    ql_cancel_channel(s, ch, cl);
+    if (atomic_load(&cl->playing)) ql_schedule(s, cl, 3, qb);
+    else { ql_prepare(cl); ql_schedule(s, cl, 1, qb); }
+}
+
+void session_quant_tick(Session *s)
+{
+    if (!s) return;
+    for (int c = 0; c < s->channel_count; ++c)
+        for (int sc = 0; sc < s->scene_count; ++sc) {
+            Clip *cl = &s->channels[c].clips[sc];
+            if (atomic_exchange(&cl->ql_restart_now, false) && atomic_load(&cl->has_clip)) clip_start(cl, STREAM_FROM_START);
+            if (atomic_exchange(&cl->ql_stopped, false) && !atomic_load(&cl->playing) && !atomic_load(&cl->ql_state))
+                if (cl->stream) stream_stop(cl->stream);
+        }
+}
+
 void session_toggle_clip(Session *s, int ch, int scene)
 {
     if (!s || ch < 0 || ch >= s->channel_count) return;
@@ -723,6 +1019,9 @@ void session_toggle_clip(Session *s, int ch, int scene)
 
     session_queue_clear(s);                         // manual play -> the queue is cleared
     s->last_started = ch * MAX_SCENES + scene;
+
+    double qb = ql_target(s);
+    if (qb >= 0.0) { ql_launch_clip(s, ch, cl, qb); return; }   /* 1.1: waits for the next beat/bar */
 
     if (!atomic_load(&cl->playing)) {
         for (int sc = 0; sc < s->scene_count; ++sc) {
@@ -751,6 +1050,30 @@ void session_play_clip_from(Session *s, int ch, int scene, size_t frame)
         if (atomic_load(&other->has_clip) && !atomic_load(&other->is_note)) clip_stop(other);
     }
     clip_start(cl, frame);
+}
+
+void session_midi_play_from(Session *s, int ch, int scene, double beat)
+{
+    if (!s || ch < 0 || ch >= s->channel_count) return;
+    if (scene < 0 || scene >= MAX_SCENES) return;
+    Clip *cl = &s->channels[ch].clips[scene];
+    if (!atomic_load(&cl->has_clip) || !atomic_load(&cl->is_midi)) return;
+    if (beat < 0.0) beat = 0.0;
+    bool was = atomic_load(&cl->playing);
+    if (!was) {
+        session_queue_clear(s);
+        s->last_started = ch * MAX_SCENES + scene;
+        for (int sc = 0; sc < s->scene_count; ++sc) {
+            if (sc == scene) continue;
+            Clip *other = &s->channels[ch].clips[sc];
+            if (atomic_load(&other->has_clip) && !atomic_load(&other->is_note)) clip_stop(other);
+        }
+    }
+    atomic_store(&cl->m_seek, beat);
+    atomic_store(&cl->m_seek_gen, atomic_load(&cl->m_gen) + 1);      /* the start that follows begins at "beat" */
+    if (!atomic_load(&s->tp_running)) atomic_store(&s->tp_start, beat);   /* the beat count (and metronome) follow */
+    if (was) atomic_fetch_add(&cl->m_gen, 1);
+    else clip_start(cl, 0);
 }
 
 void session_seek_clip(Session *s, int ch, int scene, size_t frame)
@@ -839,6 +1162,7 @@ void session_rename_clip(Session *s, int ch, int scene, const char *new_name)
 
 void session_delete_channel(Session *s, int ch)
 {
+    rec_abort_all(s);                               /* 1.4: the cells move - a running recording ends here */
     if (!s || ch < 0 || ch >= s->channel_count) return;
     session_queue_clear(s);                         // the cell numbers shift
 
@@ -869,6 +1193,7 @@ void session_delete_channel(Session *s, int ch)
 
 void session_delete_scene(Session *s, int sc)
 {
+    rec_abort_all(s);                               /* 1.4: the cells move - a running recording ends here */
     if (!s || sc < 0 || sc >= s->scene_count) return;
     session_queue_clear(s);                         // the cell numbers shift
 
@@ -906,6 +1231,7 @@ void session_delete_scene(Session *s, int sc)
 // Used by undo to bring back a deleted channel without stopping the ones playing around it.
 int session_insert_channel(Session *s, int idx)
 {
+    rec_abort_all(s);                               /* 1.4: the cells move - a running recording ends here */
     if (!s || idx < 0 || idx > s->channel_count || s->channel_count >= MAX_CHANNELS) return -1;
     session_queue_clear(s);
     struct_lock(s);
@@ -936,6 +1262,7 @@ static int move_cell(int cell, int from, int to)
 
 bool session_move_channel(Session *s, int from, int to)
 {
+    if (from != to) rec_abort_all(s);              /* 1.4 */
     if (!s) return false;
     int n = s->channel_count;
     if (from < 0 || from >= n || to < 0 || to >= n || from == to) return false;
@@ -960,6 +1287,7 @@ bool session_move_channel(Session *s, int from, int to)
 // Inserts an EMPTY scene at position idx (the later ones shift down).
 int session_insert_scene(Session *s, int idx)
 {
+    rec_abort_all(s);                               /* 1.4: the cells move - a running recording ends here */
     if (!s || idx < 0 || idx > s->scene_count || s->scene_count >= MAX_SCENES) return -1;
     session_queue_clear(s);
     /* the cell right below the last scene will be overwritten -> if something was left there, free it */
@@ -995,6 +1323,23 @@ void session_play_scene(Session *s, int scene)
 {
     if (!s || scene < 0 || scene >= s->scene_count) return;
     session_queue_clear(s);                         // manual play -> the queue is cleared
+
+    double qb = ql_target(s);
+    if (qb >= 0.0) {                                /* 1.1: the whole scene starts together on the next beat/bar */
+        for (int c = 0; c < s->channel_count; ++c) {
+            Clip *target = &s->channels[c].clips[scene];
+            if (atomic_load(&target->has_clip) && !atomic_load(&target->is_note) && (target->stream || atomic_load(&target->is_midi))) {
+                ql_launch_clip(s, c, target, qb);
+            } else {                                /* no clip in this scene: what plays in this channel stops then */
+                ql_cancel_channel(s, c, NULL);
+                for (int sc = 0; sc < s->scene_count; ++sc) {
+                    Clip *o = &s->channels[c].clips[sc];
+                    if (atomic_load(&o->has_clip) && atomic_load(&o->playing)) ql_schedule(s, o, 2, qb);
+                }
+            }
+        }
+        return;
+    }
 
     for (int c = 0; c < s->channel_count; ++c) {
         for (int sc = 0; sc < s->scene_count; ++sc) {
@@ -1037,9 +1382,339 @@ void session_play_all(Session *s)
     }
 }
 
+/* ===== 1.2: playing instruments ===== */
+void session_midi_tick(Session *s)
+{
+    if (!s) return;
+    session_midi_reap(s);                            /* 1.3: old note lists */
+    unsigned b[4] = { 0, 0, 0, 0 };
+#define MARK(v) do { int bb_ = (v); if (MIDI_BIND_KIND(bb_) == MIDI_BIND_NOTE) { int nn_ = MIDI_BIND_NUM(bb_) & 0x7F; b[nn_ >> 5] |= 1u << (nn_ & 31); } } while (0)
+    for (int c = 0; c < s->channel_count; ++c) {
+        Channel *ch = &s->channels[c];
+        MARK(atomic_load(&ch->mute_bind));
+        MARK(atomic_load(&ch->solo_bind));
+        for (int sc = 0; sc < s->scene_count; ++sc) {
+            int v = atomic_load_explicit(&ch->clips[sc].bind, memory_order_relaxed);
+            if (v) MARK(v);
+        }
+    }
+#undef MARK
+    for (int i = 0; i < 4; ++i) atomic_store(&s->midi_bound[i], b[i]);
+    atomic_store(&s->midi_block, atomic_load(&s->btn_learn_kind) != BTN_LEARN_NONE);
+    int t = atomic_load(&s->midi_target);
+    if (t >= s->channel_count) atomic_store(&s->midi_target, -1);
+}
+
+void session_set_midi_target(Session *s, int ch)
+{
+    if (!s) return;
+    if (ch < -1 || ch >= s->channel_count) ch = -1;
+    atomic_store(&s->midi_target, ch);
+}
+int session_get_midi_target(Session *s) { return s ? atomic_load(&s->midi_target) : -1; }
+void session_midi_panic(Session *s) { if (s) atomic_store(&s->midi_panic, true); }
+
+/* ===== 1.4: recording ===== */
+void session_toggle_arm(Session *s, int ch)
+{
+    if (!s || ch < 0 || ch >= s->channel_count) return;
+    atomic_store(&s->channels[ch].armed, !atomic_load(&s->channels[ch].armed));
+}
+bool session_is_armed(Session *s, int ch) { return s && ch >= 0 && ch < s->channel_count && atomic_load(&s->channels[ch].armed); }
+void session_set_rec_input(Session *s, int ch, int first, bool stereo)
+{
+    if (!s || ch < 0 || ch >= s->channel_count) return;
+    if (first < 0) first = 0;
+    if (first > 62) first = 62;
+    atomic_store(&s->channels[ch].rec_in_first, first);
+    atomic_store(&s->channels[ch].rec_in_stereo, stereo);
+}
+void session_set_monitor(Session *s, int ch, bool on) { if (s && ch >= 0 && ch < s->channel_count) atomic_store(&s->channels[ch].monitor, on); }
+
+/* what the UI keeps for one recording */
+typedef struct {
+    SNDFILE *sf;
+    char     path[1024];
+    float   *buf;                       /* for writing out of the ring */
+    /* MIDI: the keys being held (start, velocity) and the finished notes */
+    double   on_beat[16][128];
+    unsigned char on_vel[16][128];
+    bool     on[16][128];
+    MNote   *notes; int n, cap;
+    bool     dirty;
+    double   last_pub;
+} RecUi;
+
+static RecSlot *rec_find(Session *s, int ch, int sc)
+{
+    for (int i = 0; i < MAX_REC; ++i) {
+        RecSlot *r = &s->rec[i];
+        if (atomic_load(&r->state) != REC_IDLE && r->ch == ch && r->sc == sc) return r;
+    }
+    return NULL;
+}
+
+static void rec_free(Session *s, RecSlot *r)
+{
+    RecUi *u = r->ui;
+    if (u) { if (u->sf) sf_close(u->sf); free(u->buf); free(u->notes); free(u); }
+    r->ui = NULL;
+    free(r->ring); r->ring = NULL;
+    atomic_store(&r->state, REC_IDLE);
+    atomic_fetch_sub(&s->rec_active, 1);
+}
+
+int session_rec_state(Session *s, int ch, int scene, double *beats)
+{
+    if (!s) return REC_IDLE;
+    RecSlot *r = rec_find(s, ch, scene);
+    if (!r) return REC_IDLE;
+    if (beats) *beats = atomic_load(&r->rec_beats);
+    return atomic_load(&r->state);
+}
+
+int session_rec_cell(Session *s, int ch, int sc, bool midi, const char *wav_path, unsigned latency, char *err, int esz)
+{
+    char dummy[8];
+    if (!err) { err = dummy; esz = sizeof dummy; }
+    err[0] = 0;
+    if (!s || ch < 0 || ch >= s->channel_count || sc < 0 || sc >= s->scene_count) { snprintf(err, (size_t)esz, "no such cell"); return 1; }
+    RecSlot *r = rec_find(s, ch, sc);
+    if (r) {                                         /* a recording is here: stop it */
+        int st = atomic_load(&r->state);
+        if (st == REC_WAIT) {                        /* has not started yet: just cancel */
+            if (atomic_compare_exchange_strong(&r->state, &st, REC_IDLE + 100)) {   /* the audio thread ignores this state */
+                audio_barrier(s);
+                if (r->midi) session_clear_clip(s, ch, sc);
+                if (!r->midi && r->ui && ((RecUi *)r->ui)->path[0]) { RecUi *u = r->ui; sf_close(u->sf); u->sf = NULL; remove(u->path); }
+                rec_free(s, r);
+            }
+            return 0;
+        }
+        if (st == REC_ON) {                          /* at the next beat/bar (like a launch), or at once */
+            double qb = -1.0;
+            float q = atomic_load(&s->quant_beats);
+            if (q > 0.0f && atomic_load(&s->tp_running)) {
+                double tp = atomic_load(&s->tp_beats);
+                qb = ceil(tp / (double)q - 1e-9) * (double)q;
+                if (qb <= r->beat0 + 1e-9) qb += q;  /* at least one step long */
+            }
+            atomic_store(&r->stop_beat, qb);
+            atomic_store(&r->state, REC_STOPPING);
+        } else if (st == REC_STOPPING) {
+            atomic_store(&r->stop_beat, -1.0);       /* a second click: now */
+        }
+        return 0;
+    }
+    if (!atomic_load(&s->channels[ch].armed)) { snprintf(err, (size_t)esz, "the channel is not armed for recording"); return 1; }
+    if (atomic_load(&s->channels[ch].clips[sc].has_clip)) { snprintf(err, (size_t)esz, "the cell is not empty"); return 1; }
+    r = NULL;
+    for (int i = 0; i < MAX_REC && !r; ++i) if (atomic_load(&s->rec[i].state) == REC_IDLE) r = &s->rec[i];
+    if (!r) { snprintf(err, (size_t)esz, "already %d recordings at once", MAX_REC); return 1; }
+    RecUi *u = calloc(1, sizeof *u);
+    if (!u) { snprintf(err, (size_t)esz, "out of memory"); return 1; }
+    r->ch = ch; r->sc = sc; r->midi = midi;
+    r->in_first = atomic_load(&s->channels[ch].rec_in_first);
+    r->in_count = atomic_load(&s->channels[ch].rec_in_stereo) ? 2 : 1;
+    r->latency = midi ? 0 : latency;
+    r->stopped_at = false;
+    atomic_store(&r->rec_beats, 0.0);
+    atomic_store(&r->frames, 0ull); atomic_store(&r->after, 0ull);
+    atomic_store(&r->overflow, false);
+    atomic_store(&r->final_beats, 0.0);
+    atomic_store(&r->rw, 0u); atomic_store(&r->rr, 0u);
+    atomic_store(&r->mw, 0u); atomic_store(&r->mr, 0u);
+    atomic_store(&r->stop_beat, -1.0);
+    if (midi) {
+        if (session_new_midi_clip(s, ch, sc, 1024.0f, "Rec") != 0) { free(u); snprintf(err, (size_t)esz, "cannot make the clip"); return 1; }
+        atomic_store(&s->channels[ch].clips[sc].loop, true);
+    } else {
+        if (!wav_path || !wav_path[0]) { free(u); snprintf(err, (size_t)esz, "no file to record into"); return 1; }
+        r->ring = malloc(sizeof(float) * 2 * REC_RING_FRAMES);
+        u->buf = malloc(sizeof(float) * 2 * 8192);
+        SF_INFO info;
+        memset(&info, 0, sizeof info);
+        info.samplerate = s->sample_rate > 0 ? s->sample_rate : 48000;
+        info.channels = 2;
+        info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_24;
+        snprintf(u->path, sizeof u->path, "%s", wav_path);
+        u->sf = r->ring && u->buf ? sf_open(wav_path, SFM_WRITE, &info) : NULL;
+        if (!u->sf) {
+            snprintf(err, (size_t)esz, "cannot write '%s'", wav_path);
+            free(r->ring); r->ring = NULL; free(u->buf); free(u);
+            return 1;
+        }
+    }
+    r->ui = u;
+    /* the start: on the next beat/bar while something plays (like a launch), otherwise at once */
+    double qb = -1.0;
+    float q = atomic_load(&s->quant_beats);
+    bool any = session_any_playing(s);
+    if (!any) atomic_store(&s->tp_reset, true);      /* nothing plays: the recording is beat 1 */
+    else if (q > 0.0f && atomic_load(&s->tp_running)) {
+        double tp = atomic_load(&s->tp_beats);
+        qb = ceil(tp / (double)q - 1e-9) * (double)q;
+    }
+    atomic_store(&r->start_beat, qb);
+    atomic_fetch_add(&s->rec_active, 1);
+    atomic_store(&r->state, REC_WAIT);
+    printf("rec: [%d][%d] %s %s\n", ch, sc, midi ? "MIDI" : "audio", qb >= 0 ? "waits for the beat" : "starts now");
+    return 0;
+}
+
+static void rec_publish_midi(Session *s, RecSlot *r, double len_beats, bool final)
+{
+    RecUi *u = r->ui;
+    MidiSeq *m = midiseq_new(u->n, final ? (float)len_beats : 1024.0f);
+    if (!m) return;
+    if (u->n) memcpy(m->note, u->notes, sizeof(MNote) * (size_t)u->n);
+    m->n = u->n;
+    if (final) {                                     /* notes that start after the end are dropped */
+        int w = 0;
+        for (int i = 0; i < m->n; ++i) if (m->note[i].start < m->length) m->note[w++] = m->note[i];
+        m->n = w;
+    }
+    session_midi_set(s, r->ch, r->sc, m);
+    u->dirty = false;
+}
+
+static void rec_add_note(RecUi *u, double start, double end, int key, int vel)
+{
+    if (end <= start) end = start + 1.0 / 64.0;
+    if (u->n == u->cap) {
+        int nc = u->cap ? u->cap * 2 : 256;
+        MNote *nn = realloc(u->notes, sizeof(MNote) * (size_t)nc);
+        if (!nn) return;
+        u->notes = nn; u->cap = nc;
+    }
+    MNote *q = &u->notes[u->n++];
+    q->start = (float)(start < 0 ? 0 : start); q->len = (float)(end - (start < 0 ? 0 : start)); q->key = (unsigned char)key;
+    q->vel = (unsigned char)(vel < 1 ? 1 : vel); q->sel = 0;
+    u->dirty = true;
+}
+
+void session_rec_tick(Session *s)
+{
+    if (!s || atomic_load(&s->rec_active) <= 0) return;
+    for (int i = 0; i < MAX_REC; ++i) {
+        RecSlot *r = &s->rec[i];
+        int st = atomic_load(&r->state);
+        if (st == REC_IDLE || !r->ui) continue;
+        RecUi *u = r->ui;
+        if (!r->midi) {                              /* the ring -> the file */
+            unsigned rr = atomic_load_explicit(&r->rr, memory_order_relaxed), rw = atomic_load_explicit(&r->rw, memory_order_acquire);
+            while (rr != rw && u->sf) {
+                unsigned k = rw - rr, at = rr % REC_RING_FRAMES;
+                if (k > REC_RING_FRAMES - at) k = REC_RING_FRAMES - at;
+                if (k > 8192) k = 8192;
+                memcpy(u->buf, r->ring + (size_t)at * 2, sizeof(float) * 2 * k);
+                sf_writef_float(u->sf, u->buf, k);
+                rr += k;
+                atomic_store_explicit(&r->rr, rr, memory_order_release);
+            }
+        } else {                                     /* the played messages -> notes */
+            unsigned mr = atomic_load_explicit(&r->mr, memory_order_relaxed), mw = atomic_load_explicit(&r->mw, memory_order_acquire);
+            for (; mr != mw; ++mr) {
+                const RecEv *e = &r->mev[mr % REC_MEV];
+                unsigned stt = e->m[0] & 0xF0, mc = e->m[0] & 0x0F, k = e->m[1] & 0x7F;
+                if (stt == 0x90 && e->m[2] > 0) {
+                    if (u->on[mc][k]) rec_add_note(u, u->on_beat[mc][k], e->beat, (int)k, u->on_vel[mc][k]);
+                    u->on[mc][k] = true; u->on_beat[mc][k] = e->beat; u->on_vel[mc][k] = e->m[2];
+                } else if ((stt == 0x80 || stt == 0x90) && u->on[mc][k]) {
+                    rec_add_note(u, u->on_beat[mc][k], e->beat, (int)k, u->on_vel[mc][k]);
+                    u->on[mc][k] = false;
+                }
+            }
+            atomic_store_explicit(&r->mr, mr, memory_order_release);
+            if (u->dirty && st != REC_DONE) rec_publish_midi(s, r, 0.0, false);   /* the notes appear while you play */
+        }
+        if (st != REC_DONE) continue;
+        /* ---- finished: it becomes a clip that plays on in time ---- */
+        double len = atomic_load(&r->final_beats);
+        Clip *cl = &s->channels[r->ch].clips[r->sc];
+        char nm[NAME_LEN];
+        int nrec = 1;
+        for (int sc = 0; sc < s->scene_count; ++sc) {
+            const Clip *o = &s->channels[r->ch].clips[sc];
+            if (atomic_load(&o->has_clip) && !strncmp(o->name, "Rec ", 4)) ++nrec;
+        }
+        snprintf(nm, sizeof nm, "Rec %d", nrec);
+        if (r->midi) {
+            for (int c = 0; c < 16; ++c)             /* keys still held: they end at the end */
+                for (int k = 0; k < 128; ++k)
+                    if (u->on[c][k]) { rec_add_note(u, u->on_beat[c][k], len, k, u->on_vel[c][k]); u->on[c][k] = false; }
+            if (len < 0.25) len = 0.25;
+            rec_publish_midi(s, r, len, true);
+            session_rename_clip(s, r->ch, r->sc, nm);
+            printf("rec: [%d][%d] MIDI done, %.2f beats, %d notes\n", r->ch, r->sc, len, u->n);
+        } else {
+            sf_close(u->sf); u->sf = NULL;
+            bool ovf = atomic_load(&r->overflow);
+            char path[1024];
+            snprintf(path, sizeof path, "%s", u->path);
+            unsigned long long after = atomic_load(&r->after);
+            unsigned long long frames = atomic_load(&r->frames);
+            if (frames > 0 && session_set_clip(s, r->ch, r->sc, path) == 0) {
+                session_rename_clip(s, r->ch, r->sc, nm);
+                atomic_store(&cl->loop, true);
+                float T = atomic_load(&s->tempo);
+                session_set_clip_bpm_fields(s, r->ch, r->sc, 0.0f, T > 0 ? T : 0.0f, 0.0f);   /* recorded at this tempo */
+                size_t len_f = cl->wav.frame_count;
+                if (len_f > 0) clip_start(cl, (size_t)(after % len_f));   /* goes on as if it had started at the stop */
+                printf("rec: [%d][%d] audio done, %llu frames (%.2f beats)%s -> %s\n", r->ch, r->sc, frames, len,
+                       ovf ? " - SOME AUDIO WAS LOST (the disk was too slow)" : "", path);
+            } else {
+                remove(path);
+                printf("rec: [%d][%d] nothing recorded\n", r->ch, r->sc);
+            }
+        }
+        rec_free(s, r);
+    }
+}
+
+/* the cells are about to move (a channel/scene is inserted, deleted, moved; a project is closed): every recording
+ * ends at once. What was recorded stays in its file (audio); no clip is made from it. */
+static void rec_abort_all(Session *s)
+{
+    if (!s || atomic_load(&s->rec_active) <= 0) return;
+    bool any = false;
+    for (int i = 0; i < MAX_REC; ++i) {
+        RecSlot *r = &s->rec[i];
+        int st = atomic_load(&r->state);
+        if (st == REC_IDLE) continue;
+        atomic_store(&r->state, REC_IDLE + 100);     /* the audio thread ignores it from now on */
+        any = true;
+    }
+    if (!any) return;
+    audio_barrier(s);
+    for (int i = 0; i < MAX_REC; ++i) {
+        RecSlot *r = &s->rec[i];
+        if (atomic_load(&r->state) != REC_IDLE + 100) continue;
+        RecUi *u = r->ui;
+        if (u && u->sf) {                            /* the audio recorded so far still goes into the file */
+            unsigned rr = atomic_load(&r->rr), rw = atomic_load(&r->rw);
+            for (; rr != rw; ++rr) sf_writef_float(u->sf, r->ring + (size_t)(rr % REC_RING_FRAMES) * 2, 1);
+            printf("rec: stopped by a change of the grid - the audio stays in %s\n", u->path);
+        }
+        rec_free(s, r);
+    }
+}
+
+void session_rec_stop_all(Session *s)
+{
+    if (!s || atomic_load(&s->rec_active) <= 0) return;
+    for (int i = 0; i < MAX_REC; ++i) {
+        RecSlot *r = &s->rec[i];
+        int st = atomic_load(&r->state);
+        if (st == REC_WAIT) session_rec_cell(s, r->ch, r->sc, r->midi, NULL, 0, NULL, 0);    /* cancel */
+        else if (st == REC_ON || st == REC_STOPPING) { atomic_store(&r->stop_beat, -1.0); atomic_store(&r->state, REC_STOPPING); }
+    }
+}
+
 void session_stop_all(Session *s)
 {
     if (!s) return;
+    session_rec_stop_all(s);                         /* 1.4: Stop all also ends the recordings (now) */
     for (int c = 0; c < s->channel_count; ++c) {
         for (int sc = 0; sc < MAX_SCENES; ++sc) {
             Clip *cl = &s->channels[c].clips[sc];
@@ -1617,6 +2292,30 @@ void session_set_tempo(Session *s, float bpm)
 {
     if (!s) return;
     atomic_store(&s->tempo, clamp_bpm(bpm));
+    atomic_store(&g_master_tempo, atomic_load(&s->tempo));
+}
+
+void session_set_quantize(Session *s, float beats)
+{
+    if (!s) return;
+    if (!(beats >= 0.0f)) beats = 0.0f;
+    if (beats > 64.0f) beats = 64.0f;
+    atomic_store(&s->quant_beats, beats);
+}
+
+float session_get_quantize(Session *s) { return s ? atomic_load(&s->quant_beats) : 0.0f; }
+
+bool session_transport(Session *s, double *beats)
+{
+    if (!s) return false;
+    if (beats) *beats = atomic_load(&s->tp_beats);
+    return atomic_load(&s->tp_running);
+}
+
+int session_clip_launch_state(Session *s, int ch, int scene)
+{
+    if (!s || ch < 0 || ch >= s->channel_count || scene < 0 || scene >= MAX_SCENES) return 0;
+    return atomic_load(&s->channels[ch].clips[scene].ql_state);
 }
 
 float session_get_tempo(Session *s)
@@ -1649,9 +2348,8 @@ float session_clip_bpm_play(Session *s, int ch, int scene)
     Clip *cl = audio_clip(s, ch, scene);
     if (!cl) return 0.0f;
     float o = clip_orig(cl);
-    if (!atomic_load(&cl->warp)) return o;
-    float p = atomic_load(&cl->bpm_play);
-    return p > 0.0f ? p : o;
+    if (!atomic_load(&cl->warp) || o <= 0.0f) return o;
+    return atomic_load(&g_master_tempo);           /* 1.1: WARP = the master tempo */
 }
 
 bool session_clip_bpm_busy(Session *s, int ch, int scene)
@@ -1693,8 +2391,7 @@ void session_set_clip_bpm_value(Session *s, int ch, int scene, float bpm)
     Clip *cl = audio_clip(s, ch, scene);
     if (!cl) return;
     bpm = clamp_bpm(bpm);
-    if (atomic_load(&cl->warp)) atomic_store(&cl->bpm_play, bpm);
-    else                        atomic_store(&cl->bpm_fix, bpm);
+    atomic_store(&cl->bpm_fix, bpm);                /* 1.1: the field is always the clip's own tempo (a correction) */
 }
 
 void session_set_clip_bpm_fields(Session *s, int ch, int scene, float detected, float fix, float play)
@@ -1713,9 +2410,15 @@ void session_set_clip_bpm_fields(Session *s, int ch, int scene, float detected, 
 double session_clip_speed(const Clip *cl)
 {
     if (!cl || !atomic_load(&cl->warp)) return 1.0;
+    return session_clip_speed_warp(cl);
+}
+
+double session_clip_speed_warp(const Clip *cl)
+{
+    if (!cl) return 1.0;
     float o = clip_orig(cl);
     if (o <= 0.0f) return 1.0;
-    float p = atomic_load(&cl->bpm_play);
+    float p = atomic_load(&g_master_tempo);         /* 1.1: WARP clips follow the master tempo */
     if (p <= 0.0f) return 1.0;
     double sp = (double)p / (double)o;
     if (sp < STRETCH_SPEED_MIN) sp = STRETCH_SPEED_MIN;
@@ -1804,7 +2507,7 @@ bool session_queue_add(Session *s, int ch, int scene)
         for (int c = 0; c < s->channel_count && anchor < 0; ++c)
             for (int sc = 0; sc < s->scene_count && anchor < 0; ++sc) {
                 Clip *cl = &s->channels[c].clips[sc];
-                if (atomic_load(&cl->has_clip) && !atomic_load(&cl->is_note) && atomic_load(&cl->playing))
+                if (atomic_load(&cl->has_clip) && !atomic_load(&cl->is_note) && cl->stream && atomic_load(&cl->playing))
                     anchor = c * MAX_SCENES + sc;
             }
         if (anchor < 0) return false;                  // nothing is playing -> no queue
@@ -2195,6 +2898,36 @@ int session_fx_add(Session *s, int ch, const char *fmt, const char *name, const 
     snprintf(f->name, sizeof f->name, "%s", name ? name : "");
     snprintf(f->path, sizeof f->path, "%s", path ? path : "");
     return c->fx_count++;
+}
+
+/* 1.2: an instrument goes to the front of the chain (the effects after it process its sound) */
+int session_fx_insert(Session *s, int ch, int pos, const char *fmt, const char *name, const char *path)
+{
+    if (!s || ch < 0 || ch >= s->channel_count) return -1;
+    Channel *c = &s->channels[ch];
+    if (c->fx_count >= MAX_CH_FX) return -1;
+    if (pos < 0) pos = 0;
+    if (pos > c->fx_count) pos = c->fx_count;
+    memmove(&c->fx[pos + 1], &c->fx[pos], sizeof(ChFx) * (size_t)(c->fx_count - pos));
+    ChFx *f = &c->fx[pos];
+    memset(f, 0, sizeof *f);
+    snprintf(f->fmt, sizeof f->fmt, "%s", fmt ? fmt : "");
+    snprintf(f->name, sizeof f->name, "%s", name ? name : "");
+    snprintf(f->path, sizeof f->path, "%s", path ? path : "");
+    c->fx_count++;
+    return pos;
+}
+
+/* 1.2: move a plugin in the chain (the device panel) */
+void session_fx_move(Session *s, int ch, int from, int to)
+{
+    if (!s || ch < 0 || ch >= s->channel_count) return;
+    Channel *c = &s->channels[ch];
+    if (from < 0 || from >= c->fx_count || to < 0 || to >= c->fx_count || from == to) return;
+    ChFx tmp = c->fx[from];
+    if (from < to) memmove(&c->fx[from], &c->fx[from + 1], sizeof(ChFx) * (size_t)(to - from));
+    else memmove(&c->fx[to + 1], &c->fx[to], sizeof(ChFx) * (size_t)(from - to));
+    c->fx[to] = tmp;
 }
 
 void session_fx_remove(Session *s, int ch, int idx)

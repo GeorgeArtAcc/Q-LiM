@@ -11,17 +11,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
-static uint32_t ev_size(const clap_input_events_t *l) { (void)l; return 0; }
-static const clap_event_header_t *ev_get(const clap_input_events_t *l, uint32_t i) { (void)l; (void)i; return NULL; }
 static bool ev_push(const clap_output_events_t *l, const clap_event_header_t *e)
 {
     (void)l;
     if (e && e->space_id == CLAP_CORE_EVENT_SPACE_ID && e->type == CLAP_EVENT_PARAM_VALUE) qplug_note_edit();
     return true;
 }
-static const clap_input_events_t  g_in_ev = { NULL, ev_size, ev_get };
 static const clap_output_events_t g_out_ev = { NULL, ev_push };
+
+/* 1.2: the input events of one process call - MIDI from the keyboard and parameter changes from the device panel */
+typedef union { clap_event_header_t h; clap_event_note_t note; clap_event_midi_t midi; clap_event_param_value_t pv; } CEv;
+#define CL_PQ 128
+typedef struct { clap_id id; void *cookie; double min, max, def; uint32_t flags; char name[CLAP_NAME_SIZE]; } CParam;
 
 typedef struct {
     clap_host_t host;                /* host_data -> this CL */
@@ -37,7 +40,25 @@ typedef struct {
     const clap_plugin_timer_support_t *timers;
     const clap_plugin_posix_fd_support_t *fds;
     unsigned tm_ids[64]; int ntm;    /* our timer ids */
+    /* 1.2 */
+    int dialect;                     /* 0 = no MIDI, 1 = raw MIDI, 2 = CLAP notes */
+    int16_t note_port;
+    CEv ev[QMIDI_MAX + CL_PQ];
+    const clap_event_header_t *evp[QMIDI_MAX + CL_PQ];
+    uint32_t nev;
+    clap_input_events_t in_ev;
+    const clap_plugin_params_t *params;
+    CParam *par; int npar;           /* the visible parameters */
+    struct { clap_id id; void *cookie; double v; } pq[CL_PQ];   /* UI -> audio: values to send */
+    atomic_uint pq_head, pq_tail;
 } CL;
+
+static uint32_t cin_size(const clap_input_events_t *l) { return ((const CL *)l->ctx)->nev; }
+static const clap_event_header_t *cin_get(const clap_input_events_t *l, uint32_t i)
+{
+    const CL *c = l->ctx;
+    return i < c->nev ? c->evp[i] : NULL;
+}
 
 static pthread_t g_main_thread;
 static bool      g_main_known;
@@ -217,8 +238,92 @@ static void cl_process(void *h, float **in, float **out, unsigned n)
     p.frames_count = n;
     p.audio_inputs = &bi; p.audio_inputs_count = c->nin ? 1 : 0;
     p.audio_outputs = &bo; p.audio_outputs_count = 1;
-    p.in_events = &g_in_ev; p.out_events = &g_out_ev;
+    /* 1.2: parameter changes from the panel go first (time 0), then the MIDI (already in c->ev, in time order) */
+    uint32_t nm = c->nev, np = 0;
+    if (nm > QMIDI_MAX) nm = QMIDI_MAX;
+    for (unsigned t = atomic_load_explicit(&c->pq_tail, memory_order_relaxed);
+         t != atomic_load_explicit(&c->pq_head, memory_order_acquire) && np < CL_PQ; ++t) {
+        clap_event_param_value_t *e = &c->ev[QMIDI_MAX + np].pv;
+        memset(e, 0, sizeof *e);
+        e->header.size = sizeof *e; e->header.space_id = CLAP_CORE_EVENT_SPACE_ID; e->header.type = CLAP_EVENT_PARAM_VALUE;
+        e->param_id = c->pq[t % CL_PQ].id; e->cookie = c->pq[t % CL_PQ].cookie;
+        e->note_id = -1; e->port_index = -1; e->channel = -1; e->key = -1;
+        e->value = c->pq[t % CL_PQ].v;
+        c->evp[np++] = &e->header;
+        atomic_store_explicit(&c->pq_tail, t + 1, memory_order_release);
+    }
+    for (uint32_t i = 0; i < nm; ++i) {
+        if (c->ev[i].h.time >= n) c->ev[i].h.time = n - 1;
+        c->evp[np + i] = &c->ev[i].h;
+    }
+    c->nev = np + nm;
+    p.in_events = &c->in_ev; p.out_events = &g_out_ev;
     c->pl->process(c->pl, &p);
+    c->nev = 0;
+}
+
+/* 1.2: MIDI from the keyboard (RT thread) */
+static void cl_midi(void *h, const QMidiEv *ev, int n)
+{
+    CL *c = h;
+    for (int i = 0; i < n && c->nev < QMIDI_MAX; ++i) {
+        CEv *e = &c->ev[c->nev];
+        unsigned char st = ev[i].d[0] & 0xF0, ch = ev[i].d[0] & 0x0F;
+        if (c->dialect == 1) {
+            memset(&e->midi, 0, sizeof e->midi);
+            e->midi.header.size = sizeof e->midi; e->midi.header.type = CLAP_EVENT_MIDI;
+            e->midi.port_index = (uint16_t)c->note_port;
+            memcpy(e->midi.data, ev[i].d, 3);
+        } else if (st == 0x90 || st == 0x80) {
+            bool on = st == 0x90 && ev[i].d[2] > 0;
+            memset(&e->note, 0, sizeof e->note);
+            e->note.header.size = sizeof e->note; e->note.header.type = on ? CLAP_EVENT_NOTE_ON : CLAP_EVENT_NOTE_OFF;
+            e->note.note_id = -1; e->note.port_index = c->note_port; e->note.channel = ch; e->note.key = ev[i].d[1];
+            e->note.velocity = ev[i].d[2] / 127.0;
+        } else continue;                                /* CLAP notes only: CC/pitch bend are not sent */
+        e->h.space_id = CLAP_CORE_EVENT_SPACE_ID;
+        e->h.time = ev[i].frame;
+        e->h.flags = 0;
+        c->nev++;
+    }
+}
+
+/* 1.2: parameters (main thread) */
+static int cl_param_count(void *h) { return ((CL *)h)->npar; }
+static bool cl_param_name(void *h, int i, char *name, int nsz)
+{
+    CL *c = h;
+    if (i < 0 || i >= c->npar) return false;
+    snprintf(name, (size_t)nsz, "%s", c->par[i].name);
+    return true;
+}
+static float cl_param_get(void *h, int i)
+{
+    CL *c = h;
+    if (i < 0 || i >= c->npar) return 0.0f;
+    double v = c->par[i].def;
+    c->params->get_value(c->pl, c->par[i].id, &v);
+    double r = c->par[i].max - c->par[i].min;
+    return r > 0.0 ? (float)((v - c->par[i].min) / r) : 0.0f;
+}
+static void cl_param_set(void *h, int i, float x)
+{
+    CL *c = h;
+    if (i < 0 || i >= c->npar) return;
+    double v = c->par[i].min + (double)x * (c->par[i].max - c->par[i].min);
+    if (c->par[i].flags & CLAP_PARAM_IS_STEPPED) v = floor(v + 0.5);
+    unsigned hd = atomic_load(&c->pq_head);
+    if (hd - atomic_load(&c->pq_tail) >= CL_PQ) return;      /* full: the audio thread is behind */
+    c->pq[hd % CL_PQ].id = c->par[i].id; c->pq[hd % CL_PQ].cookie = c->par[i].cookie; c->pq[hd % CL_PQ].v = v;
+    atomic_store_explicit(&c->pq_head, hd + 1, memory_order_release);
+}
+static void cl_param_text(void *h, int i, char *out, int sz)
+{
+    CL *c = h;
+    if (i < 0 || i >= c->npar || !c->params->value_to_text) return;
+    double v = c->par[i].def;
+    c->params->get_value(c->pl, c->par[i].id, &v);
+    if (!c->params->value_to_text(c->pl, c->par[i].id, v, out, (uint32_t)sz)) out[0] = 0;
 }
 
 /* ---- window ---- */
@@ -337,6 +442,7 @@ static void cl_destroy(void *h)
     c->pl->deactivate(c->pl);
     c->pl->destroy(c->pl);
     mod_put(c->lib, c->entry);
+    free(c->par);
     free(c);
 }
 
@@ -376,6 +482,35 @@ int clap_open(const char *id, double rate, int maxb, QInst *out, char *err, int 
     out->has_editor = cl_has_editor; out->ed_open = cl_ed_open; out->ed_close = cl_ed_close;
     out->main_idle = cl_main_idle;
     out->get_state = cl_get_state; out->set_state = cl_set_state;
+    /* 1.2: MIDI - through the first note input port (raw MIDI if it takes it, otherwise CLAP notes) */
+    c->in_ev.ctx = c; c->in_ev.size = cin_size; c->in_ev.get = cin_get;
+    const clap_plugin_note_ports_t *npo = pl->get_extension(pl, CLAP_EXT_NOTE_PORTS);
+    if (npo && npo->count(pl, true) > 0) {
+        clap_note_port_info_t ni;
+        if (npo->get(pl, 0, true, &ni)) {
+            c->note_port = 0;
+            if (ni.supported_dialects & CLAP_NOTE_DIALECT_MIDI) c->dialect = 1;
+            else if (ni.supported_dialects & CLAP_NOTE_DIALECT_CLAP) c->dialect = 2;
+        }
+    }
+    if (c->dialect) out->midi = cl_midi;
+    /* 1.2: parameters (hidden and read-only ones are skipped) */
+    c->params = pl->get_extension(pl, CLAP_EXT_PARAMS);
+    if (c->params) {
+        uint32_t pc = c->params->count(pl);
+        c->par = calloc(pc ? pc : 1, sizeof *c->par);
+        for (uint32_t i = 0; c->par && i < pc; ++i) {
+            clap_param_info_t pi;
+            if (!c->params->get_info(pl, i, &pi)) continue;
+            if (pi.flags & (CLAP_PARAM_IS_HIDDEN | CLAP_PARAM_IS_READONLY)) continue;
+            CParam *q = &c->par[c->npar++];
+            q->id = pi.id; q->cookie = pi.cookie; q->min = pi.min_value; q->max = pi.max_value; q->def = pi.default_value;
+            q->flags = pi.flags;
+            snprintf(q->name, sizeof q->name, "%s", pi.name);
+        }
+        out->param_count = cl_param_count; out->param_name = cl_param_name; out->param_get = cl_param_get;
+        out->param_set = cl_param_set; out->param_text = cl_param_text;
+    }
     return 0;
 }
 

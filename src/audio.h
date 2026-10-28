@@ -39,6 +39,12 @@ int  audio_init(Session *session, const AudioConfig *config);
 // Stops the stream and closes PortAudio.
 void audio_shutdown(void);
 
+// ============ 1.4: input (recording) ============
+int         audio_input_channels(void);      /* 0 = no input (cannot record audio) */
+unsigned    audio_roundtrip_frames(void);    /* the delay out + in (frames): recordings are shifted back by this much */
+const char *audio_input_name(void);
+void        audio_input_want(bool on);       /* PipeWire: the input is opened only while a channel is armed */
+
 // ============ Lost sound card ============
 
 // Called every frame (it rate-limits itself). If the card has disappeared -> audio_is_lost() becomes true.
@@ -83,6 +89,8 @@ int  audio_asio_panel(int global_device_index);
 // Short text about the audio state (for the dialog): with PipeWire - graph rate, buffer, dropouts.
 // Returns false if there is nothing to show.
 bool audio_engine_status_text(char *out, int size);
+/* 1.3.1: the buffer really in use (PipeWire: the graph's quantum) and the output delay in ms; false = unknown */
+bool audio_actual_buffer(int *frames, double *out_ms);
 
 // ============ PipeWire graph (step 28) ============
 

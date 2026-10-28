@@ -10,12 +10,17 @@
 
 - **Clip grid**: up to 50 channels and 250 scenes. You can start one clip or a whole scene, or queue the next clip with a crossfade. Clips can loop, scenes can be renamed and channels can be coloured.
 - **Waveform editor** with start, end and loop markers. Cutting, copying and pasting parts of a clip is non-destructive (the audio file is never changed).
-- **Tempo**: BPM detection, plus time-stretching with **Rubber Band R3**, which changes the tempo without changing the pitch.
+- **Tempo**: BPM detection, plus time-stretching with **Rubber Band R3**, which changes the tempo without changing the pitch. A master BPM, and a **WARP** button per clip that fits the clip to it.
+- **Launch quantization** (like Ableton/Bitwig): clips and scenes start exactly on the next beat or bar (Now, 1 Beat … 4 Bars).
 - **Mixer**:
   - faders, pan, solo and mute;
   - a master channel and level meters;
   - routing of each channel to any output of the sound card (up to 62 outputs).
-- **Effects**: hosts **VST3, VST2, CLAP** and (on Linux) **LV2** plugins, each with its own window. Plugins are scanned in a separate process, so a crashing plugin cannot take Q-LiM down.
+- **Effects and instruments**: hosts **VST3, VST2, CLAP** and (on Linux) **LV2** plugins, each with its own window. Plugins are scanned in a separate process, so a crashing plugin cannot take Q-LiM down.
+- **MIDI clips and a piano-roll editor**; **.mid** files can be dropped onto cells.
+- **Metronome** (the button next to the BPM).
+- **Recording**: arm a channel (●), click an empty cell to record audio from the sound card (or MIDI on an instrument channel); start and stop on the bar, then it loops in time.
+- **Play VST instruments** from a MIDI keyboard or the computer keyboard. Click a channel name and its plugins appear below with knobs for their settings (like Bitwig's device panel).
 - **MIDI learn** for faders, knobs, buttons and clips, using notes or CC messages.
 - **Audio**:
   - **Linux**: ALSA/JACK through PortAudio, or native **PipeWire** output. With PipeWire, every channel can be its own node in the graph, ready for qpwgraph or Patchance.
@@ -102,6 +107,9 @@ cd tests-win && make -f Makefile.win tests   # Windows builds of some of them (r
 - **Load clips** by dragging audio files onto a cell (from the built-in library `L` or from your file manager). Start a clip with its ▶ button, or a whole scene with the scene button.
 - **Show the waveform** of the selected clip with `Ctrl+W`. You can set the start, end and loop markers there and cut, copy and paste parts of the clip.
 - **Add effects**: open the FX strip with the `FX` button, then press `+`. Double-click a plugin to open its window.
+- **MIDI clips**: on an instrument channel, double-click an empty cell; the piano roll opens below (double-click = add / delete a note; drag on the ruler = zoom / move, double-click on the ruler = play from there; Ctrl+drag = copy, Ctrl+C / Ctrl+V notes, Ctrl+U = quantize).
+- **Record**: click ● on a channel header to arm it, then the red circle in an empty cell (right-click ● for the input and monitoring).
+- **Play an instrument**: click a channel name, press `+` in the panel below and pick a plugin marked `INST`. The MIDI keyboard plays the selected instrument channel. No MIDI keyboard? Press `Ctrl+K` and play with `A`…`K` (`Z`/`X` = octave).
 - **Settings**: Edit → Audio… for the sound card and Edit → MIDI… for controllers. Press `Ctrl+M` to start MIDI learn.
 - **Shortcuts**: the Shortcuts menu shows all of them.
 
