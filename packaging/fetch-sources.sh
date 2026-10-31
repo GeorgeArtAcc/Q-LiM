@@ -17,6 +17,10 @@ cl libsndfile/libsndfile 1.2.2 libsndfile
 cl madebr/mpg123 "" mpg123
 cl lameproject/lame "" lame
 cl PortAudio/portaudio v19.7.0 portaudio
+# 1.4.0: the JACK API headers only (no code) - PortAudio's JACK driver is built against them; Q-LiM loads the
+# real libjack at run time, if it is installed (src/jack_shim.c)
+cl jackaudio/headers "" jack-headers
+[ -d jackinc/jack ] || { mkdir -p jackinc/jack && cp jack-headers/*.h jackinc/jack/; }
 cl thestk/rtmidi 6.0.0 rtmidi
 cl alsa-project/alsa-lib v1.2.12 alsa-lib
 cd "$PKGROOT"

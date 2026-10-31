@@ -23,6 +23,7 @@
 #include "undo.h"
 #include "plugins.h"
 #include "fxchain.h"
+#include "perf.h"
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -33,6 +34,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 static bool g_recovered_unsaved = false;      /* the work was recovered from an autosave and has not been saved by the user yet */
 
@@ -370,6 +372,7 @@ static bool take_open_request(char *out, size_t n)
 
 #ifndef _WIN32
 /* On a crash (segfault) shows where it happened - helps to find the bug. */
+static char g_crash_file[1024];       /* 1.3.13: ~/.config/qlim/crash-report.txt (made ready at the start) */
 static void crash_handler(int sig)
 {
 #ifdef QLIM_HAVE_BACKTRACE
@@ -382,6 +385,23 @@ static void crash_handler(int sig)
 #ifdef QLIM_HAVE_BACKTRACE
     backtrace_symbols_fd(bt, n, fd);
 #endif
+    /* 1.3.13: the same into a file, with what the program wrote just before - so it can be sent later */
+    if (g_crash_file[0]) {
+        int cf = open(g_crash_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (cf >= 0) {
+            static const char h[] = "Q-LiM " QLIM_VERSION " crash report\n\n*** Where it happened:\n";
+            if (write(cf, h, sizeof(h) - 1) < 0) {}
+            char sg[48]; int k = snprintf(sg, sizeof sg, "signal %d\n", sig);
+            if (k > 0 && write(cf, sg, (size_t)k) < 0) {}
+#ifdef QLIM_HAVE_BACKTRACE
+            backtrace_symbols_fd(bt, n, cf);
+#endif
+            static const char h2[] = "\n*** The last lines of the log:\n";
+            if (write(cf, h2, sizeof(h2) - 1) < 0) {}
+            applog_dump_fd(cf, 150);
+            close(cf);
+        }
+    }
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -516,6 +536,7 @@ int main(int argc, char **argv)
 #ifdef _WIN32
     qw_install_crash_handler();
 #else
+    qlim_cfg_path(g_crash_file, sizeof g_crash_file, "crash-report.txt");
     signal(SIGSEGV, crash_handler);
     signal(SIGABRT, crash_handler);
     signal(SIGBUS, crash_handler);
@@ -538,6 +559,8 @@ int main(int argc, char **argv)
     printf("%s. License: %s. This program comes with ABSOLUTELY NO WARRANTY.\n", QLIM_COPYRIGHT, QLIM_LICENSE);
     printf("Time-stretch engine: %s\n", stretch_engine_name());
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    perf_load();                                      /* 1.3.7: Edit > Performance (the drawing is chosen at start) */
+    GfxSetRendererPref(perf_settings()->draw);
     InitWindow(1600, 950, "Q-LiM");
     SetExitKey(KEY_NULL);
     SetTargetFPS(60);
@@ -803,6 +826,14 @@ int main(int argc, char **argv)
             if (mod_ctrl && IsKeyPressed(KEY_F) && !mod_shift) {
                 ui_toggle_mixer();
             }
+
+            // 1.3.10: Ctrl+Shift+M = the master column, Ctrl+Shift+U = the level meters,
+            //         Ctrl+= / Ctrl+- / Ctrl+0 = the size of the interface (also Ctrl+wheel over the clips)
+            if (mod_ctrl && mod_shift && IsKeyPressed(KEY_M)) ui_toggle_master();
+            if (mod_ctrl && mod_shift && IsKeyPressed(KEY_U)) ui_toggle_meters();
+            if (mod_ctrl && !mod_shift && IsKeyPressed(KEY_EQUAL)) ui_zoom_step(1);
+            if (mod_ctrl && !mod_shift && IsKeyPressed(KEY_MINUS)) ui_zoom_step(-1);
+            if (mod_ctrl && !mod_shift && IsKeyPressed(KEY_ZERO)) ui_zoom_step(0);
 
             // Ctrl+R
             if (mod_ctrl && IsKeyPressed(KEY_R) && !mod_shift) {
@@ -1228,6 +1259,12 @@ int main(int argc, char **argv)
             undo_poke(GetTime());
         }
 
+        {   /* 1.3.4/1.3.7: the frame rate (Edit > Performance): automatic or fixed, fewer while nothing moves,
+             * fewer for a while after a sound dropout. Moving the mouse or pressing a key = full speed at once. */
+            bool busy = session_any_playing(session) || atomic_load(&session->rec_active) > 0 ||
+                        atomic_load(&session->ql_pending) > 0;
+            perf_frame(busy, qplug_editors_open() > 0);
+        }
         EndDrawing();
     }
 

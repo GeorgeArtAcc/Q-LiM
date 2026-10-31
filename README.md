@@ -4,6 +4,8 @@
 
 ![Q-LiM main window](docs/screenshots/main.png)
 
+*Left: a MIDI clip in the piano roll. Right: an audio clip with its waveform.*
+
 *[Прочети на български](README.bg.md)*
 
 ## Features
@@ -23,7 +25,7 @@
 - **Play VST instruments** from a MIDI keyboard or the computer keyboard. Click a channel name and its plugins appear below with knobs for their settings (like Bitwig's device panel).
 - **MIDI learn** for faders, knobs, buttons and clips, using notes or CC messages.
 - **Audio**:
-  - **Linux**: ALSA/JACK through PortAudio, or native **PipeWire** output. With PipeWire, every channel can be its own node in the graph, ready for qpwgraph or Patchance.
+  - **Linux**: native **PipeWire** output (every channel can be its own node in the graph, ready for qpwgraph or Patchance), or ALSA / **JACK** through PortAudio (JACK is offered when a JACK server is running - jackd or PipeWire's JACK; the packages do not need JACK to be installed).
   - **Windows**: WASAPI, **ASIO**, DirectSound, MME or WDM-KS.
 - **Files**:
   - WAV, AIFF, FLAC, Ogg Vorbis, Opus and MP3 are built in;
@@ -105,15 +107,16 @@ cd tests-win && make -f Makefile.win tests   # Windows builds of some of them (r
 ## Using Q-LiM
 
 - **Load clips** by dragging audio files onto a cell (from the built-in library `L` or from your file manager). Start a clip with its ▶ button, or a whole scene with the scene button.
-- **Show the waveform** of the selected clip with `Ctrl+W`. You can set the start, end and loop markers there and cut, copy and paste parts of the clip.
+- **Show the waveform** of the selected clip with `Ctrl+W`. You can set the start, end and loop markers there and cut, copy and paste parts of the clip. The **Fit** button (next to the pointer and the scissors) shows it from the Start to the End marker again.
 - **Add effects**: open the FX strip with the `FX` button, then press `+`. Double-click a plugin to open its window.
 - **MIDI clips**: on an instrument channel, double-click an empty cell; the piano roll opens below (double-click = add / delete a note; drag on the ruler = zoom / move, double-click on the ruler = play from there; Ctrl+drag = copy, Ctrl+C / Ctrl+V notes, Ctrl+U = quantize).
 - **Record**: click ● on a channel header to arm it, then the red circle in an empty cell (right-click ● for the input and monitoring).
 - **Play an instrument**: click a channel name, press `+` in the panel below and pick a plugin marked `INST`. The MIDI keyboard plays the selected instrument channel. No MIDI keyboard? Press `Ctrl+K` and play with `A`…`K` (`Z`/`X` = octave).
-- **Settings**: Edit → Audio… for the sound card and Edit → MIDI… for controllers. Press `Ctrl+M` to start MIDI learn.
+- **Settings**: Edit → Audio… for the sound card and Edit → MIDI… for controllers; Edit → Performance… for old or slow computers (Eco interface, drawing, frames per second, light waveform, "sound first"); Edit → Appearance… for the theme and the **interface size** (also `Ctrl+wheel`, `Ctrl+=` / `Ctrl+-` / `Ctrl+0`). Press `Ctrl+M` to start MIDI learn.
+- **A smaller window**: `Ctrl+Shift+M` hides the master, `Ctrl+Shift+U` the level meters (only the dB scale stays), `Ctrl+F` the faders.
 - **Shortcuts**: the Shortcuts menu shows all of them.
 
-Settings, the log and autosaves are kept in `~/.config/qlim/` (on Windows: `C:\Users\<name>\.config\qlim\`). If something goes wrong, `qlim.log` there is the most useful thing to attach to an issue.
+Settings, the log and autosaves are kept in `~/.config/qlim/` (on Windows: `C:\Users\<name>\.config\qlim\`). If something goes wrong, `qlim.log` there (on Linux: start `qlim` from a terminal - errors and warnings are marked `[ERROR]` / `[WARN]`) and, after a crash, `crash-report.txt` are the most useful things to attach to an issue.
 
 ## Project layout
 

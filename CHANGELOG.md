@@ -1,5 +1,145 @@
 # Changelog
 
+## 1.4.0 — 2026-10-31
+- **JACK on Linux, when it is there.** The Linux packages now contain PortAudio's JACK driver, without depending on
+  JACK: Q-LiM loads libjack itself when it starts (`src/jack_shim.c`).
+  - JACK server running (jackd, or PipeWire's JACK): **"JACK Audio Connection Kit"** appears in Edit → Audio;
+  - JACK installed but not running, or not installed at all: nothing changes - PipeWire and ALSA as before.
+  - The terminal says which it is (`>>> JACK: libjack found (...)` / `>>> JACK: not installed ...`).
+  - For older systems and for people who prefer JACK. Tested with a JACK2 server (dummy driver): Q-LiM plays
+    through it; and with libjack missing: Q-LiM starts as always.
+- **Behind dialogs** the window is now always darkened (as in Eco), never blurred - in every interface mode. It is
+  also lighter: the window behind is not captured and blurred any more.
+- README: the newer features (Fit, interface size, hiding the master / meters, crash report, `[ERROR]` marks).
+- Together with 1.3.4 – 1.3.16 (see below): much less CPU on old computers (smart redraw, Eco, the light CPU drawing,
+  the cheaper waveform), Edit → Performance, interface size, Fit, the crash report and a clean log.
+
+## 1.3.16 — 2026-10-31
+- **Pan knobs** (channels and master) no longer jump to where you click: they are dragged from where they are, like
+  the faders (up = right, down = left, Shift = fine, a light stop in the centre). Double click = centre, as before.
+
+## 1.3.15 — 2026-10-31
+- **Fit** (a new button next to the pointer and the scissors, above the waveform): shows the waveform exactly from
+  the Start to the End marker (with a little air, so they can be grabbed) and turns SCROLL off - handy after zooming
+  and moving around.
+- **Double click on a pan knob** (channels and master) puts it back in the centre - now also with the system's
+  double-click timing, so a slower double click works too.
+- **The log** (top right) no longer shows errors for harmless messages: PortAudio / JACK looking for sound cards
+  ("Expression ... failed", "Cannot connect to server"), the zenity windows, a missing Music folder, "0 failed",
+  formats read through ffmpeg, X11 notes from plugin windows. A damaged mp3 frame is a warning, not an error.
+- **The terminal** shows the same marks as the log: `[ERROR]` and `[WARN]` in front of those lines, so the
+  terminal output can be copied and sent as it is.
+
+## 1.3.14 — 2026-10-31
+- **The waveform costs much less, and looks the same.** Q-LiM now draws it itself into one picture: a still view
+  costs nothing, and a moving one (SCROLL, follow) computes only the new columns. Before → now, main thread, light
+  CPU drawing, 60 frames per second, a clip playing: waveform 11 % → 7 % (hidden: 7 %), SCROLL 33 % → 20 %.
+- **Edit → Performance → Waveform: Auto / Smooth / Light.** Light: in SCROLL the waveform moves 15 times per second
+  and in whole pixels: SCROLL 20 % → 9 %. Auto = light together with Eco (Eco: SCROLL 16 % → 7 %).
+- **Clip lamps** above the meters light only while the sound is too loud (and a moment after, so a short peak is
+  seen) and then go out by themselves - like on a mixing desk.
+- **The log** no longer counts a line as an error because of a file or song name (e.g. a song called "Lost …" or a
+  folder called "crash"): names in quotes are not looked at.
+
+## 1.3.13 — 2026-10-30
+- **No false errors in the log**: mp3 files with an empty tag field (often files from YouTube: "No comment text /
+  valid description?") are no longer counted as errors - the sound was always fine. "Collect All & Save" no longer
+  shows an error when every file was copied ("copied 9 files, all OK").
+- **Crash report**: if Q-LiM ever crashes, it writes `~/.config/qlim/crash-report.txt` (where it happened and the
+  last 150 lines of the log), so it can be sent later even when Q-LiM was not started from a terminal.
+
+## 1.3.12 — 2026-10-30
+- **Eco**: the outline under the mouse no longer lands on the clips behind an open menu (File / Edit), a context
+  menu, a list or a dialog, and the thin edges that are dragged (the top of the fader panel, the waveform bar, the
+  master edge) always win, with the resize mouse cursor.
+- **Hidden level meters** (Ctrl+Shift+U) now leave only the **dB scale** (0, 6, 12, 24, 48 …) next to the faders
+  and the master - a ruler, no boxes, no clip lamps, nothing that moves.
+- **The top bar** (Launch, BPM, metronome, the logo, the library button, DSP) keeps its normal size when the
+  interface is zoomed - like the menu bar and the dialogs. The DSP window too.
+- **Interface size** moved from Edit → Performance to **Edit → Appearance**.
+
+## 1.3.11 — 2026-10-30
+- **Dialogs keep their normal size** when the interface is zoomed (Ctrl+wheel / Ctrl+= / Ctrl+-): only the main
+  window grows or shrinks.
+- **Eco**: scrolling the clips no longer lights up the clips under the mouse.
+- **Eco**: a very simple highlight instead of none - a thin outline around the thing under the mouse, drawn at most
+  15 times per second. Thin places that can be dragged (the edge of the master, the size bars of the faders and the
+  waveform) also show the resize mouse cursor again.
+  Measured with the mouse moving fast and clips playing: main thread about 6 % (graphics card and CPU drawing).
+
+## 1.3.10 — 2026-10-30
+- **Hide the master**: drag its left edge far to the right, or **Ctrl+Shift+M**. A thin handle stays on the right:
+  click it (or Ctrl+Shift+M again) and the master is back. Remembered.
+- **Hide the level meters**: **Ctrl+Shift+U** or Edit → Performance → "Level meters". The meters of the channels and
+  the master stay empty boxes - nothing moves there, so nothing is drawn again. Remembered.
+- **Interface size**: **Ctrl+wheel** over the clips, **Ctrl+=** / **Ctrl+-**, **Ctrl+0** = 100 %, or the buttons in
+  Edit → Performance (50 % … 250 %). The menu bar and its menus keep their normal size. Remembered.
+  (Over the waveform and the MIDI editor, Ctrl+wheel still zooms those.)
+- Together with Ctrl+W (waveform) and Ctrl+F (faders), the window can be reduced to the clips alone.
+
+## 1.3.9 — 2026-10-30
+- **Redrawing only what changed is now the normal way** (every interface, every computer): Q-LiM records each
+  frame, compares it with the last one in tiles and draws again only the changed tiles. The look stays the same
+  (soft edges, the blurred background behind dialogs - now made once when a dialog opens, from the window as it
+  was). Measured with the mouse moving and clips playing: main thread 40 % → 25 %, at 60 frames per second.
+  `QLIM_SMART=0` turns it off (the old way, for comparison).
+- **Eco** now goes much further, for old computers - everything for the sound:
+  - no highlights under the mouse: a mouse that only moves does not wake the window at all; it counts again as
+    soon as a button, the wheel or a key is used (clicks, drags, menus, scrolling work as before);
+  - at most 30 frames per second, no soft edges, no blur, a smaller text cache (less RAM).
+  - Measured with the mouse moving fast and clips playing: main thread 8 % (graphics card) / 5 % (CPU drawing).
+
+## 1.3.8 — 2026-10-30
+- **Eco interface** (Edit → Performance → Interface: Auto / Normal / Eco). Q-LiM records what it wants to draw,
+  compares it with the last frame in small tiles and draws again **only the tiles that changed** (while clips play:
+  about 1 % of the window); nothing changed = nothing drawn and nothing sent to the screen. Shapes are drawn
+  without soft edges and the window behind dialogs is darkened instead of blurred. Measured (60 frames per
+  second, 3 clips playing, MIDI editor open): light CPU drawing 29 % → 6 % of one core; OpenGL main thread
+  39 % → 10 %. **Auto** = Eco with the light CPU drawing, Normal otherwise.
+- `QLIM_ECO=1` turns Eco on for one run; `QLIM_FPS=1` also shows how much of the window Eco draws per frame.
+
+## 1.3.7 — 2026-10-30
+- **Edit → Performance…** (new): how the window is drawn and how often, so the sound always has room.
+  - **Drawing**: Auto (the graphics card, or the light CPU drawing when there is no acceleration) / Graphics card /
+    Light (CPU). Applies at the next start. The dialog shows how it is drawn right now.
+  - **Frames per second**: Auto, or at most 60 / 30 / 20 / 12. **Auto** measures all the time how much CPU one frame
+    takes and draws as many frames as fit in about 40 % of one CPU core (a fast computer keeps its full rate, an
+    old one gets fewer, but steady frames).
+  - **Fewer frames while nothing moves** (10 per second; on by default).
+  - **Sound first** (on by default): when the sound breaks up - the sound card, reading from the disk, WARP
+    (Rubber Band) or processing over 100 % - Q-LiM draws at most 15 frames per second for 30 seconds and says why
+    in a message. The dialog shows the dropout counts.
+- The background work nobody waits for (the waveform overview, finding the tempo of a file) now runs with a lower
+  priority, so it never takes time from the sound or the picture. On Windows, reading from the disk and WARP get a
+  higher priority.
+
+## 1.3.6 — 2026-10-30
+- Fixes for 1.3.5 on computers without graphics acceleration:
+  - Opening a dialog (Edit → Audio, etc.) crashed Q-LiM: the blurred background read the whole drawing image (as
+    big as the screen) into a buffer the size of the window.
+  - The waveform (and anything else that changes across the whole width) was not sent to the screen: a run of
+    changed parts that reached the right edge of the window was forgotten.
+
+## 1.3.5 — 2026-10-30
+- Computers without graphics acceleration (ThinkPad T60): the sound still crackled while the window was visible
+  and stopped as soon as it was minimized - every frame went whole through the X server. Now the picture is drawn
+  into Q-LiM's own image and only the parts that changed since the last frame are sent to the window (while clips
+  play that is about 1 % of the window instead of all of it). While clips play such a computer redraws 12 times per
+  second (`QLIM_PLAY_FPS=<n>` changes it), at most 25 while you work.
+- `QLIM_FPS=1` also shows how much of the window is sent per frame.
+
+## 1.3.4 — 2026-10-30
+- **Much less CPU, above all on old computers** (found on a ThinkPad T60: 60–70 % CPU with nothing playing, and the
+  sound crackled):
+  - Graphics chips without a working driver (Mesa's "llvmpipe", e.g. the Intel GMA 950) made every frame on ALL the
+    CPU cores and left too little for the sound. Q-LiM now notices it and draws with SDL's light software renderer
+    on one core (shapes as whole-pixel spans, no soft edges), at most 30 frames per second. Measured: playing
+    117 % → 18 %, nothing playing 137 % → 9 %. `QLIM_RENDERER=gpu` keeps OpenGL anyway.
+  - On every computer: while nothing plays and nobody touches anything, the window is redrawn only 10 times per
+    second (it reacts to the mouse and the keys at once, as before). While clips play: full speed with a graphics
+    card, 20 frames per second without one. Plugin windows open = full speed.
+  - `QLIM_FPS=1` writes the frames per second and the work per frame into the log every 5 seconds.
+
 ## 1.3.3 — 2026-10-28
 - Dragging on the ruler of the waveform or of the MIDI editor (or with the middle mouse button) hides the mouse
   cursor and does not stop at the edge of the screen, so one long drag is enough (no need to grab it again). When

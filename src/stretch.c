@@ -1,6 +1,7 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 #define _POSIX_C_SOURCE 200809L
 #include "stretch.h"
+#include "thread_prio.h"
 
 typedef struct Wsola Wsola;
 static void ws_reset(Wsola *st);
@@ -10,6 +11,8 @@ static void ws_reset(Wsola *st);
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
+static atomic_uint g_underruns_total;   /* 1.3.7: see stretch_underruns_total */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -458,6 +461,7 @@ static void rb_fill(Stretch *st)
 static void *rb_thread(void *arg)
 {
     Stretch *st = arg;
+    thread_prio_high();                 /* 1.3.7 (Windows) */
     while (!atomic_load(&st->quit)) {
         atomic_store(&st->busy, true);
         if (!atomic_load(&st->active)) {               /* the clip is not playing with warp -> do not touch the stream */
@@ -612,6 +616,7 @@ long stretch_frames_to_end(const Stretch *st)
     return -1;
 }
 
+unsigned stretch_underruns_total(void) { return atomic_load(&g_underruns_total); }
 unsigned stretch_underruns(const Stretch *st)
 {
 #ifdef HAVE_RUBBERBAND
@@ -653,7 +658,10 @@ size_t stretch_process(Stretch *st, double speed, float *out, size_t n,
             atomic_store(&st->rd, rd + k);
             done = k;
             if (done < n && !atomic_load(&st->eof_done) && atomic_load(&st->primed))
+            {
                 atomic_fetch_add(&st->underruns, 1);      /* a real "could not keep up" (not the very start) */
+                atomic_fetch_add(&g_underruns_total, 1);
+            }
         }
         if (done < n) memset(out + done * 2, 0, (n - done) * 2 * sizeof(float));
         return n;

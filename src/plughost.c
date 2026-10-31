@@ -251,6 +251,15 @@ void qplug_editor_close(QPlug *p)
     p->win = NULL;
 }
 
+int qplug_editors_open(void)
+{
+    int k = 0;
+    pthread_mutex_lock(&g_all_mu);
+    for (int i = 0; i < g_nall; ++i) if (g_all[i] && g_all[i]->win) ++k;
+    pthread_mutex_unlock(&g_all_mu);
+    return k;
+}
+
 void qplug_idle_all(void)
 {
     clap_host_set_main_thread();

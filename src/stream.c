@@ -1,6 +1,7 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 #define _POSIX_C_SOURCE 200809L
 #include "stream.h"
+#include "thread_prio.h"
 #include "diskinfo.h"
 
 #include <pthread.h>
@@ -400,6 +401,7 @@ static size_t fill_of(ClipStream *s)
 static void *disk_main(void *arg)
 {
     (void)arg;
+    thread_prio_high();                 /* 1.3.7 (Windows) */
     ClipStream *act[MAX_SORT];
     size_t      fil[MAX_SORT];
     while (atomic_load(&g_run)) {

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <strings.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -82,7 +83,8 @@ void fb_scan(FileBrowser *fb)
 
     DIR *d = opendir(fb->current_dir);
     if (!d) {
-        fprintf(stderr, "fb_scan: cannot open '%s'\n", fb->current_dir);
+        if (errno == ENOENT) printf("fb_scan: '%s' does not exist (yet)\n", fb->current_dir);   /* e.g. no Music folder: normal */
+        else fprintf(stderr, "fb_scan: cannot open '%s'\n", fb->current_dir);
         return;
     }
 

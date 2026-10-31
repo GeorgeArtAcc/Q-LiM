@@ -555,7 +555,7 @@ static int open_clip_source(Session *s, const char *path, int sr,
 
     if (stream_source_sndfile_native(path, &nat, &fsr) != 0) {
         // libsndfile cannot read it
-        printf("session_set_clip: '%s' is not readable directly, trying ffmpeg\n", path);
+        printf("session_set_clip: '%s' - a format read through ffmpeg, converting\n", path);
         if (wav_convert_with_ffmpeg(path, sr, cache, cache_size) != 0) return 1;
         *open_path = cache;
         return stream_source_open(cache, sr, src, &fsr);
@@ -705,7 +705,8 @@ int session_set_sample_rate(Session *s, int sr)
     }
     for (int i = 0; i < cap; ++i) free(saved[i].edits);
     free(saved);
-    printf("session_set_sample_rate: %d -> %d Hz (%d clips reloaded, %d failed)\n", old_sr, sr, cap - failed, failed);
+    if (failed) printf("session_set_sample_rate: %d -> %d Hz (%d clips reloaded, %d failed)\n", old_sr, sr, cap - failed, failed);
+    else printf("session_set_sample_rate: %d -> %d Hz (%d clips reloaded)\n", old_sr, sr, cap);
     return failed;
 }
 

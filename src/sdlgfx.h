@@ -24,6 +24,7 @@
  */
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stddef.h>
 
 typedef struct { unsigned char r, g, b, a; } Color;
@@ -104,6 +105,12 @@ void BeginScissorMode(int x, int y, int w, int h);
 void EndScissorMode(void);
 
 /* ---- drawing ---- */
+void DrawRectanglesBatch(const Rectangle *r, int n, Color c);
+typedef struct GfxImage GfxImage;    /* 1.3.14: a picture the program draws itself, pixel by pixel (the waveform) */
+GfxImage *GfxImageNew(void);
+void      GfxImageUpload(GfxImage *im, const uint32_t *argb, int w, int h);   /* ARGB, not premultiplied */
+void      GfxImageDraw(GfxImage *im, int px, int py);                         /* in real (physical) pixels */
+float     GfxScaleNow(void);                                                  /* UI unit -> physical pixels */   /* 1.3.14: many rectangles of one colour, one command */
 void DrawRectangle(int x, int y, int w, int h, Color c);
 void DrawRectangleGradientV(float x, float y, float w, float h, Color top, Color bottom);   /* step 36c */
 void DrawRectangleRounded(Rectangle r, float radius, Color c);                 /* step 36f: rounded corners */
@@ -133,8 +140,21 @@ Vector2 GetMouseDelta(void);               /* mouse movement for this frame */
 void    GfxMouseRelative(bool on);         /* "infinite" dragging: hidden cursor, no edge (as in Bitwig) */
 bool    IsMouseButtonPressed(int b);
 bool    IsMouseButtonDown(int b);
+int     GetMouseClicks(int b);        /* 1.3.15: 2 = this press is a double click (the system's timing) */
 /* Call before/after an external window (zenity): releases the mouse and resets "stuck" buttons */
 void   *GfxSdlWindow(void);
+bool    GfxSoftwareRendering(void);   /* 1.3.4: the CPU draws the picture (no graphics acceleration) */
+void    GfxSetBusyFps(int fps);       /* 1.3.4: frames per second needed while nothing is touched (0 = full) */
+void    GfxSetMaxFps(int fps);        /* 1.3.7: the cap at all times (0 = none) */
+void    GfxSetRendererPref(int pref); /* 1.3.7: before InitWindow: 0 auto, 1 graphics card, 2 light (QLIM_RENDERER wins) */
+const char *GfxRendererDesc(void);    /* 1.3.7: how the window is drawn, in words */
+void    GfxSetEco(bool on);           /* 1.3.8: Eco interface - redraw only what changed, simple shapes, no blur */
+bool    GfxEco(void);
+void    GfxSetSmart(bool on);
+void    GfxSetZoom(float z);          /* 1.3.10: the size of the whole interface (0.5 .. 2.5), the menu bar excluded */
+float   GfxGetZoom(void);
+void    GfxUnzoomBegin(void);         /* 1.3.10: draw at the normal size (the menu bar and its menus) ... */
+void    GfxUnzoomEnd(void);           /* ... and back */         /* 1.3.9: redraw only what changed (on by default; QLIM_SMART=0 turns it off) */
 void    GfxGLRelease(void);     /* before calling a plugin on the main thread */
 void    GfxGLRestore(void);     /* after it */
 void    GfxExternalDialogBegin(void);
@@ -156,8 +176,17 @@ void         UnloadDroppedFiles(FilePathList files);
 Vector2      GetDropPosition(void);   /* where the cursor was at the drop (UI coordinates) */
 
 /* ---- helpers ---- */
+extern bool g_gfx_hover_filter;       /* 1.3.11: Eco - the hover checks go through GfxHoverCheck */
+bool GfxHoverCheck(Vector2 p, Rectangle r);
+void GfxHoverLayer(Rectangle r);     /* 1.3.12: Eco - something is drawn on top here: what was under the mouse below it does not count */
+Vector2 GfxMouseTrue(void);           /* 1.3.12: the real mouse even in Eco (for "is the mouse over a popup" checks) */
+static inline bool GfxPointIn(Vector2 p, Rectangle r)   /* a plain test (never a hover in Eco) */
+{
+    return p.x >= r.x && p.x < r.x + r.width && p.y >= r.y && p.y < r.y + r.height;
+}
 static inline bool CheckCollisionPointRec(Vector2 p, Rectangle r)
 {
+    if (g_gfx_hover_filter) return GfxHoverCheck(p, r);
     return p.x >= r.x && p.x < r.x + r.width && p.y >= r.y && p.y < r.y + r.height;
 }
 

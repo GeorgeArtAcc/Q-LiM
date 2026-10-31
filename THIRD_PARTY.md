@@ -11,7 +11,8 @@ CLAP headers (MIT), VST 3 pluginterfaces (MIT), LV2 and lilv headers (ISC).
 |---|---|---|---|
 | [SDL2](https://www.libsdl.org/), [SDL2_ttf](https://github.com/libsdl-org/SDL_ttf) (with FreeType, HarfBuzz) | zlib (FreeType: FTL, HarfBuzz: MIT) | built in | DLL |
 | [libsndfile](https://libsndfile.github.io/libsndfile/) with libogg, libvorbis, FLAC, Opus, mpg123, LAME | LGPL-2.1+ (codecs: BSD / LGPL) | built in | DLL |
-| [PortAudio](https://www.portaudio.com/) | MIT | built in | built in |
+| [PortAudio](https://www.portaudio.com/) | MIT | built in (with its JACK driver) | built in |
+| [JACK](https://jackaudio.org/) API headers ([jackaudio/headers](https://github.com/jackaudio/headers)) | LGPL-2.1+ | headers only, at build time; libjack is loaded at run time if installed (`src/jack_shim.c`) | — |
 | [RtMidi](https://github.com/thestk/rtmidi) | MIT-style | built in | built in |
 | [Steinberg ASIO SDK](https://www.steinberg.net/developers/asiosdk-open/) 2.3.4 | GPL-3.0 option | — | built in |
 | ALSA (libasound), X11 (libX11) | LGPL-2.1+ / MIT | from the system | — |

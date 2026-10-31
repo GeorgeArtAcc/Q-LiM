@@ -74,7 +74,9 @@ fi
 cmk sndfile "$SRC/libsndfile" -DBUILD_PROGRAMS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF -DENABLE_CPACK=OFF \
     -DENABLE_EXTERNAL_LIBS=ON -DENABLE_MPEG=ON -DINSTALL_MANPAGES=OFF -DBUILD_REGTEST=OFF
 
-cmk portaudio "$SRC/portaudio" -DPA_BUILD_SHARED_LIBS=OFF -DPA_USE_ALSA=ON -DPA_USE_JACK=OFF \
+# 1.4.0: with the JACK driver; libjack is NOT linked - Q-LiM loads it at run time if it is there (src/jack_shim.c)
+cmk portaudio "$SRC/portaudio" -DPA_BUILD_SHARED_LIBS=OFF -DPA_USE_ALSA=ON -DPA_USE_JACK=ON \
+    -DJACK_INCLUDE_DIRS="$SRC/jackinc" -DJACK_LIBRARIES=dl \
     -DALSA_INCLUDE_DIR="$P/include" -DALSA_LIBRARY="$P/lib/libasound.so"
 
 # SDL2: X11 (loaded at run time), OpenGL/GLES renderers; no SDL audio (Q-LiM has its own), no Wayland/KMS

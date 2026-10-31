@@ -44,7 +44,7 @@ static int x_error(Display *d, XErrorEvent *e)
 {
     char msg[160];
     XGetErrorText(d, e->error_code, msg, sizeof msg);
-    fprintf(stderr, ">>> X11 error (ignored): %s (request %d.%d)\n", msg, e->request_code, e->minor_code);
+    fprintf(stderr, ">>> X11 note from a plugin window (ignored, harmless): %s (request %d.%d)\n", msg, e->request_code, e->minor_code);
     return 0;
 }
 

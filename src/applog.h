@@ -33,5 +33,6 @@ void     applog_mark_seen(void);
 void     applog_clear(void);             /* clears the lines in memory and the counters */
 
 int      applog_classify(const char *line);   /* for tests */
+void     applog_dump_fd(int fd, int last);    /* 1.3.13: the last lines into a file (crash report; no locks) */
 
 #endif

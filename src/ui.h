@@ -28,6 +28,9 @@ void ui_get_selection(int *ch, int *scene);
 void ui_get_hovered_cell(int *ch, int *scene);
 void ui_toggle_library(void);
 void ui_toggle_waveform(void);
+void ui_toggle_master(void);      /* 1.3.10: Ctrl+Shift+M */
+void ui_toggle_meters(void);      /* 1.3.10: Ctrl+Shift+U */
+void ui_zoom_step(int dir);       /* 1.3.10: +1 bigger, -1 smaller, 0 = 100 % */
 void ui_toggle_mixer(void);        /* Ctrl+F: shows/hides the fader panel */
 void ui_flash_message(const char *msg);
 

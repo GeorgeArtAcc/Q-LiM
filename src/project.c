@@ -1192,7 +1192,8 @@ int project_collect_and_save(Session *s, const char *project_dir,
         }
     }
 
-    printf("collect: copied %d files, failed %d\n", copied, failed);
+    if (failed == 0) printf("collect: copied %d files, all OK\n", copied);      /* (1.3.13: "failed 0" was shown as an error) */
+    else printf("collect: copied %d files, %d failed to copy\n", copied, failed);
 
     char proj_file[1024];
     snprintf(proj_file, sizeof(proj_file), "%s/%s.limproject",

@@ -51,6 +51,7 @@ void     stretch_prepare(Stretch *st, double speed, StretchPull pull, void *ud);
 bool     stretch_finished(const Stretch *st);
 bool     stretch_threaded(const Stretch *st);
 unsigned stretch_underruns(const Stretch *st);
+unsigned stretch_underruns_total(void);   /* 1.3.7: all the "could not keep up" of all clips since the start */
 /* Background thread only: after how many output frames the music ends (-1 = not known yet). For the queue. */
 long     stretch_frames_to_end(const Stretch *st);
 

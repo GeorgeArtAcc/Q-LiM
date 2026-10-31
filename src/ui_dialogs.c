@@ -380,6 +380,9 @@ static const Sc SC_MIDI[] = {
     { "MIDI editor: Ctrl + drag a note", "Copy it (the original stays)" },
     { "MIDI editor: Ctrl+C / Ctrl+X, Ctrl+V", "Copy / cut notes, paste at the last click" },
     { "MIDI editor: Ctrl+U", "Quantize (the selected notes, or all)" },
+    { "Ctrl+Shift+M", "Hide / show the master (or drag its edge right)" },
+    { "Ctrl+Shift+U", "Hide / show the level meters" },
+    { "Ctrl+wheel, Ctrl+= / Ctrl+-", "Bigger / smaller interface (Ctrl+0 = 100 %)" },
     { "● on a channel header", "Arm for recording (right click: input, monitoring)" },
     { "Armed channel: red circle in a cell", "Record; click the cell again to stop (on the bar)" },
 };

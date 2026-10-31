@@ -1,5 +1,6 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 #include "ui.h"
+#include "perf.h"
 #include "version.h"
 #include "plugins.h"
 #include "fxchain.h"
@@ -35,8 +36,10 @@ static void ui_text_input_draw(int screen_w, int screen_h);
 static void draw_audio_settings_dialog(int screen_w, int screen_h);
 static void draw_appearance_dialog(int screen_w, int screen_h);
 
-#define MENU_BAR_H       28
-#define TOP_BAR_H        44
+#define MENU_BAR_H_BASE  28          /* the menu bar is never zoomed (1.3.10) ... */
+#define MENU_BAR_H       (MENU_BAR_H_BASE / GfxGetZoom())   /* ... so the rest of the window starts here */
+#define TOP_BAR_H_BASE   44          /* 1.3.12: the top bar (DSP, logo, BPM) is never zoomed either ... */
+#define TOP_BAR_H        (TOP_BAR_H_BASE / GfxGetZoom())     /* ... so the zoomed rest makes room for it with this */
 #define BOTTOM_BAR_H     28
 #define SCENE_COL_W      56
 #define MASTER_W         170
@@ -315,6 +318,7 @@ static bool  g_footer_drag = false;
 #define MASTER_W_WIDE  250        /* from this width up: the extra column */
 static float g_master_w = MASTER_W;
 static bool  g_mw_drag = false;
+static bool  g_master_hidden = false;          /* 1.3.10: the master column is hidden (drag right / Ctrl+Shift+M) */
 static float g_mw_x0 = 0, g_mw_w0 = 0;
 static double g_mw_last_t = 0;
 static float g_fd_y0 = 0, g_fd_h0 = 0;
@@ -334,8 +338,9 @@ static void layout_save(void)
     layout_path(p, sizeof p);
     FILE *f = fopen(p, "w");
     if (!f) return;
-    fprintf(f, "footer_h=%d\nfooter_hidden=%d\nxfade_on=%d\nxfade_sec=%.2f\nmaster_w=%d\nfx_open=%d\n",
-            (int)g_footer_h, g_footer_hidden ? 1 : 0, g_xf_on ? 1 : 0, g_xf_sec, (int)g_master_w, g_fx_open ? 1 : 0);
+    fprintf(f, "footer_h=%d\nfooter_hidden=%d\nxfade_on=%d\nxfade_sec=%.2f\nmaster_w=%d\nfx_open=%d\nmaster_hidden=%d\n",
+            (int)g_footer_h, g_footer_hidden ? 1 : 0, g_xf_on ? 1 : 0, g_xf_sec, (int)g_master_w, g_fx_open ? 1 : 0,
+            g_master_hidden ? 1 : 0);
     fclose(f);
 }
 static void layout_load(void)
@@ -350,6 +355,7 @@ static void layout_load(void)
         if (sscanf(line, "footer_h=%d", &v) == 1 && v >= FOOTER_MIN && v <= 2000) g_footer_h = (float)v;
         else if (sscanf(line, "footer_hidden=%d", &v) == 1) g_footer_hidden = v != 0;
         else if (sscanf(line, "fx_open=%d", &v) == 1) g_fx_open = v != 0;
+        else if (sscanf(line, "master_hidden=%d", &v) == 1) g_master_hidden = v != 0;
         else if (sscanf(line, "xfade_on=%d", &v) == 1) g_xf_on = v != 0;
         else if (sscanf(line, "master_w=%d", &v) == 1 && v >= MASTER_W && v <= MASTER_W_MAX) g_master_w = (float)v;
         else if (sscanf(line, "xfade_sec=%f", &fv) == 1 && fv >= XF_SEC_MIN && fv <= XFADE_MAX_SEC) g_xf_sec = fv;
@@ -493,6 +499,7 @@ static bool g_midi_learn_mode = false;
 
 // Appearance dialog state
 static bool   g_about_open = false;
+static bool   g_perf_open = false;            /* 1.3.7: Edit > Performance... */
 static bool   g_plugins_open = false;
 static bool   g_appearance_open = false;
 static double g_appearance_open_time = 0.0;
@@ -781,6 +788,34 @@ void ui_toggle_library(void)
     if (g_fb) fb_toggle(g_fb);
 }
 
+/* 1.3.10 */
+void ui_toggle_master(void)
+{
+    g_master_hidden = !g_master_hidden;
+    layout_save();
+    ui_flash_message(g_master_hidden ? "Master hidden (Ctrl+Shift+M shows it)" : "Master shown");
+}
+void ui_toggle_meters(void)
+{
+    PerfSettings *ps = perf_settings();
+    ps->meters = !ps->meters;
+    perf_save();
+    ui_flash_message(ps->meters ? "Level meters shown" : "Level meters hidden (Ctrl+Shift+U shows them)");
+}
+void ui_zoom_step(int dir)
+{
+    PerfSettings *ps = perf_settings();
+    float z = dir == 0 ? 1.0f : ps->zoom * (dir > 0 ? 1.1f : 1.0f / 1.1f);
+    if (fabsf(z - 1.0f) < 0.04f) z = 1.0f;
+    if (z < 0.5f) z = 0.5f;
+    if (z > 2.5f) z = 2.5f;
+    ps->zoom = z;
+    perf_save();
+    char m[64];
+    snprintf(m, sizeof m, "Interface size %.0f %%  (Ctrl+0 = 100 %%)", z * 100.0f);
+    ui_flash_message(m);
+}
+
 void ui_toggle_waveform(void)
 {
     static float prev = WAVEFORM_DEF_H;               /* comes back at the same height */
@@ -852,11 +887,11 @@ void ui_select_scene_row(int sc) { g_selected_ch = -1; g_selected_scene = sc; g_
 
 static void draw_menu_bar(Session *s, int screen_w)
 {
-    DrawRectangle(0, 0, screen_w, MENU_BAR_H, g_theme.panel_bg);
+    DrawRectangle(0, 0, screen_w, MENU_BAR_H_BASE, g_theme.panel_bg);
 
     float file_x = 8;
     float file_w = 60;
-    float file_h = MENU_BAR_H;
+    float file_h = MENU_BAR_H_BASE;
 
     Vector2 mouse = GetMousePosition();
     Rectangle file_r = { file_x, 0, file_w, file_h };
@@ -870,7 +905,7 @@ static void draw_menu_bar(Session *s, int screen_w)
         DrawRectangle((int)file_x, 0, (int)file_w, (int)file_h, hc);
     }
 
-    ui_text("File", (int)(file_x + 8), (int)(MENU_BAR_H / 2 - 8),
+    ui_text("File", (int)(file_x + 8), (int)(MENU_BAR_H_BASE / 2 - 8),
             15, g_file_menu_open ? g_theme.selection : g_theme.text);
 
     if (file_hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -895,7 +930,7 @@ static void draw_menu_bar(Session *s, int screen_w)
         DrawRectangle((int)edit_x, 0, (int)edit_w, (int)file_h, hc);
     }
 
-    ui_text("Edit", (int)(edit_x + 8), (int)(MENU_BAR_H / 2 - 8),
+    ui_text("Edit", (int)(edit_x + 8), (int)(MENU_BAR_H_BASE / 2 - 8),
             15, g_edit_menu_open ? g_theme.selection : g_theme.text);
 
     if (edit_hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
@@ -917,7 +952,7 @@ static void draw_menu_bar(Session *s, int screen_w)
         hc.r = (unsigned char)(hc.r + 30); hc.g = (unsigned char)(hc.g + 30); hc.b = (unsigned char)(hc.b + 30);
         DrawRectangle((int)rt_x, 0, (int)rt_w, (int)file_h, hc);
     }
-    ui_text("Routing", (int)(rt_x + 8), (int)(MENU_BAR_H / 2 - 8), 15, g_theme.text);
+    ui_text("Routing", (int)(rt_x + 8), (int)(MENU_BAR_H_BASE / 2 - 8), 15, g_theme.text);
     if (rt_hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         file_menu_close();
         edit_menu_close();
@@ -933,7 +968,7 @@ static void draw_menu_bar(Session *s, int screen_w)
         hc.r = (unsigned char)(hc.r + 30); hc.g = (unsigned char)(hc.g + 30); hc.b = (unsigned char)(hc.b + 30);
         DrawRectangle((int)sc_x, 0, (int)sc_w, (int)file_h, hc);
     }
-    ui_text("Shortcuts", (int)(sc_x + 8), (int)(MENU_BAR_H / 2 - 8), 15, g_theme.text);
+    ui_text("Shortcuts", (int)(sc_x + 8), (int)(MENU_BAR_H_BASE / 2 - 8), 15, g_theme.text);
     if (sc_hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
         file_menu_close();
         edit_menu_close();
@@ -954,7 +989,7 @@ static void draw_menu_bar(Session *s, int screen_w)
         else               { snprintf(lbl, sizeof lbl, "Log"); dot = g_theme.vu_green; }
         int lw = ui_text_w(lbl, 13);
         float bw = (float)lw + 30.0f;
-        Rectangle r = { (float)screen_w - bw - 8.0f, 4.0f, bw, (float)(MENU_BAR_H - 8) };
+        Rectangle r = { (float)screen_w - bw - 8.0f, 4.0f, bw, (float)(MENU_BAR_H_BASE - 8) };
         g_log_btn = r;
         bool hov = CheckCollisionPointRec(mouse, r);
         bool alarm = lost || ne > 0;
@@ -988,18 +1023,18 @@ static void draw_edit_dropdown(int screen_w, int screen_h)
     const int menu_w = 220;
     const int pad = 4;
 
-    const char *items[] = { "Undo", "Redo", NULL, "Audio...", "MIDI...", "Plugins...", "Appearance...", NULL, "About Q-LiM..." };
-    const char *shortcuts[] = { "Ctrl+Z", "Ctrl+Shift+Z", NULL, "Ctrl+,", "Ctrl+M", NULL, NULL, NULL, NULL };
+    const char *items[] = { "Undo", "Redo", NULL, "Audio...", "MIDI...", "Plugins...", "Appearance...", "Performance...", NULL, "About Q-LiM..." };
+    const char *shortcuts[] = { "Ctrl+Z", "Ctrl+Shift+Z", NULL, "Ctrl+,", "Ctrl+M", NULL, NULL, NULL, NULL, NULL };
     EditMenuAction actions[] = { EDIT_MENU_UNDO, EDIT_MENU_REDO, EDIT_MENU_NONE,
-                                 EDIT_MENU_AUDIO, EDIT_MENU_MIDI, EDIT_MENU_NONE, EDIT_MENU_APPEARANCE, EDIT_MENU_NONE, EDIT_MENU_NONE };
-    bool enabled[] = { g_can_undo, g_can_redo, true, true, true, true, true, true, true };
-    int n_items = 9;
+                                 EDIT_MENU_AUDIO, EDIT_MENU_MIDI, EDIT_MENU_NONE, EDIT_MENU_APPEARANCE, EDIT_MENU_NONE, EDIT_MENU_NONE, EDIT_MENU_NONE };
+    bool enabled[] = { g_can_undo, g_can_redo, true, true, true, true, true, true, true, true };
+    int n_items = 10;
 
     int menu_h = pad * 2;
     for (int i = 0; i < n_items; ++i) menu_h += items[i] ? item_h : 6;
 
     int mx = 8 + 60 + 8;
-    int my = MENU_BAR_H;
+    int my = MENU_BAR_H_BASE;
 
     double t = GetTime() - g_edit_menu_open_time;
     float alpha = 1.0f;
@@ -1014,6 +1049,7 @@ static void draw_edit_dropdown(int screen_w, int screen_h)
     bg.a = (unsigned char)(bg.a * alpha);
     DrawRectangle(mx, my, menu_w, menu_h, bg);
     g_menu_dd_rect = (Rectangle){ (float)mx, (float)my, (float)menu_w, (float)menu_h };   /* for the mouse shield */
+    GfxHoverLayer(g_menu_dd_rect);                                                         /* 1.3.12 */
 
     Color border = g_theme.text_dim;
     border.a = (unsigned char)(border.a * alpha);
@@ -1061,7 +1097,7 @@ static void draw_edit_dropdown(int screen_w, int screen_h)
     }
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !inside) {
-        Rectangle edit_r = { 8 + 60 + 8, 0, 60, MENU_BAR_H };
+        Rectangle edit_r = { 8 + 60 + 8, 0, 60, MENU_BAR_H_BASE };
         if (!CheckCollisionPointRec(mouse, edit_r)) {
             edit_menu_close();
         }
@@ -1073,8 +1109,11 @@ static void draw_edit_dropdown(int screen_w, int screen_h)
         return;
     }
 
-    if (clicked == 8) {                      /* About - opens here, without main.c */
+    if (clicked == 9) {                      /* About - opens here, without main.c */
         g_about_open = true;
+        edit_menu_close();
+    } else if (clicked == 7) {               /* 1.3.7: Performance... */
+        g_perf_open = true;
         edit_menu_close();
     } else if (clicked == 5) {               /* Plugins... */
         g_plugins_open = true;
@@ -1129,7 +1168,7 @@ static void draw_file_dropdown(int screen_w, int screen_h)
     }
 
     int mx = 8;
-    int my = MENU_BAR_H;
+    int my = MENU_BAR_H_BASE;
 
     double t = GetTime() - g_file_menu_open_time;
     float alpha = 1.0f;
@@ -1144,6 +1183,7 @@ static void draw_file_dropdown(int screen_w, int screen_h)
     bg.a = (unsigned char)(bg.a * alpha);
     DrawRectangle(mx, my, menu_w, menu_h, bg);
     g_menu_dd_rect = (Rectangle){ (float)mx, (float)my, (float)menu_w, (float)menu_h };   /* for the mouse shield */
+    GfxHoverLayer(g_menu_dd_rect);                                                         /* 1.3.12 */
 
     Color border = g_theme.text_dim;
     border.a = (unsigned char)(border.a * alpha);
@@ -1198,7 +1238,7 @@ static void draw_file_dropdown(int screen_w, int screen_h)
     }
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !inside) {
-        Rectangle file_r = { 8, 0, 60, MENU_BAR_H };
+        Rectangle file_r = { 8, 0, 60, MENU_BAR_H_BASE };
         if (!CheckCollisionPointRec(mouse, file_r)) {
             file_menu_close();
         }
@@ -1278,8 +1318,8 @@ static void dsp_pct_text(char *out, size_t n, float v)
 
 static Rectangle dsp_widget_rect(int screen_w)
 {
-    return (Rectangle){ (float)(screen_w - MASTER_W - GAP), (float)(MENU_BAR_H + 7),
-                        (float)MASTER_W, (float)(TOP_BAR_H - 14) };
+    return (Rectangle){ (float)(screen_w - MASTER_W - GAP), (float)(MENU_BAR_H_BASE + 7),
+                        (float)MASTER_W, (float)(TOP_BAR_H_BASE - 14) };
 }
 
 static Rectangle dsp_popup_rect(int screen_w)
@@ -1520,7 +1560,7 @@ static float draw_transport_group(float x, float y0)
     if (!s) return x;
     Vector2 m = GetMousePosition();
     bool free_ui = !g_ti_active && !g_ctx_open && !g_file_menu_open && !g_edit_menu_open && !g_audio_dlg_open;
-    float h = 28.0f, y = y0 + (TOP_BAR_H - h) * 0.5f;
+    float h = 28.0f, y = y0 + (TOP_BAR_H_BASE - h) * 0.5f;
 
     /* launch quantization */
     float q = session_get_quantize(s);
@@ -1559,7 +1599,10 @@ static float draw_transport_group(float x, float y0)
     float v = tempo;
     int res = value_field_input(4, br, &v, free_ui || g_vf_id == 4);
     if (res == 1) session_set_tempo(s, v);
-    else if (res == 2) num_edit_begin(1, -1, -1, tempo, (Rectangle){ x, y - 1, bw > 100 ? bw : 100, h + 2 });
+    else if (res == 2) {           /* (the top bar is not zoomed; the text box is drawn with the zoomed rest) */
+        float z = GfxGetZoom();
+        num_edit_begin(1, -1, -1, tempo, (Rectangle){ x / z, (y - 1) / z, (bw > 100 ? bw : 100) / z, (h + 2) / z });
+    }
     x += bw + 8.0f;
 
     {   /* 1.3.1: the metronome (on/off) - ticks on every beat while clips play */
@@ -1605,19 +1648,19 @@ static float draw_transport_group(float x, float y0)
 
 static void draw_top_bar(int screen_w)
 {
-    int y0 = MENU_BAR_H;
+    int y0 = MENU_BAR_H_BASE;   /* 1.3.12: drawn at the normal size */
 
-    DrawRectangle(0, y0, screen_w, TOP_BAR_H, g_theme.panel_bg);
+    DrawRectangle(0, y0, screen_w, TOP_BAR_H_BASE, g_theme.panel_bg);
     float group_r = draw_transport_group(12.0f, (float)y0);
     {   /* 1.2.1: the wordmark in the middle of the WINDOW (where the eye looks for the centre), never over the buttons */
         float r = (float)(screen_w - MASTER_W - GAP - 36 - 12) - 16.0f;
-        draw_wordmark(screen_w * 0.5f, y0 + TOP_BAR_H * 0.5f, group_r + 16.0f, r);
+        draw_wordmark(screen_w * 0.5f, y0 + TOP_BAR_H_BASE * 0.5f, group_r + 16.0f, r);
     }
 
     float icon_w = 36;
     float icon_h = 28;
     float icon_x = screen_w - MASTER_W - GAP - icon_w - 12;   /* to the left of the DSP indicator */
-    float icon_y = y0 + (TOP_BAR_H - icon_h) / 2;
+    float icon_y = y0 + (TOP_BAR_H_BASE - icon_h) / 2;
 
     bool lib_open = (g_fb && g_fb->visible);
     Color icon_bg;
@@ -1696,11 +1739,36 @@ static Color mix_col(Color a, Color b, float t)
 
 /* step 36c: a "CLIP" lamp for every meter (channel 0..MAX_CHANNELS-1, master = MAX_CHANNELS).
  * Lights up as soon as the signal goes over 0 dBFS, and stays on until clicked (the lamp or the meter). */
-static bool g_clip_led[MAX_CHANNELS + 1];
+static double g_clip_led[MAX_CHANNELS + 1];   /* 1.3.14: lit until this time (like a mixing desk: only while clipping) */
+#define CLIP_LED_HOLD 0.35                       /* seconds - so that even one short peak is seen */
 
 /* id: a channel or MAX_CHANNELS = master; clipped = the audio thread has seen > 0 dBFS (since the last frame) */
+/* 1.3.16: a pan knob is dragged from where it is (like the faders): up = right, down = left,
+ * the whole range over 4 knob heights; Shift = fine; it stops lightly in the centre */
+static float g_pan_y0, g_pan_v0, g_pan_last;
+static bool  g_pan_sh;
+static float pan_drag_value(float mouse_y, float knob_d)
+{
+    bool sh = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    if (sh != g_pan_sh) { g_pan_sh = sh; g_pan_v0 = g_pan_last; g_pan_y0 = mouse_y; }   /* Shift pressed/released: no jump */
+    float p = g_pan_v0 + (g_pan_y0 - mouse_y) / (knob_d * 2.0f) * (sh ? 0.2f : 1.0f);
+    if (p < -1.0f) p = -1.0f;
+    if (p >  1.0f) p =  1.0f;
+    if (fabsf(p) < 0.03f && fabsf(g_pan_v0) >= 0.03f) p = 0.0f;   /* passing the centre: it stops there lightly */
+    g_pan_last = p;
+    return p;
+}
+
 static void draw_vu_meter(float x, float y, float w, float h, float lvl_l, float lvl_r, int id, bool clipped)
 {
+    /* 1.3.12: meters hidden (Ctrl+Shift+U) = only the dB scale, as a ruler: no box, no bars, no clip lamp -
+     * nothing that moves, so nothing is drawn again */
+    bool meters = perf_settings()->meters;
+    if (!meters) {
+        Color rl = mix_col(g_theme.panel_bg, g_theme.text_dim, 0.6f);
+        DrawLine((int)(x + w), (int)y, (int)(x + w), (int)(y + h), rl);
+        goto scale;
+    }
     Color vu_bg = g_theme.bg;
     DrawRectangleRounded((Rectangle){ x, y, w, h }, 2, vu_bg);
 
@@ -1739,16 +1807,14 @@ static void draw_vu_meter(float x, float y, float w, float h, float lvl_l, float
 
     /* the CLIP lamp above the meter */
     if (id >= 0 && id <= MAX_CHANNELS) {
-        if (clipped) g_clip_led[id] = true;
+        double now = GetTime();
+        if (clipped) g_clip_led[id] = now + CLIP_LED_HOLD;
         Rectangle led = { x, y - 7, w, 5 };
-        Rectangle hit = { x - 2, y - 10, w + 4, h + 12 };
-        DrawRectangleRounded(led, 2, g_clip_led[id] ? g_theme.vu_red : mix_col(g_theme.bg, g_theme.text_dim, 0.35f));
-        if (g_clip_led[id] && CheckCollisionPointRec(GetMousePosition(), hit) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
-            !g_ctx_open && !g_ti_active)
-            g_clip_led[id] = false;                     /* click on the meter/lamp = reset */
+        DrawRectangleRounded(led, 2, now < g_clip_led[id] ? g_theme.vu_red : mix_col(g_theme.bg, g_theme.text_dim, 0.35f));
     }
     DrawLine((int)(x + 1 + bw + 0.5f), (int)y, (int)(x + 1 + bw + 0.5f), (int)(y + h), g_theme.panel_bg);
 
+scale:;
     /* step 36b: the scale lines - ABOVE the bars, clearer. The main ones (with a label) - across the whole meter,
      * 0 dB - the clearest; the intermediate ones - a short tick on the right. */
     /* step 36d: the scale as in Bitwig - the numbers are "how many dB below 0" (0, 6, 12, 18, 24, 36, 48, ∞), without a "minus".
@@ -1766,7 +1832,7 @@ static void draw_vu_meter(float x, float y, float w, float h, float lvl_l, float
         DrawLine((int)(x + w - (zero ? 11 : 8)), (int)my, (int)(x + w), (int)my, zero ? g_theme.text : c_tick);
     }
 
-    DrawRectangleRoundedLines((Rectangle){ x, y, w, h }, 2, 1, g_theme.text_dim);
+    if (meters) DrawRectangleRoundedLines((Rectangle){ x, y, w, h }, 2, 1, g_theme.text_dim);
 
     /* the labels - exactly opposite their tick, right-aligned. On a short meter first 0/12/24/48 and ∞,
      * then 6/18/36 if there is room (they do not overlap). */
@@ -3085,23 +3151,19 @@ static void draw_channel_footer(Session *s, int ch,
         static int    pan_click_ch = -1;
         if (knob_hover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             double now = GetTime();
-            if (pan_click_ch == ch && now - pan_click_t < DOUBLE_CLICK_TIME) {   /* step 36: double click = centre */
+            if ((pan_click_ch == ch && now - pan_click_t < DOUBLE_CLICK_TIME) || GetMouseClicks(MOUSE_BUTTON_LEFT) >= 2) {   /* double click = centre */
                 session_set_channel_pan(s, ch, 0.0f);
                 pan_click_ch = -1;
             } else {
                 g_dragging_slider = 2000 + ch;
                 pan_click_ch = ch;
                 pan_click_t = now;
+                g_pan_y0 = mouse.y; g_pan_v0 = g_pan_last = pan; g_pan_sh = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);   /* 1.3.16: grabbed where it is - no jump */
             }
         }
         if (g_dragging_slider == 2000 + ch &&
             IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            float rel = (knob_y + knob_d/2) - mouse.y;
-            float p = rel / (knob_d * 2.0f);
-            if (p < -1.0f) p = -1.0f;
-            if (p >  1.0f) p =  1.0f;
-            if (fabsf(p) < 0.03f) p = 0.0f;                  /* the centre is easy to hit (it is exactly 0 dB there) */
-            session_set_channel_pan(s, ch, p);
+            session_set_channel_pan(s, ch, pan_drag_value(mouse.y, knob_d));
         }
     }
 
@@ -3322,15 +3384,11 @@ static void draw_master(Session *s, float x, float y, float w, float h)
         if (!g_midi_learn_mode && CheckCollisionPointRec(mm, khit) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
             !g_ctx_open && !g_ti_active && !g_audio_dlg_open) {
             double now = GetTime();
-            if (now - mpan_last < DOUBLE_CLICK_TIME) { atomic_store(&s->master_pan, 0.0f); mpan_last = 0; }   /* double click = centre */
-            else { g_dragging_slider = MPAN_ID; mpan_last = now; }
+            if (now - mpan_last < DOUBLE_CLICK_TIME || GetMouseClicks(MOUSE_BUTTON_LEFT) >= 2) { atomic_store(&s->master_pan, 0.0f); mpan_last = 0; }   /* double click = centre */
+            else { g_dragging_slider = MPAN_ID; mpan_last = now; g_pan_y0 = mm.y; g_pan_v0 = g_pan_last = mpan; g_pan_sh = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT); }   /* 1.3.16: no jump */
         }
         if (g_dragging_slider == MPAN_ID && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            float p = ((ky + knob_d / 2) - mm.y) / (knob_d * 2.0f);
-            if (p < -1.0f) p = -1.0f;
-            if (p >  1.0f) p =  1.0f;
-            if (fabsf(p) < 0.03f) p = 0.0f;                 /* the centre is easy to hit */
-            atomic_store(&s->master_pan, p);
+            atomic_store(&s->master_pan, pan_drag_value(mm.y, knob_d));
         }
         /* main MUTE */
         Rectangle mr = { cx0 + 4, ky + knob_d + 20, cw - 8, 26 };
@@ -3756,21 +3814,89 @@ static void aa_vbar(float x0, float wpx, float y, float h, Color c)
 }
 
 /* Vertical segment yt..yb in column cx with soft (partly transparent) top and bottom ends */
+/* ===== 1.3.14: the waveform is drawn by Q-LiM itself into one picture (pixel by pixel, in the same order and with
+ * the same transparency as before) and the screen gets that one picture: a still view costs nothing, a moving one
+ * (SCROLL, follow) is one cheap pass over the pixels instead of ~10 000-30 000 tiny rectangles ===== */
+static GfxImage *g_wimg;
+static uint32_t *g_wpx;                               /* ARGB, not premultiplied */
+static int       g_wpw, g_wph, g_wpcap;
+static int       g_wox, g_woy;                       /* the picture's top left corner, in physical pixels */
+static float     g_wsc;                               /* UI unit -> physical pixels */
+static bool      g_wb_on;
+static int wpx_d(float v) { return (int)lroundf(v * g_wsc); }
+static void wb_begin(float x, float y, float w, float h)
+{
+    g_wsc = GfxScaleNow();
+    g_wox = wpx_d(x); g_woy = wpx_d(y);
+    g_wpw = wpx_d(x + w) - g_wox; g_wph = wpx_d(y + h) - g_woy;
+    if (g_wpw <= 0 || g_wph <= 0) { g_wb_on = false; return; }
+    int need = g_wpw * g_wph;
+    if (need > g_wpcap) {
+        uint32_t *nb = (uint32_t *)realloc(g_wpx, sizeof(uint32_t) * (size_t)need);
+        if (!nb) { g_wb_on = false; return; }
+        g_wpx = nb; g_wpcap = need;
+    }
+    memset(g_wpx, 0, sizeof(uint32_t) * (size_t)need);
+    g_wb_on = true;
+}
+/* "over" into the picture: the same as drawing the rectangle on the screen (the picture is laid over the background) */
+static void wb_rect(int x, int y, int w, int h, Color c)
+{
+    if (!g_wb_on) { DrawRectangle(x, y, w, h, c); return; }
+    if (c.a == 0) return;
+    int x0 = wpx_d((float)x), y0 = wpx_d((float)y), x1 = wpx_d((float)(x + w)), y1 = wpx_d((float)(y + h));
+    if (x1 == x0 && w > 0) x1 = x0 + 1;
+    if (y1 == y0 && h > 0) y1 = y0 + 1;
+    x0 -= g_wox; x1 -= g_wox; y0 -= g_woy; y1 -= g_woy;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > g_wpw) x1 = g_wpw;
+    if (y1 > g_wph) y1 = g_wph;
+    if (x1 <= x0 || y1 <= y0) return;
+    uint32_t src = ((uint32_t)c.a << 24) | ((uint32_t)c.r << 16) | ((uint32_t)c.g << 8) | c.b;
+    unsigned sa = c.a;
+    for (int yy = y0; yy < y1; ++yy) {
+        uint32_t *p = g_wpx + (size_t)yy * g_wpw + x0;
+        for (int xx = x0; xx < x1; ++xx, ++p) {
+            uint32_t d = *p;
+            unsigned da = d >> 24;
+            if (da == 0 || sa == 255) { *p = src; continue; }
+            /* out = src + dst * (1 - src_a), not premultiplied */
+            unsigned k = da * (255 - sa);                       /* dst weight * 255 */
+            unsigned oa255 = sa * 255 + k;                      /* out alpha * 255 */
+            unsigned r = (c.r * sa * 255 + ((d >> 16) & 255) * k + oa255 / 2) / oa255;
+            unsigned g = (c.g * sa * 255 + ((d >> 8) & 255) * k + oa255 / 2) / oa255;
+            unsigned b = (c.b * sa * 255 + (d & 255) * k + oa255 / 2) / oa255;
+            unsigned oa = (oa255 + 127) / 255;
+            *p = (oa << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+static void wb_send(void) { if (g_wimg) GfxImageDraw(g_wimg, g_wox, g_woy); }
+static void wb_end(void)
+{
+    if (!g_wb_on) return;
+    g_wb_on = false;
+    if (!g_wimg) g_wimg = GfxImageNew();
+    GfxImageUpload(g_wimg, g_wpx, g_wpw, g_wph);
+    wb_send();
+}
+
 static void wspan(int cx, float yt, float yb, Color c)
 {
     if (c.a == 0 || yb <= yt) return;
     int it = (int)ceilf(yt), ib = (int)floorf(yb);
     if (ib < it) {                                   /* all of it is in one pixel */
         Color e = c; e.a = (unsigned char)(c.a * (yb - yt));
-        if (e.a) DrawRectangle(cx, ib, 1, 1, e);
+        if (e.a) wb_rect(cx, ib, 1, 1, e);
         return;
     }
-    if (ib > it) DrawRectangle(cx, it, 1, ib - it, c);
+    if (ib > it) wb_rect(cx, it, 1, ib - it, c);
     Color e = c;
     e.a = (unsigned char)(c.a * ((float)it - yt));
-    if (e.a) DrawRectangle(cx, it - 1, 1, 1, e);
+    if (e.a) wb_rect(cx, it - 1, 1, 1, e);
     e.a = (unsigned char)(c.a * (yb - (float)ib));
-    if (e.a) DrawRectangle(cx, ib, 1, 1, e);
+    if (e.a) wb_rect(cx, ib, 1, 1, e);
 }
 static Color wmul(Color c, float k) { c.a = (unsigned char)((float)c.a * k + 0.5f); return c; }
 
@@ -3963,35 +4089,51 @@ static void icon_scissors(float cx, float cy, Color c)
     DrawCircleLines((int)(cx + 4), (int)(cy + 5), 2.6f, c);
 }
 
-#define EDIT_TOOLS_W (2 * 26 + 4)
+#define EDIT_TOOLS_W (3 * 26 + 4)                 /* 1.3.15: + "fit Start..End" */
 static const char *g_tool_tip;
 static float g_tool_tip_x, g_tool_tip_y;
-/* two buttons in the waveform's header row (to the left of BPM) */
-static void draw_edit_tools(float bx, float by, float bh)
+/* 1.3.15: the icon of "fit": |<->| */
+static void icon_fit(float cx, float cy, Color c)
 {
-    static const char *tips[2] = {
+    DrawRectangle((int)(cx - 8), (int)(cy - 6), 2, 12, c);
+    DrawRectangle((int)(cx + 6), (int)(cy - 6), 2, 12, c);
+    DrawRectangle((int)(cx - 4), (int)cy, 8, 1, c);
+    DrawTriangle((Vector2){ cx - 6, cy + 0.5f }, (Vector2){ cx - 3, cy + 3.5f }, (Vector2){ cx - 3, cy - 2.5f }, c);
+    DrawTriangle((Vector2){ cx + 6, cy + 0.5f }, (Vector2){ cx + 3, cy - 2.5f }, (Vector2){ cx + 3, cy + 3.5f }, c);
+}
+/* buttons in the waveform's header row (to the left of BPM): pointer, scissors, and (1.3.15) "fit Start..End".
+ * Returns true when "fit" was clicked. */
+static bool draw_edit_tools(float bx, float by, float bh)
+{
+    static const char *tips[3] = {
         "Pointer: click = play position | drag a part = move (Ctrl = copy) | drag its edges = trim | top corners = fades | Del = delete part",
-        "Scissors: click to cut exactly there (hold Shift to snap to beats)" };
+        "Scissors: click to cut exactly there (hold Shift to snap to beats)",
+        "Fit: show the waveform exactly from the Start to the End marker" };
     Vector2 m = GetMousePosition();
     bool free_ui = !g_ti_active && !g_ctx_open && !g_file_menu_open && !g_edit_menu_open && !g_audio_dlg_open;
     if (free_ui && g_em_kind == EM_NONE && !g_rt_open && IsKeyPressed(KEY_ESCAPE) && g_tool != TOOL_POINTER)
         g_tool = TOOL_POINTER;                              /* Esc: back to the arrow */
     int hov_i = -1;
-    for (int i = 0; i < 2; ++i) {
+    bool fit = false;
+    for (int i = 0; i < 3; ++i) {
         Rectangle r = { bx + i * 26, by + 2, 24, bh - 4 };
         bool hov = free_ui && CheckCollisionPointRec(m, r);
-        bool on = g_tool == i;
+        bool on = i < 2 && g_tool == i;
         DrawRectangleRec(r, on ? g_theme.selection : (hov ? g_theme.cell_hover : g_theme.panel_bg2));
         Color ic = on ? g_theme.bg : g_theme.text;
         float cx = r.x + r.width / 2, cy = r.y + r.height / 2;
-        if (i == 0) icon_pointer(cx, cy, ic); else icon_scissors(cx, cy, ic);
+        if (i == 0) icon_pointer(cx, cy, ic); else if (i == 1) icon_scissors(cx, cy, ic); else icon_fit(cx, cy, ic);
         if (hov) {
             hov_i = i;
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { g_tool = i; g_em_kind = EM_NONE; }
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                if (i < 2) { g_tool = i; g_em_kind = EM_NONE; }
+                else fit = true;
+            }
         }
     }
     g_tool_tip = hov_i >= 0 ? tips[hov_i] : NULL;          /* drawn last (above the ruler) */
-    g_tool_tip_x = bx + 2 * 26; g_tool_tip_y = by + bh + 2;
+    g_tool_tip_x = bx + 3 * 26; g_tool_tip_y = by + bh + 2;
+    return fit;
 }
 static void draw_tool_tip(void)
 {
@@ -5287,6 +5429,14 @@ static void draw_waveform_zone(Session *s,
         if (visible_frames < WAVE_MIN_VISIBLE) visible_frames = WAVE_MIN_VISIBLE;
         pos_disp = smooth_position(cl, clip_sr);
         view0 = pos_disp - (double)visible_frames * 0.5;
+        if (perf_wave_light()) {               /* 1.3.14: light - the view moves 15 times per second */
+            static double hv0, ht; static const Clip *hcl; static size_t hvis;
+            double now = GetTime();
+            if (hcl != cl || hvis != visible_frames || now - ht >= 1.0 / 15.0 || now < ht ||
+                fabs(view0 - hv0) > (double)visible_frames * 0.25) {
+                hv0 = view0; ht = now; hcl = cl; hvis = visible_frames;
+            } else view0 = hv0;
+        }
     }
 
     const char *state = atomic_load(&cl->playing) ? "PLAY"
@@ -5328,7 +5478,22 @@ static void draw_waveform_zone(Session *s,
             ed_forget();
             g_ed_ch = g_selected_ch; g_ed_sc = g_selected_scene;
         }
-        draw_edit_tools(tools_x, y, WAVE_HDR_H);
+        if (draw_edit_tools(tools_x, y, WAVE_HDR_H) && atomic_load(&cl->has_clip) && cl->wav.frame_count > 0) {
+            /* 1.3.15: fit - the view exactly from the Start to the End marker (a little air so they can be grabbed) */
+            size_t tf = cl->wav.frame_count;
+            size_t a = atomic_load(&cl->start_marker), b = atomic_load(&cl->end_marker);
+            if (b == 0 || b > tf) b = tf;
+            if (a >= b) { a = 0; b = tf; }
+            double span = (double)(b - a), vis = span * 1.03;
+            if (vis < (double)WAVE_MIN_VISIBLE) vis = (double)WAVE_MIN_VISIBLE;
+            float z = (float)((double)tf / vis);
+            if (z < WAVE_ZOOM_MIN) z = WAVE_ZOOM_MIN;
+            g_wave_follow = false;                          /* SCROLL off: the view stays where it is put */
+            session_set_wave_zoom(s, g_selected_ch, g_selected_scene, z);
+            double v = (double)tf / (double)atomic_load(&cl->wave_zoom);    /* (after the limits) */
+            int64_t sf = (int64_t)llround(((double)a + (double)b) * 0.5 - v * 0.5);
+            session_set_wave_scroll(s, g_selected_ch, g_selected_scene, (size_t)sf);
+        }
     }
 
     float ruler_y = y + WAVE_HDR_H;
@@ -5608,19 +5773,51 @@ static void draw_waveform_zone(Session *s,
     #define WCOL_MAX 8192
     static PeakVal wcol[WCOL_MAX + 2];
     static bool    wok[WCOL_MAX + 2];
-    bool subpix = !detail_mode && ncol + 2 <= WCOL_MAX && off_px > 0.001f;
-    if (subpix) {
-        for (int i = 0; i <= ncol; ++i) {
+    bool subpix = !detail_mode && ncol + 2 <= WCOL_MAX && off_px > 0.001f && !perf_wave_light();
+
+    /* 1.3.14: the values of the columns are kept (by their absolute number q0 + i): a moving view (SCROLL, follow)
+     * computes only the columns that are new; a still view computes nothing */
+    static PeakVal cv[WCOL_MAX + 2], cv2[WCOL_MAX + 2];
+    static bool    cok[WCOL_MAX + 2], cok2[WCOL_MAX + 2];
+    static struct { const Peaks *pk; size_t ready; uint64_t eh; double fpp; } ck;
+    static double  cq0 = 0.0; static int cn = 0;
+    uint64_t ehash = el_hash(draw_edits);
+    size_t pready = cl->peaks ? peaks_ready(cl->peaks) : 0;
+    bool use_cols = !detail_mode && ncol + 2 <= WCOL_MAX;
+    if (use_cols) {
+        if (ck.pk != cl->peaks || ck.ready != pready || ck.eh != ehash || ck.fpp != fpp) {
+            ck.pk = cl->peaks; ck.ready = pready; ck.eh = ehash; ck.fpp = fpp; cn = 0;
+        }
+        int need = ncol + 1;
+        for (int i = 0; i < need; ++i) {
+            double j = q0 + i - cq0;
+            if (cn > 0 && j >= 0.0 && j < (double)cn && j == floor(j)) { cv2[i] = cv[(int)j]; cok2[i] = cok[(int)j]; continue; }
             double f0 = (q0 + i) * fpp, f1 = f0 + fpp;
-            wok[i] = false;
-            if (!cl->peaks) continue;
             int64_t st = (int64_t)floor(f0), en = (int64_t)floor(f1);   /* may also be outside the clip (step 36j) */
             if (en <= st) en = st + 1;
-            wok[i] = session_clip_peaks_list(cl, draw_edits, st, en, &wcol[i]);
+            cok2[i] = cl->peaks && session_clip_peaks_list(cl, draw_edits, st, en, &cv2[i]);
         }
+        memcpy(cv, cv2, sizeof(PeakVal) * (size_t)need);
+        memcpy(cok, cok2, sizeof(bool) * (size_t)need);
+        cq0 = q0; cn = need;
+        memcpy(wcol, cv, sizeof(PeakVal) * (size_t)need);
+        memcpy(wok, cok, sizeof(bool) * (size_t)need);
     }
 
+    /* 1.3.14: a still view (nothing moved, nothing changed) -> the same batches again */
+    static struct { const Peaks *pk; size_t ready; uint64_t eh; double q0, fpp; float off, x, w, wy, wh; int nl, st, dm, ncol;
+                    int64_t dstart; Color co; float sc; int lt; } gk, nk;
+    memset(&nk, 0, sizeof nk);
+    nk.pk = cl->peaks; nk.ready = pready; nk.eh = ehash; nk.q0 = q0; nk.fpp = fpp; nk.off = off_px; nk.x = x; nk.w = w;
+    nk.wy = wave_y; nk.wh = wave_h; nk.nl = nlanes; nk.st = stereo; nk.dm = detail_mode; nk.ncol = ncol;
+    nk.dstart = detail_mode ? detail_start : 0; nk.co = chan_col; nk.sc = GfxScaleNow(); nk.lt = perf_wave_light();
+    static bool g_have = false;
+    bool same = g_have && memcmp(&gk, &nk, sizeof nk) == 0;
+
     BeginScissorMode((int)x, (int)wave_y, (int)w, (int)wave_h);
+    if (same) { wb_send(); goto wave_done; }
+    memcpy(&gk, &nk, sizeof nk); g_have = true;
+    wb_begin(x, wave_y, w, wave_h);
     for (int i = 0; i <= ncol; ++i) {
         PeakVal v;
         if (subpix) {
@@ -5661,10 +5858,15 @@ static void draw_waveform_zone(Session *s,
             if (i >= ncol) break;
             v = detail_buf[i];
         } else {
-            double f0 = (q0 + i) * fpp, f1 = f0 + fpp;
-            int64_t st = (int64_t)floor(f0), en = (int64_t)floor(f1);   /* may also be outside the clip (step 36j) */
-            if (en <= st) en = st + 1;
-            if (!session_clip_peaks_list(cl, draw_edits, st, en, &v)) continue;
+            if (!use_cols) {
+                double f0 = (q0 + i) * fpp, f1 = f0 + fpp;
+                int64_t st = (int64_t)floor(f0), en = (int64_t)floor(f1);   /* may also be outside the clip (step 36j) */
+                if (en <= st) en = st + 1;
+                if (!session_clip_peaks_list(cl, draw_edits, st, en, &v)) continue;
+            } else {
+                if (!wok[i]) continue;
+                v = wcol[i];
+            }
         }
         int cx = subpix ? (int)x + i : (int)floorf(x + (float)i - off_px + 0.5f);
         for (int ln = 0; ln < nlanes; ++ln) {
@@ -5682,19 +5884,21 @@ static void draw_waveform_zone(Session *s,
             if (yb - yt < 1.0f) { float c = (yt + yb) * 0.5f; yt = c - 0.5f; yb = c + 0.5f; }
             /* outline with soft ends: whole pixels + partly transparent end pixels */
             int it = (int)ceilf(yt), ib = (int)floorf(yb);
-            if (ib > it) DrawRectangle(cx, it, 1, ib - it, c_out);
+            if (ib > it) wb_rect(cx, it, 1, ib - it, c_out);
             Color e = c_out;
             e.a = (unsigned char)(c_out.a * ((float)it - yt));
-            if (e.a) DrawRectangle(cx, it - 1, 1, 1, e);
+            if (e.a) wb_rect(cx, it - 1, 1, 1, e);
             e.a = (unsigned char)(c_out.a * (yb - (float)ib));
-            if (e.a) DrawRectangle(cx, ib, 1, 1, e);
+            if (e.a) wb_rect(cx, ib, 1, 1, e);
             /* core: +-RMS around the middle, but not outside the outline */
             float rt = my - rms * amp, rb = my + rms * amp;
             if (rt < yt) rt = yt;
             if (rb > yb) rb = yb;
-            if (rb - rt >= 1.0f) DrawRectangle(cx, (int)(rt + 0.5f), 1, (int)(rb - rt + 0.5f), c_rms);
+            if (rb - rt >= 1.0f) wb_rect(cx, (int)(rt + 0.5f), 1, (int)(rb - rt + 0.5f), c_rms);
         }
     }
+    wb_end();
+    wave_done:;
     {   /* step 36j: outside the clip - darkened (the parts there do not play) + the clip's boundaries */
         double sx0 = x + (0.0 - view0) / (double)visible_frames * w, sx1 = x + ((double)total_frames - view0) / (double)visible_frames * w;
         Color dim = { 0, 0, 0, 130 };
@@ -6820,6 +7024,7 @@ static void ctx_menu_draw(Session *s, int screen_w, int screen_h)
     bg.b = (unsigned char)(bg.b + 10);
     bg.a = (unsigned char)(bg.a * alpha);
     DrawRectangle(mx, my, CTX_MENU_W, menu_h, bg);
+    GfxHoverLayer((Rectangle){ (float)mx, (float)my, (float)CTX_MENU_W, (float)menu_h });   /* 1.3.12 */
 
     Color border = g_theme.text_dim;
     border.a = (unsigned char)(border.a * alpha);
@@ -6990,6 +7195,7 @@ static int draw_dropdown_list(int id,
     }
 
     DrawRectangle((int)x, (int)y, (int)w, list_h, g_theme.panel_bg);
+    GfxHoverLayer((Rectangle){ x, y, w, (float)list_h });   /* 1.3.12 */
     DrawRectangleLines((int)x, (int)y, (int)w, list_h, g_theme.text_dim);
 
     Vector2 mouse = GetMousePosition();
@@ -7767,6 +7973,128 @@ static void draw_about_dialog(int screen_w, int screen_h)
     if (IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_ENTER)) g_about_open = false;
 }
 
+/* ============ 1.3.7: Edit -> Performance... ============
+ * How the window is drawn and how often, so the sound always has room (see perf.h). Every change applies at once
+ * and is saved (the drawing method: at the next start). */
+static bool pl_button(Rectangle r, const char *label, int fs, bool active);
+static void perf_check(int x, int y, bool *v, const char *label, const char *sub)
+{
+    Vector2 m = GetMousePosition();
+    Rectangle box = { (float)x, (float)y, 20, 20 };
+    Rectangle hit = { (float)x, (float)y, 560, 34 };
+    bool hov = CheckCollisionPointRec(m, hit);
+    DrawRectangleRec(box, *v ? g_theme.selection : g_theme.panel_bg2);
+    DrawRectangleLinesEx(box, 1, hov ? g_theme.selection : g_theme.text_dim);
+    if (*v) { DrawLineEx((Vector2){ x + 4.0f, y + 10.0f }, (Vector2){ x + 8.5f, y + 15.0f }, 2.2f, g_theme.bg);
+              DrawLineEx((Vector2){ x + 8.5f, y + 15.0f }, (Vector2){ x + 16.0f, y + 5.0f }, 2.2f, g_theme.bg); }
+    ui_text(label, x + 30, y + 2, 14, g_theme.text);
+    if (sub) ui_text(sub, x + 30, y + 20, 11, g_theme.text_dim);
+    if (hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { *v = !*v; perf_save(); }
+}
+
+static void draw_perf_dialog(int screen_w, int screen_h)
+{
+    GfxDialogBackdrop(70);
+    PerfSettings *ps = perf_settings();
+    const int w = 720, h = 656;
+    const int x = (screen_w - w) / 2, y = (screen_h - h) / 2;
+    Color bg = g_theme.panel_bg;
+    bg.r = (unsigned char)(bg.r + 10); bg.g = (unsigned char)(bg.g + 10); bg.b = (unsigned char)(bg.b + 10);
+    DrawRectangle(x, y, w, h, bg);
+    DrawRectangleLinesEx((Rectangle){ (float)x, (float)y, (float)w, (float)h }, 2, g_theme.selection);
+    DrawRectangle(x, y, w, 40, g_theme.selection);
+    ui_text("Performance", x + 16, y + 10, 20, g_theme.bg);
+
+    int lx = x + 24, cx = x + 190, ty = y + 62;
+    /* 1.3.8: the interface */
+    ui_text("Interface:", lx, ty + 7, 14, g_theme.text);
+    static const char *in[] = { "Auto", "Normal", "Eco" };
+    for (int i = 0; i < 3; ++i)
+        if (pl_button((Rectangle){ (float)(cx + i * 150), (float)ty, 142, 30 }, in[i], 13, ps->eco == i) && ps->eco != i) {
+            ps->eco = i; perf_save();
+        }
+    ui_text(GfxEco() ? "Now: Eco" : "Now: Normal", cx, ty + 36, 11, g_theme.text_dim);
+    ui_text("Always: only the parts of the window that changed are drawn again. Eco saves even more: no highlights",
+            lx, ty + 54, 11, g_theme.text_dim);
+    ui_text("under the mouse, no soft edges, no blur, at most 30 frames/s. Auto = Eco when there is no graphics card.",
+            lx, ty + 69, 11, g_theme.text_dim);
+    ty += 104;
+    /* drawing */
+    ui_text("Drawing:", lx, ty + 7, 14, g_theme.text);
+    static const char *dn[] = { "Auto", "Graphics card", "Light (CPU)" };
+    for (int i = 0; i < 3; ++i) {
+        Rectangle r = { (float)(cx + i * 150), (float)ty, 142, 30 };
+        if (pl_button(r, dn[i], 13, ps->draw == i)) {
+            if (ps->draw != i) { ps->draw = i; perf_save(); ui_flash_message("Drawing: applies the next time Q-LiM starts"); }
+        }
+    }
+    char nb[220];
+    snprintf(nb, sizeof nb, "Now: %s", GfxRendererDesc());
+    ui_text(nb, cx, ty + 36, 11, g_theme.text_dim);
+    ui_text("Auto = the graphics card, or the light drawing when there is no acceleration. Applies at the next start.",
+            lx, ty + 54, 11, g_theme.text_dim);
+
+    /* frames per second */
+    ty += 86;
+    ui_text("Frames per second:", lx, ty + 7, 14, g_theme.text);
+    static const int fv[] = { 0, 60, 30, 20, 12 };
+    static const char *fn[] = { "Auto", "60", "30", "20", "12" };
+    for (int i = 0; i < 5; ++i) {
+        Rectangle r = { (float)(cx + i * 90), (float)ty, 82, 30 };
+        if (pl_button(r, fn[i], 13, ps->fps == fv[i]) && ps->fps != fv[i]) { ps->fps = fv[i]; perf_save(); }
+    }
+    ui_text("Auto = as many as fit in about 40 % of one CPU core (measured all the time); a number = at most that many.",
+            lx, ty + 38, 11, g_theme.text_dim);
+
+    /* 1.3.14: the waveform */
+    ty += 66;
+    ui_text("Waveform:", lx, ty + 7, 14, g_theme.text);
+    static const char *wvn[] = { "Auto", "Smooth", "Light" };
+    for (int i = 0; i < 3; ++i)
+        if (pl_button((Rectangle){ (float)(cx + i * 150), (float)ty, 142, 30 }, wvn[i], 13, ps->wave == i) && ps->wave != i) {
+            ps->wave = i; perf_save();
+        }
+    ui_text(perf_wave_light() ? "Now: light" : "Now: smooth", cx + 460, ty + 9, 11, g_theme.text_dim);
+    ui_text("Light: in SCROLL the waveform moves 15 times per second, in whole pixels (less CPU). Auto = light with Eco.",
+            lx, ty + 38, 11, g_theme.text_dim);
+
+    /* switches */
+    ty += 66;
+    perf_check(lx, ty, &ps->idle_save, "Fewer frames while nothing moves (10 per second)",
+               "The mouse or a key brings full speed back at once.");
+    ty += 44;
+    perf_check(lx, ty, &ps->sound_first, "Sound first",
+               "When the sound breaks up, draw fewer frames for 30 seconds and say why.");
+    ty += 44;
+    {   bool was = ps->meters;
+        perf_check(lx, ty, &ps->meters, "Level meters (Ctrl+Shift+U)",
+                   "Off: only the dB scale stays next to the faders - nothing moves there.");
+        (void)was; }
+    ty += 44;
+    ty -= 60;                               /* (1.3.12: the interface size moved to Edit > Appearance) */
+    /* the state now */
+    ty += 56;
+    DrawLine(lx, ty, x + w - 24, ty, g_theme.grid_line);
+    ty += 10;
+    int cap = perf_max_fps_now();
+    char sb[300];
+    if (cap > 0) snprintf(sb, sizeof sb, "Right now: at most %d frames per second%s   |   drawing uses about %.0f %% of one CPU core",
+                          cap, perf_slowed_for_sound() ? " (sound first)" : "", 100.0f * perf_ui_load());
+    else snprintf(sb, sizeof sb, "Right now: full frame rate   |   drawing uses about %.0f %% of one CPU core", 100.0f * perf_ui_load());
+    ui_text(sb, lx, ty, 12, g_theme.text);
+    unsigned c, d, wp, ov;
+    perf_problem_counts(&c, &d, &wp, &ov);
+    snprintf(sb, sizeof sb, "Sound dropouts since the start:  sound card %u   |   disk %u   |   WARP %u   |   processing over 100 %% %u",
+             c, d, wp, ov);
+    ui_text(sb, lx, ty + 20, 12, (c || d || wp || ov) ? (Color){ 235, 120, 90, 255 } : g_theme.text_dim);
+
+    Rectangle close_r = { (float)(x + w - 140), (float)(y + h - 52), 120, 36 };
+    bool close = pl_button(close_r, "Close", 16, false);
+    Vector2 m = GetMousePosition();
+    bool outside = !CheckCollisionPointRec(m, (Rectangle){ (float)x, (float)y, (float)w, (float)h });
+    if (close || (outside && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) || IsKeyPressed(KEY_ESCAPE)) g_perf_open = false;
+}
+
 /* ============ Edit -> Plugins... (step 34) ============ */
 static int   g_pl_tab = 0;                 /* 0 = available, 1 = problems, 2 = search locations */
 static float g_pl_scroll[3];
@@ -7979,7 +8307,7 @@ static void draw_appearance_dialog(int screen_w, int screen_h)
     GfxDialogBackdrop(70);
 
     const int dlg_w = 700;
-    const int dlg_h = 300;                  /* +40: the themes are on two rows */
+    const int dlg_h = 345;                  /* +40: the themes are on two rows; +70: the interface size (1.3.12) */
     const int dlg_x = (screen_w - dlg_w) / 2;
     const int dlg_y = (screen_h - dlg_h) / 2;
 
@@ -8153,6 +8481,21 @@ static void draw_appearance_dialog(int screen_w, int screen_h)
     }
 
     y += 40;
+
+    {   /* 1.3.12 (from Performance): the size of the interface */
+        float z = perf_settings()->zoom;
+        ui_text("Interface size:", x, y + 7, 14, g_theme.text);
+        float zx = x + 130;
+        if (pl_button((Rectangle){ zx, (float)y, 40, 30 }, "-", 16, false)) ui_zoom_step(-1);
+        char zb[32]; snprintf(zb, sizeof zb, "%.0f %%", z * 100.0f);
+        int zw = ui_text_w(zb, 14);
+        ui_text(zb, (int)zx + 48 + (70 - zw) / 2, y + 7, 14, g_theme.selection);
+        if (pl_button((Rectangle){ zx + 126, (float)y, 40, 30 }, "+", 16, false)) ui_zoom_step(1);
+        if (pl_button((Rectangle){ zx + 176, (float)y, 70, 30 }, "100 %", 13, false)) ui_zoom_step(0);
+        ui_text("Also Ctrl+wheel over the clips, Ctrl+= / Ctrl+- / Ctrl+0. The menus, the top bar and the dialogs keep their size.",
+                x, y + 38, 11, g_theme.text_dim);
+        y += 70;
+    }
 
     // === Apply / Cancel / Save buttons ===
     const int btn2_w = 120;
@@ -9126,28 +9469,33 @@ static void ui_draw_world(Session *s)
         layout_save();
     }
 
-    if (g_log_open && CheckCollisionPointRec(GetMousePosition(), g_log_rect))
+    if (g_log_open && GfxPointIn(GfxMouseTrue(), g_log_rect))
         GfxMouseShield(true);
 
     /* File/Edit drop-down menu: a click on it must not select/play the cell below */
-    if ((g_file_menu_open || g_edit_menu_open) && CheckCollisionPointRec(GetMousePosition(), g_menu_dd_rect))
+    Rectangle ddz = { g_menu_dd_rect.x / GfxGetZoom(), g_menu_dd_rect.y / GfxGetZoom(),      /* (the menu: normal size) */
+                      g_menu_dd_rect.width / GfxGetZoom(), g_menu_dd_rect.height / GfxGetZoom() };
+    if ((g_file_menu_open || g_edit_menu_open) && GfxPointIn(GfxMouseTrue(), ddz))
         GfxMouseShield(true);
 
     /* While the queue is open, the elements below it do not see the mouse */
-    if (g_rt_open && CheckCollisionPointRec(GetMousePosition(), g_rt_rect))
+    if (g_rt_open && GfxPointIn(GfxMouseTrue(), g_rt_rect))
         GfxMouseShield(true);
-    if (g_em_kind != EM_NONE && CheckCollisionPointRec(GetMousePosition(), g_em_rect))
+    if (g_em_kind != EM_NONE && GfxPointIn(GfxMouseTrue(), g_em_rect))
         GfxMouseShield(true);
-    if ((g_fxp_ch >= 0 && CheckCollisionPointRec(GetMousePosition(), g_fxp_rect)) ||
-        (g_fxm_ch >= 0 && CheckCollisionPointRec(GetMousePosition(), g_fxm_rect)))
+    if ((g_fxp_ch >= 0 && GfxPointIn(GfxMouseTrue(), g_fxp_rect)) ||
+        (g_fxm_ch >= 0 && GfxPointIn(GfxMouseTrue(), g_fxm_rect)))
         GfxMouseShield(true);
-    if (g_queue_open && (CheckCollisionPointRec(GetMousePosition(), g_q_rect) || g_q_drag >= 0 || g_vf_id == 3))
+    if (g_queue_open && (GfxPointIn(GfxMouseTrue(), g_q_rect) || g_q_drag >= 0 || g_vf_id == 3))
         GfxMouseShield(true);
 
     /* While the DSP popup is open, the elements below it do not see the mouse when it is clicked/hovered over it */
     if (g_dsp_open) {
-        Vector2 mm = GetMousePosition();
-        if (CheckCollisionPointRec(mm, dsp_popup_rect(screen_w)) ||
+        Vector2 mm = GfxMouseTrue();   /* 1.3.12: the real mouse (Eco) */
+        float z = GfxGetZoom();
+        Rectangle pr = dsp_popup_rect((int)lroundf(screen_w * z));          /* (in the top bar's normal size) */
+        pr = (Rectangle){ pr.x / z, pr.y / z, pr.width / z, pr.height / z };
+        if (GfxPointIn(mm, pr) ||
             IsMouseButtonPressed(MOUSE_BUTTON_LEFT) || IsMouseButtonPressed(MOUSE_BUTTON_RIGHT))
             GfxMouseShield(true);
     }
@@ -9216,7 +9564,7 @@ static void ui_draw_world(Session *s)
         if (g_master_w > mx_max) g_master_w = mx_max;
         if (g_master_w < MASTER_W) g_master_w = MASTER_W;
     }
-    float master_x = screen_w - g_master_w - GAP;
+    float master_x = screen_w - (g_master_hidden ? 14.0f : g_master_w) - GAP;   /* 1.3.10: hidden = a thin handle */
     float scene_col_x = GAP + lib_w;
     float channels_x = scene_col_x + SCENE_COL_W + GAP;
     float channels_w = master_x - channels_x - GAP;
@@ -9330,7 +9678,9 @@ static void ui_draw_world(Session *s)
     if (!in_library && !g_ti_active && !g_ctx_open && !g_file_menu_open
         && !g_audio_dlg_open && !mouse_in_wave) {
         float wheel = GetMouseWheelMove();
-        if (wheel != 0.0f) {
+        if (wheel != 0.0f && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))) {
+            ui_zoom_step(wheel > 0 ? 1 : -1);        /* 1.3.10: Ctrl+wheel = the size of the whole interface */
+        } else if (wheel != 0.0f) {
             if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
                 g_scroll_x -= wheel * 60;
             } else {
@@ -9431,8 +9781,12 @@ static void ui_draw_world(Session *s)
     /* the buttons on the left (Stop, Loop, MIDI, SCROLL, QUEUE) always have room: with a hidden panel they sit at the very bottom */
     float side_y = g_footer_hidden ? grid_bottom - CHANNEL_FOOTER_H : footer_y + (g_fx_open ? FX_STRIP_H : 0.0f);   /* the FX strip does not move the buttons */
 
-    draw_menu_bar(s, screen_w);
-    draw_top_bar(screen_w);
+    GfxUnzoomBegin();                        /* 1.3.10: the menu bar keeps its size */
+    draw_menu_bar(s, GetScreenWidth());
+    GfxUnzoomEnd();
+    GfxUnzoomBegin();                        /* 1.3.12: the top bar (DSP, logo, BPM) keeps its size too */
+    draw_top_bar(GetScreenWidth());
+    GfxUnzoomEnd();
 
     draw_stop_button(s, scene_col_x, side_y, SCENE_COL_W, CLIP_HEADER_H);
 
@@ -9735,7 +10089,8 @@ static void ui_draw_world(Session *s)
 
     BeginScissorMode((int)channels_x, 0, (int)(hdr_right - channels_x), screen_h);   /* next to the scrollbar, like the headers */
     bool shield_was = GfxMouseShieldGet();
-    if (mouse.x < channels_x || mouse.x >= hdr_right) GfxMouseShield(true);    /* the hidden part does not react to the mouse */
+    { float tx = GfxMouseTrue().x;   /* 1.3.12: the real mouse (in Eco "mouse" is far away) */
+      if (tx < channels_x || tx >= hdr_right) GfxMouseShield(true); }    /* the hidden part does not react to the mouse */
     for (int c = first_vis_ch; c <= last_vis_ch; ++c) {
         float cx = channels_x + g_chx[c] - g_scroll_x;
         if (cx + g_chw[c] < channels_x) continue;
@@ -9790,11 +10145,24 @@ static void ui_draw_world(Session *s)
         }
     }
 
-    draw_master(s, master_x, grid_top, g_master_w,
+    if (g_master_hidden) {                   /* 1.3.10: a thin handle - click or drag left = the master again */
+        Rectangle hr = { master_x, grid_top, 14.0f, grid_bottom - grid_top };
+        bool free_ui = !g_ti_active && !g_ctx_open && !g_file_menu_open && !g_audio_dlg_open && !g_drag_active &&
+                       !g_drag_clip_active && g_dragging_slider < 0;
+        bool hov = free_ui && CheckCollisionPointRec(mouse, hr);
+        DrawRectangleRec(hr, hov ? g_theme.cell_hover : g_theme.panel_bg);
+        DrawRectangleLinesEx(hr, 1, hov ? g_theme.selection : g_theme.grid_line);
+        float cy = grid_top + (grid_bottom - grid_top) * 0.5f;
+        DrawTriangle((Vector2){ master_x + 10, cy - 7 }, (Vector2){ master_x + 4, cy }, (Vector2){ master_x + 10, cy + 7 },
+                     hov ? g_theme.text : g_theme.text_dim);
+        if (hov) SetMouseCursor(MOUSE_CURSOR_POINTING_HAND);
+        if (hov && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { g_master_hidden = false; layout_save(); }
+    } else draw_master(s, master_x, grid_top, g_master_w,
                 grid_bottom - grid_top);
 
-    /* the left edge of the master: it is dragged (wider = balance and MUTE); double click = the usual width */
-    {
+    /* the left edge of the master: it is dragged (wider = balance and MUTE); double click = the usual width;
+     * 1.3.10: dragged far to the right = hidden */
+    if (!g_master_hidden) {
         Rectangle grip = { master_x - 2, grid_top, 6, grid_bottom - grid_top };   /* does not overlap the scrollbar on the left */
         bool free_ui = !g_ti_active && !g_ctx_open && !g_file_menu_open && !g_audio_dlg_open &&
                        g_sb_drag == 0 && !g_drag_active && !g_drag_clip_active && g_dragging_slider < 0 &&
@@ -9815,6 +10183,13 @@ static void ui_draw_world(Session *s)
         if (g_mw_drag) {
             if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
                 g_master_w = g_mw_w0 + (g_mw_x0 - mouse.x);       /* left = wider */
+                if (g_master_w < MASTER_W - 70.0f) {             /* 1.3.10: far to the right = hide it */
+                    g_master_w = g_mw_w0 < MASTER_W ? MASTER_W : g_mw_w0;
+                    g_master_hidden = true;
+                    g_mw_drag = false;
+                    layout_save();
+                    ui_flash_message("Master hidden - click the handle on the right or press Ctrl+Shift+M to show it");
+                }
                 if (g_master_w < MASTER_W) g_master_w = MASTER_W;
                 if (g_master_w > MASTER_W_MAX) g_master_w = MASTER_W_MAX;
             } else {
@@ -9925,18 +10300,22 @@ static void ui_draw_world(Session *s)
         if (g_vf_moved) GfxMouseRelative(false);
         g_vf_id = 0;
     }
-    draw_dsp_popup(screen_w);
+    GfxUnzoomBegin();                        /* 1.3.12: opened from the top bar - its size too */
+    draw_dsp_popup(GetScreenWidth());
+    GfxUnzoomEnd();
     draw_log_popup(screen_w);
 
     if (g_ctx_open) {
         ctx_menu_draw(s, screen_w, screen_h);
     }
 
+    GfxUnzoomBegin();                        /* 1.3.10: its menus too */
     if (g_file_menu_open) {
-        draw_file_dropdown(screen_w, screen_h);
+        draw_file_dropdown(GetScreenWidth(), GetScreenHeight());
     } else if (g_edit_menu_open) {
-        draw_edit_dropdown(screen_w, screen_h);
+        draw_edit_dropdown(GetScreenWidth(), GetScreenHeight());
     }
+    GfxUnzoomEnd();
     GfxRoundAll(0.0f);
 }
 
@@ -9991,7 +10370,7 @@ void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
         ClearBackground(g_theme.bg);
         ui_draw_backdrop_world(s);
         GfxRoundAll(R_CELL);
-        ui_text_input_draw(screen_w, screen_h);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); ui_text_input_draw(GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
         GfxRoundAll(0.0f);
         return;
     }
@@ -10009,7 +10388,7 @@ void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
         edit_menu_close();
         ui_draw_backdrop_world(s);
         GfxRoundAll(R_CELL);                 /* step 36g: the dialogs - with rounded corners */
-        dialogs_draw(s, screen_w, screen_h);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); dialogs_draw(s, GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
         GfxRoundAll(0.0f);
         return;
     }
@@ -10025,7 +10404,7 @@ void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
         g_dragging_loop_marker = 0;
         ui_draw_backdrop_world(s);
         GfxRoundAll(R_CELL);                 /* step 36g: the dialogs - with rounded corners */
-        draw_audio_settings_dialog(screen_w, screen_h);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); draw_audio_settings_dialog(GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
         GfxRoundAll(0.0f);
         return;
     }
@@ -10041,7 +10420,23 @@ void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
         g_dragging_loop_marker = 0;
         ui_draw_backdrop_world(s);
         GfxRoundAll(R_CELL);                 /* step 36g: the dialogs - with rounded corners */
-        draw_about_dialog(screen_w, screen_h);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); draw_about_dialog(GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
+        GfxRoundAll(0.0f);
+        return;
+    }
+
+    if (g_perf_open) {                       /* 1.3.7 */
+        ClearBackground(g_theme.bg);
+        g_dragging_slider = -1;
+        g_drag_active = false;
+        g_drag_clip_active = false;
+        g_drag_clip_src_ch = -1;
+        g_drag_clip_src_scene = -1;
+        g_waveform_dragging = false;
+        g_dragging_loop_marker = 0;
+        ui_draw_backdrop_world(s);
+        GfxRoundAll(R_CELL);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); draw_perf_dialog(GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
         GfxRoundAll(0.0f);
         return;
     }
@@ -10057,7 +10452,7 @@ void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
         g_dragging_loop_marker = 0;
         ui_draw_backdrop_world(s);
         GfxRoundAll(R_CELL);                 /* step 36g: the dialogs - with rounded corners */
-        draw_plugins_dialog(screen_w, screen_h);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); draw_plugins_dialog(GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
         GfxRoundAll(0.0f);
         return;
     }
@@ -10074,7 +10469,7 @@ void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
         g_dragging_loop_marker = 0;
         ui_draw_backdrop_world(s);
         GfxRoundAll(R_CELL);                 /* step 36g: the dialogs - with rounded corners */
-        draw_appearance_dialog(screen_w, screen_h);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); draw_appearance_dialog(GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
         GfxRoundAll(0.0f);
         return;
     }
@@ -10090,7 +10485,7 @@ void ui_draw(Session *s, int *out_sel_ch, int *out_sel_scene)
         g_dragging_loop_marker = 0;
         ui_draw_backdrop_world(s);
         GfxRoundAll(R_CELL);                 /* step 36g: the dialogs - with rounded corners */
-        draw_midi_settings_dialog(screen_w, screen_h);
+        GfxUnzoomBegin(); GfxHoverLayer((Rectangle){ 0, 0, 1e6f, 1e6f }); draw_midi_settings_dialog(GetScreenWidth(), GetScreenHeight()); GfxUnzoomEnd();   /* 1.3.11: dialogs keep their size */
         GfxRoundAll(0.0f);
         return;
     }
@@ -10120,6 +10515,6 @@ bool ui_midi_learn_is_active(void)
 
 bool ui_any_modal_open(void)
 {
-    return g_ti_active || g_audio_dlg_open || g_appearance_open || g_about_open || g_plugins_open || g_midi_settings_open || dialogs_any_open() ||
+    return g_ti_active || g_audio_dlg_open || g_appearance_open || g_about_open || g_perf_open || g_plugins_open || g_midi_settings_open || dialogs_any_open() ||
            g_fxp_ch >= 0;                       /* the plugin list: typing is search, not keyboard shortcuts */
 }

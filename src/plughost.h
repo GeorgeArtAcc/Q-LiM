@@ -42,6 +42,7 @@ bool   qplug_has_editor(QPlug *p);
 int    qplug_editor_open(QPlug *p, const char *title, char *err, int esz);   /* already open -> comes to the front */
 void   qplug_editor_close(QPlug *p);
 bool   qplug_editor_is_open(QPlug *p);
+int    qplug_editors_open(void);          /* 1.3.4: how many plugin windows are open (main thread) */
 void   qplug_idle_all(void);          /* every frame: window events, timers, closing with X */
 
 /* step 35d: plugin through yabridge (Wine) - loads slowly, so on a background thread (see fxchain.c) */

@@ -1,6 +1,7 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 #define _POSIX_C_SOURCE 200809L
 #include "peaks.h"
+#include "thread_prio.h"
 #include "stream.h"
 
 #include <pthread.h>
@@ -148,6 +149,7 @@ static void compute(Peaks *p)
 static void *worker(void *arg)
 {
     (void)arg;
+    thread_prio_low();                  /* 1.3.7: the sound and the picture come first */
     pthread_mutex_lock(&g_mu);
     for (;;) {
         while (!g_head && !g_quit) pthread_cond_wait(&g_cv, &g_mu);
