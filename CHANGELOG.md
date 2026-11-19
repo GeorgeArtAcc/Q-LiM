@@ -7,6 +7,8 @@
   Microsoft's NuGet package (nuget.org) and keeps only the one library from it. If separation was already set up on
   a computer, nothing is downloaded again. On Linux the package is unpacked with `unzip`, `python3` or `bsdtar`.
   (Corrected packages of 2.0.0, package number 3.)
+- **Windows 7 / 8:** song separation now says plainly that it needs Windows 10 or 11 (64-bit) - the AI engine it
+  uses (ONNX Runtime) does not run on older Windows. Before, it stopped with a puzzling "curl / wget is missing".
 - **A fresh look.** Five new themes (Graphite, Slate, Aurora, Paper, Ember) and a **Modern** style next to the
   Classic one (Edit -> Appearance): rounder corners, the channel colour as a strip on the headers, clips tinted in their
   channel's colour. The light themes (Paper - a calm grey, never bright white - and Light) have clear outlines.

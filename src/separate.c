@@ -1076,9 +1076,31 @@ static int ncpu(void)
     return (int)n;
 }
 
+#ifdef _WIN32
+/* 2.0.0 (packages 4): ONNX Runtime and the download/unpack tools (curl.exe, tar.exe) need Windows 10 or newer.
+ * On Windows 7/8 the first separation stopped with a puzzling "curl / wget is missing". RtlGetVersion tells the
+ * real version (GetVersionEx can be told an older one by the manifest). */
+typedef LONG (WINAPI *RtlGetVersionFn)(OSVERSIONINFOW *);
+static bool windows_too_old(void)
+{
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn f = nt ? (RtlGetVersionFn)(void *)GetProcAddress(nt, "RtlGetVersion") : NULL;
+    OSVERSIONINFOW v; memset(&v, 0, sizeof v); v.dwOSVersionInfoSize = sizeof v;
+    if (!f || f(&v) != 0) return false;                 /* (unknown: let it try) */
+    return v.dwMajorVersion < 10;
+}
+#else
+static bool windows_too_old(void) { return false; }
+#endif
+
 SepJob *sep_start(Session *s, int ch, int scene, const SepRequest *r, char *err, size_t en)
 {
     if (!sep_supported()) { snprintf(err, en, "Separation needs the 64-bit version of Q-LiM"); return NULL; }
+    if (windows_too_old()) {
+        snprintf(err, en, "Song separation needs Windows 10 or 11 (64-bit). The AI engine it uses (ONNX Runtime) "
+                          "does not run on older Windows. Everything else in Q-LiM works here.");
+        return NULL;
+    }
     if (!req_parts(r)) { snprintf(err, en, "Nothing chosen to separate"); return NULL; }
     SepJob *j = calloc(1, sizeof *j);
     if (!j) { snprintf(err, en, "Out of memory"); return NULL; }
