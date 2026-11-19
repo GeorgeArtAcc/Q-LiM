@@ -3,7 +3,7 @@
  * first-use install (download from file:// copies, checksum, unpack), the separation of a clip with a known
  * synthetic voice over real music, the stems playing in the clip (levels, mute, through warp), cancel, the cache,
  * project save / load, export of one stem, "split to clips".
- * Arguments: <qlim-separate> <folder with mel-roformer.fp16.onnx + onnxruntime-linux-x64-1.22.0.tgz> <mix.wav> <voice.wav>
+ * Arguments: <qlim-separate> <folder with mel-roformer.fp16.onnx + microsoft.ml.onnxruntime.1.22.0.nupkg> <mix.wav> <voice.wav>
  *   (mix.wav / voice.wav: 44.1 kHz; make them with tests/gen_sep_audio.py) */
 #define _POSIX_C_SOURCE 200809L
 #include "../src/session.h"
@@ -73,7 +73,7 @@ static double resid_db(const float *a, long na, const float *b, long nb, long fr
 
 int main(int argc, char **argv)
 {
-    if (argc < 5) { printf("usage: test_separate <qlim-separate> <dir with model + ort tgz> <mix.wav> <voice.wav>\n"); return 2; }
+    if (argc < 5) { printf("usage: test_separate <qlim-separate> <dir with model + ort nupkg> <mix.wav> <voice.wav>\n"); return 2; }
     const char *helper = argv[1], *assets = argv[2], *mixp = argv[3], *voicep = argv[4];
     if (access(helper, X_OK) != 0) { printf("FAIL: no helper program %s (make qlim-separate)\nSEPARATE: FAILED\n", helper); return 1; }
     if (system("rm -rf /tmp/qlim_sep_data /tmp/qlim_sep_cache /tmp/qlim_sep_home && mkdir -p /tmp/qlim_sep_data /tmp/qlim_sep_home") != 0) return 2;
@@ -99,7 +99,7 @@ int main(int argc, char **argv)
     sep_set_paths(helper, "/tmp/qlim_sep_data", NULL);
     char url[1200];
     snprintf(url, sizeof url, "file://%s/mel-roformer.fp16.onnx", assets); setenv("QLIM_SEP_MODEL_URL", url, 1);
-    snprintf(url, sizeof url, "file://%s/onnxruntime-linux-x64-1.22.0.tgz", assets); setenv("QLIM_SEP_ORT_URL", url, 1);
+    snprintf(url, sizeof url, "file://%s/microsoft.ml.onnxruntime.1.22.0.nupkg", assets); setenv("QLIM_SEP_ORT_URL", url, 1);
     snprintf(url, sizeof url, "file://%s/sep2/htdemucs_6s_fp16weights.onnx", assets); setenv("QLIM_SEP_DEMUCS_URL", url, 1);
     snprintf(url, sizeof url, "file://%s/sep2/bs_roformer_sw_6stem_fp16.onnx", assets); setenv("QLIM_SEP_BSRSW_URL", url, 1);
     const SepRequest VO = { SEP_P_VOCALS, false, SEP_BSRSW };

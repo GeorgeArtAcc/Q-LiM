@@ -35,23 +35,24 @@ extern char **environ;
 #define SEP_ARCH_OK 0                     /* 32-bit, musl (Alpine): ONNX Runtime has no build for it */
 #endif
 
-/* what is downloaded on the first use */
+/* what is downloaded on the first use.
+ * 2.0.1: Microsoft took github.com/microsoft/onnxruntime offline on 17.11.2026 (with all its release downloads -> "404").
+ * The same official build is still published by Microsoft as the NuGet package Microsoft.ML.OnnxRuntime (a .zip with the
+ * native library of every platform in runtimes/<platform>/native/). Only the one library is unpacked from it. Same
+ * version as before (1.22.0), so a runtime that is already installed stays as it is. */
 #define ORT_VER     "1.22.0"
-#ifdef _WIN32
-#define ORT_URL     "https://github.com/microsoft/onnxruntime/releases/download/v" ORT_VER "/onnxruntime-win-x64-" ORT_VER ".zip"
-#define ORT_ARCHIVE "onnxruntime-win-x64-" ORT_VER ".zip"
-#define ORT_MEMBER  "onnxruntime-win-x64-" ORT_VER "/lib/onnxruntime.dll"
-#define ORT_LIB     "onnxruntime.dll"
-#define ORT_SIZE    0                     /* (checked by loading it) */
+#define ORT_URL     "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/" ORT_VER "/microsoft.ml.onnxruntime." ORT_VER ".nupkg"
+#define ORT_ARCHIVE "microsoft.ml.onnxruntime." ORT_VER ".nupkg"
+#define ORT_SIZE    0                     /* (not pinned: checked by loading it, the package comes over https from nuget.org) */
 #define ORT_SHA     ""
+#define ORT_MB      100.0                 /* about (the package has every platform in it; only ~8-12 MB of it is kept) */
+#ifdef _WIN32
+#define ORT_MEMBER  "runtimes/win-x64/native/onnxruntime.dll"
+#define ORT_LIB     "onnxruntime.dll"
 #define HELPER_EXE  "qlim-separate.exe"
 #else
-#define ORT_URL     "https://github.com/microsoft/onnxruntime/releases/download/v" ORT_VER "/onnxruntime-linux-x64-" ORT_VER ".tgz"
-#define ORT_ARCHIVE "onnxruntime-linux-x64-" ORT_VER ".tgz"
-#define ORT_MEMBER  "onnxruntime-linux-x64-" ORT_VER "/lib/libonnxruntime.so." ORT_VER
+#define ORT_MEMBER  "runtimes/linux-x64/native/libonnxruntime.so"
 #define ORT_LIB     "libonnxruntime.so." ORT_VER
-#define ORT_SIZE    7798730.0
-#define ORT_SHA     "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3"
 #define HELPER_EXE  "qlim-separate"
 #endif
 #define STEM_VER    "melroformer-v1"     /* (the key of a vocals-only separation, as in 1.4.14) */
@@ -241,7 +242,7 @@ double sep_need_mb(const SepRequest *r)
     int m[2], n = sep_request_models(r, m);
     double mb = 0;
     for (int k = 0; k < n; ++k) if (!sep_model_installed(m[k])) mb += MODELS[m[k]].size / 1048576.0;
-    if (n > 0 && !sep_runtime_installed()) mb += 8.0;
+    if (n > 0 && !sep_runtime_installed()) mb += ORT_MB;
     return mb;
 }
 int sep_ram_need_mb(const SepRequest *r)
@@ -774,6 +775,43 @@ static int download(SepJob *j, const char *url, const char *file, double size, c
     return 0;
 }
 
+/* 2.0.1: takes the one library out of the NuGet package (a .zip) -> lib. 0 = ok, -2 = no tool for it, -3 = cancelled.
+ * Windows 10+ has tar.exe (bsdtar, reads .zip). On Linux GNU tar cannot read a .zip, so: unzip, else python3 (on almost
+ * every desktop), else bsdtar. */
+static int unpack_runtime(SepJob *j, const char *arch, const char *d, const char *lib)
+{
+    char log[1200];
+    snprintf(log, sizeof log, "%s/unpack.log", d);
+    int rc;
+#ifdef _WIN32
+    const char *tar[] = { "tar.exe", "-xf", arch, "-C", d, "--strip-components=3", ORT_MEMBER, NULL };
+    rc = run_wait(j, tar, log, NULL, NULL);
+    (void)lib;
+#else
+    char tmp[1200];
+    snprintf(tmp, sizeof tmp, "%s/libonnxruntime.so", d);          /* (the name inside the package) */
+    remove(tmp);
+    const char *unz[] = { "unzip", "-o", "-j", "-q", arch, ORT_MEMBER, "-d", d, NULL };
+    rc = run_wait(j, unz, log, NULL, NULL);
+    if (rc != -3 && (rc != 0 || !file_size(tmp, NULL))) {
+        const char *py[] = { "python3", "-c",
+            "import sys,zipfile,shutil\n"
+            "z=zipfile.ZipFile(sys.argv[1])\n"
+            "with z.open(sys.argv[2]) as a, open(sys.argv[3],'wb') as b: shutil.copyfileobj(a,b)\n",
+            arch, ORT_MEMBER, tmp, NULL };
+        rc = run_wait(j, py, log, NULL, NULL);
+    }
+    if (rc != -3 && (rc != 0 || !file_size(tmp, NULL))) {
+        const char *bsd[] = { "bsdtar", "-xf", arch, "-C", d, "--strip-components=3", ORT_MEMBER, NULL };
+        rc = run_wait(j, bsd, log, NULL, NULL);
+    }
+    if (rc == 0 && file_size(tmp, NULL) && rename(tmp, lib) != 0) rc = 1;
+    if (rc != 0) remove(tmp);
+#endif
+    remove(log);
+    return rc == -3 ? -3 : rc == -2 || rc == 127 ? -2 : rc;
+}
+
 /* ONNX Runtime + the models this choice needs (each only once) */
 static int install(SepJob *j)
 {
@@ -787,20 +825,10 @@ static int install(SepJob *j)
         int rc = download(j, u && *u ? u : ORT_URL, arch, ORT_SIZE, ORT_SHA, "ONNX Runtime");
         if (rc) return rc;
         set_text(j, "Unpacking ONNX Runtime...");
-        char log[1200];
-        snprintf(log, sizeof log, "%s/tar.log", d);
-        const char *tar[] = {
-#ifdef _WIN32
-            "tar.exe", "-xf",
-#else
-            "tar", "-xzf",
-#endif
-            arch, "-C", d, "--strip-components=2", ORT_MEMBER, NULL };
-        rc = run_wait(j, tar, log, NULL, NULL);
-        remove(log);
+        rc = unpack_runtime(j, arch, d, lib);
         remove(arch);
         if (rc == -3) return -3;
-        if (rc != 0 || !file_size(lib, NULL)) { snprintf(j->err, sizeof j->err, "Could not unpack ONNX Runtime (tar)"); return 1; }
+        if (rc != 0 || !file_size(lib, NULL)) { snprintf(j->err, sizeof j->err, "Could not unpack ONNX Runtime%s", rc == -2 ? " (no unzip / python3 / bsdtar found)" : ""); return 1; }
     }
     for (int k = 0; k < j->nmodel; ++k) {
         const SepModel *m = &MODELS[j->models[k]];
