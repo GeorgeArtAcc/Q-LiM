@@ -1,0 +1,17 @@
+--- a/src/libmpg123/layer3.c
++++ b/src/libmpg123/layer3.c
+@@ -1051,9 +1051,12 @@
+ 	if(part2remain > 0) skipbits(fr, part2remain);
+ 	else if(part2remain < 0)
+ 	{
++		/* Q-LiM: some encoders write a too small part2_3_length (or one granule is damaged): the Huffman
++		   data runs past the end of the granule. Like FFmpeg, keep what was decoded and go back to where
++		   the next granule starts, instead of dropping the whole frame (= a hole of silence). */
+ 		if(VERBOSE2)
+-			error1("Can't rewind stream by %d bits!",-part2remain);
+-		return 1; /* -> error */
++			error1("granule overran by %d bits, kept",-part2remain);
++		backbits(fr, -part2remain);
+ 	}
+ 	return 0;
+ }

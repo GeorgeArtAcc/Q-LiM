@@ -1,6 +1,8 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 /* "Monkey" for the audio engine: random actions (play, stop, scenes, loop, markers, seeking,
  * warp tick/BPM, queue, crossfade, delete/move/insert, loading odd files) + audio between them.
+ * 2.1: + surround (circle / room, paths, the Speaker Map masks), surround files (stereo / multichannel / path),
+ * MIDI clips, transitions, pitch / gain / pan of clips, tempo reset, 2..16 outputs.
  * Checks: no crash (ASan/UBSan), no NaN/inf, output within [-1, 1]. */
 #define _POSIX_C_SOURCE 200809L
 #include "../src/session.h"
@@ -8,6 +10,8 @@
 #include "../src/project.h"
 #include "../src/stream.h"
 #include "../src/undo.h"
+#include "../src/surround.h"
+#include <sndfile.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,19 +40,52 @@ static void *audio_main(void *arg)
     return NULL;
 }
 
+/* 2.1: a 6-channel file for the surround-file actions (2 s, a different tone in every channel) */
+static const char *mc_file(void)
+{
+    static const char *p = "/tmp/qlim_fuzz_mc6.wav";
+    SF_INFO in = { .samplerate = 48000, .channels = 6, .format = SF_FORMAT_WAV | SF_FORMAT_FLOAT };
+    SNDFILE *f = sf_open(p, SFM_WRITE, &in);
+    if (!f) return NULL;
+    static float fr[6];
+    for (int i = 0; i < 96000; ++i) {
+        for (int k = 0; k < 6; ++k) fr[k] = 0.2f * sinf((float)i * (0.01f + 0.005f * (float)k));
+        sf_writef_float(f, fr, 1);
+    }
+    sf_close(f);
+    return p;
+}
+
+static void rand_setup(SurSetup *su, int nout)
+{
+    memset(su, 0, sizeof *su);
+    if (R(3) == 0) sur_room_layout(su, R(SUR_R_N), R(nout));
+    else sur_layout(su, R(SUR_L_N), R(nout));
+    if (R(3) == 0) { su->mode = SUR_MODE_ROOM; if (su->room_w <= 0) { su->room_w = 16; su->room_d = 26; } }
+    su->width = (float)R(4) * 40.0f;
+    su->az0 = (float)R(720) - 360.0f; su->spread0 = (float)R(130) / 100.0f - 0.1f;   /* also a bit outside */
+    for (int k = 0; k < su->n; ++k) {
+        if (R(4) == 0) su->out[k] = R(70) - 2;                        /* also outside the card */
+        int m = R(6);
+        su->omask[k] = m == 0 ? SUR_MUTED : m == 1 ? (((uint64_t)rnd() << 20) | rnd()) & ~SUR_MUTED : m == 2 ? 1ull << R(62) : 0;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 4) { fprintf(stderr, "fuzz_engine iterations seed file...\n"); return 2; }
     int iters = atoi(argv[1]);
     rs = (unsigned)atoi(argv[2]) * 2654435761u + 1;
     char **files = argv + 3; int nf = argc - 3;
+    const char *mcf = mc_file();
+    int nout = 2;                                                    /* the outputs of the "card" (2..16) */
     static Session S; Session *s = &S;
     session_init(s, 48000);
     streams_init();
     atomic_store(&s->audio_running, false);
     for (int i = 0; i < 4; ++i) session_add_channel(s, NULL);
     for (int i = 0; i < 8; ++i) session_add_scene(s);
-    float buf[1024 * 2];
+    static float buf[1024 * 16];
     long checks = 0;
     undo_reset(s);
     bool conc = getenv("CONCURRENT") != NULL;
@@ -62,7 +99,7 @@ int main(int argc, char **argv)
         int nc = s->channel_count, ns = s->scene_count;
         int ch = nc > 0 ? R(nc + 1) - (R(20) == 0) : 0;      /* sometimes out of bounds */
         int sc = ns > 0 ? R(ns + 1) - (R(20) == 0) : 0;
-        int lastop = R(43);
+        int lastop = R(56);
         switch (lastop) {
         case 0: case 1: case 2: session_set_clip(s, ch, sc, files[R(nf)]); break;
         case 3: case 4: case 5: session_toggle_clip(s, ch, sc); break;
@@ -130,6 +167,37 @@ int main(int argc, char **argv)
                    session_set_wave_scroll(s, ch, sc, (size_t)sc0);
                    session_set_wave_zoom(s, ch, sc, (float)(R(1000)) / 100.0f); break; }
         case 42: if (nc > 1) session_move_channel(s, R(nc), R(nc)); break;
+        /* 2.1: the newer parts */
+        case 43: { SurSetup su;
+                   if (R(4) == 0) session_set_surround(s, ch, NULL);
+                   else { rand_setup(&su, nout); session_set_surround(s, ch, &su); }
+                   break; }
+        case 44: { SurPt p[SUR_MAX_PTS]; int n = R(5) == 0 ? 0 : 1 + R(12);
+                   for (int i = 0; i < n; ++i) { p[i].t = (float)R(4000) / 100.0f - 1.0f; p[i].az = (float)R(800) - 400.0f;
+                       p[i].spread = (float)R(120) / 100.0f; p[i].x = (float)R(40) - 20; p[i].y = (float)R(40) - 5; p[i].w = (float)R(30); }
+                   if (R(10) == 0 && n) p[R(n)].az = NAN;
+                   session_clip_set_sur_points(s, ch, sc, p, n); break; }
+        case 45: if (mcf) { session_load_mc_next(R(3), R(nout + 4), R(2) ? mcf : NULL); session_set_clip(s, ch, sc, mcf); } break;
+        case 46: if (R(2)) session_clip_set_mc_out(s, ch, sc, R(20) - 2);
+                 else session_clip_set_mc_map(s, ch, sc, R(18) - 1, R(3) == 0 ? SUR_MUTED : R(2) ? 0 : 1ull << R(62));
+                 break;
+        case 47: if (mcf && R(3) == 0) session_clip_set_mc(s, ch, sc, R(4) - 1, R(2) ? mcf : files[R(nf)], R(2) ? mcf : NULL); break;
+        case 48: switch (R(4)) { case 0: session_set_clip_pitch(s, ch, sc, (float)R(50) - 25.0f); break;
+                                 case 1: session_set_clip_formants(s, ch, sc, R(2)); break;
+                                 case 2: session_set_clip_gain(s, ch, sc, (float)R(100) - 70.0f); break;
+                                 default: session_set_clip_pan(s, ch, sc, (float)R(300) / 100.0f - 1.5f); } break;
+        case 49: switch (R(3)) { case 0: session_transition_to(s, sc); break; case 1: session_transition_next(s); break; default: session_transition_back(s); } break;
+        case 50: if (R(2)) session_new_midi_clip(s, ch, sc, (float)(1 + R(32)), "m");
+                 else session_midi_set_text(s, ch, sc, R(2) ? "midi_len=4\nmn=0 0.5 60 100\nmn=1 0.25 64 90\nmn=2.5 1 67 80\n" : "x y z");
+                 break;
+        case 51: session_midi_play_from(s, ch, sc, (double)R(64) / 4.0 - 1.0); break;
+        case 52: session_clip_bpm_reset(s, ch, sc); break;
+        case 53: if (R(3) == 0) session_play_scene_now(s, sc);
+                 else if (R(2)) session_stop_clip(s, ch, sc);
+                 else session_play_clip_from(s, ch, sc, (size_t)R(600000));
+                 break;
+        case 54: if (!conc) { static const int NO[] = { 2, 2, 4, 6, 8, 10, 16 }; nout = NO[R(7)]; } break;
+        case 55: session_midi_tick(s); session_midi_reap(s); if (R(40) == 0) session_midi_panic(s); break;
         case 40: { char *t = session_clip_edits_text(s, ch, sc);
                    if (t && R(2)) session_clip_set_edits_text(s, R(nc + 1), R(ns + 1), t);   /* "copy" into another cell */
                    free(t); break; }
@@ -149,8 +217,8 @@ int main(int argc, char **argv)
         if (conc) { nap(1000 + R(4000)); if (atomic_load(&g_bad)) { printf("FAIL: bad sample (audio thread) iter %d\n", it); return 1; } }
         unsigned n = (unsigned)(64 << R(5));                 /* 64..1024 */
         for (int b = 0; b < blocks; ++b) {
-            mixer_render(s, buf, n, 2);
-            for (unsigned i = 0; i < n * 2; ++i) {
+            mixer_render(s, buf, n, nout);
+            for (unsigned i = 0; i < n * (unsigned)nout; ++i) {
                 float v = buf[i];
                 if (!isfinite(v) || v > 1.0001f || v < -1.0001f) {
                     printf("FAIL: bad sample %g at iter %d\n", v, it); return 1;

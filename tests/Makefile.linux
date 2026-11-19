@@ -17,6 +17,28 @@ $(DATA)/tone.wav:
 	python3 gen_test_audio.py $(DATA)
 	python3 gen_tone.py $(DATA)/tone.wav
 
+# 1.4.2: the controller buttons (learning, presses, jog wheels, controls.conf)
+test_midimap: test_midimap.c $(SRC)/midimap.c
+	$(CC) $(CFLAGS) $(SAN) -I$(SRC) $^ -o $@
+
+# 1.4.11: the loudness meter (EBU Tech 3341 cases)
+test_loudness: test_loudness.c $(SRC)/peaks.c $(SRC)/stream_sndfile.c $(SRC)/stream_resample.c
+	$(CC) $(CFLAGS) -O2 -g $(SAN) -I$(SRC) $^ $(LIBS) -o $@ -lm -lpthread
+
+# 1.4.7: the quality of the sample rate converter (flat 0..20 kHz, >= 120 dB clean)
+test_resample: test_resample.c $(SRC)/stream_resample.c
+	$(CC) -std=c11 -Wall -Wextra -O2 -g $(SAN) -I$(SRC) $^ -o $@ -lm -lpthread
+
+# 1.4.6: several MIDI inputs at once (src/midi.cpp + a fake RtMidi: devices plugged in / pulled out, midi.conf)
+test_midiports: test_midiports.cpp $(SRC)/midi.cpp $(SRC)/midiq.c
+	$(CC) -std=c11 -Wall -Wextra -O1 -g $(SAN) -c $(SRC)/midiq.c -o midiq_mp.o
+	$(CXX) -std=c++17 -Wall -Wextra -O1 -g $(SAN) -Ifake_rtmidi -I$(SRC) test_midiports.cpp $(SRC)/midi.cpp midiq_mp.o -o $@
+	rm -f midiq_mp.o
+
+# 1.4.14: the format from the file's content (an .m4a named .mp3 ...); the files are made with ffmpeg
+test_sniff: test_sniff.c $(SRC)/stream_sndfile.c $(SRC)/stream_resample.c
+	$(CC) $(CFLAGS) $(SAN) -I$(SRC) $^ $(LIBS) -o $@
+
 test_stretch: test_stretch.c $(SRC)/stretch.c
 	gcc $(CFLAGS) -O2 $^ -lm -o $@
 
@@ -27,47 +49,118 @@ RB := ../third_party/rubberband
 rb.o: $(RB)/single/RubberBandSingle.cpp
 	g++ -std=c++14 -O3 -ffast-math -w -c $< -o $@
 
+# 1.4.13: the pitch engine (an archive, so the "rm *.o" after each test does not remove it)
+SS_INC := -I../third_party/signalsmith -I../third_party/signalsmith/linear/include
+pshift.a: $(SRC)/pitchshift.cpp $(SRC)/pitchshift.h ../third_party/signalsmith/signalsmith-stretch.h
+	g++ -std=c++11 -O3 -ffast-math -Wall -Wextra $(SS_INC) -I$(SRC) -c $(SRC)/pitchshift.cpp -o pshift_tmp.o
+	ar rcs $@ pshift_tmp.o && rm -f pshift_tmp.o
+
+# 1.4.13: the quality of the pitch shifter (exact pitch, clean chords / high tones, formants, with warp)
+test_pitch: test_pitch.c $(SRC)/stretch.c rb.o pshift.a
+	gcc -std=c11 -Wall -Wextra -O2 -g -DHAVE_RUBBERBAND -I$(RB) -I$(SRC) test_pitch.c $(SRC)/stretch.c rb.o pshift.a -lstdc++ -lpthread -lm -o $@
+
+# 1.4.14: vocal separation end to end (needs the model + the ONNX Runtime archive: make sep SEPDIR=<folder>)
+ORT_INC := -I../third_party/onnxruntime/include
+qlim-separate: $(SRC)/sep/qlim_separate.c
+	gcc -std=c11 -O2 -Wall $(ORT_INC) $(shell pkg-config --cflags sndfile) $< $(LIBS) -ldl -o $@
+SEP_SRC = test_separate.c $(ENGINE_SRC) $(SRC)/export.c $(SRC)/separate.c
+test_separate: $(SEP_SRC) rb.o pshift.a
+	gcc $(CFLAGS) -O2 -DHAVE_RUBBERBAND -I$(RB) -c $(SEP_SRC)
+	g++ $(patsubst %.c,%.o,$(notdir $(SEP_SRC))) rb.o pshift.a $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+sep: qlim-separate test_separate
+	python3 gen_sep_audio.py /tmp/qlim_sep_audio
+	cd /tmp && $(CURDIR)/test_separate $(CURDIR)/qlim-separate $(SEPDIR) /tmp/qlim_sep_audio/mix.wav /tmp/qlim_sep_audio/voice.wav | grep -E "^(ok|FAIL|SEPARATE|      )"
+
+# 1.4.17: a clip with N separated parts: solo / mute / levels, MIDI CC, project lines, split to clips (no model)
+STEMS_SRC = test_stems.c $(ENGINE_SRC) $(SRC)/export.c
+test_stems: $(STEMS_SRC) rb.o pshift.a
+	gcc $(CFLAGS) -O2 -DHAVE_RUBBERBAND -I$(RB) -c $(STEMS_SRC)
+	g++ $(patsubst %.c,%.o,$(notdir $(STEMS_SRC))) rb.o pshift.a $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# 1.4.17: scene transitions, "Stop automations", launches at a clock time
+TR_SRC = test_transition.c $(ENGINE_SRC) $(SRC)/export.c
+test_transition: $(TR_SRC) rb.o pshift.a
+	gcc $(CFLAGS) -O2 -DHAVE_RUBBERBAND -I$(RB) -c $(TR_SRC)
+	g++ $(patsubst %.c,%.o,$(notdir $(TR_SRC))) rb.o pshift.a $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# 1.4.19: surround (the panning law, the automation, the mixer through 4 / 8 outputs, the project)
+SUR_SRC = test_surround.c $(ENGINE_SRC) $(SRC)/export.c
+MC_SRC = test_mc.c $(ENGINE_SRC) $(SRC)/export.c
+test_mc: $(MC_SRC) rb.o pshift.a
+	gcc $(CFLAGS) -O2 -DHAVE_RUBBERBAND -I$(RB) -c $(MC_SRC)
+	g++ $(patsubst %.c,%.o,$(notdir $(MC_SRC))) rb.o pshift.a $(LIBS) -o $@
+
+# 2.1: save -> open -> save gives the same file, with every newer feature
+RT_SRC = test_roundtrip.c $(ENGINE_SRC)
+test_roundtrip: $(RT_SRC) rb.o pshift.a
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(RT_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(RT_SRC))) rb.o pshift.a $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# 2.1: Collect All & Save also takes a surround path's original and the separated parts
+COLLECT_SRC = test_collect.c $(ENGINE_SRC)
+test_collect: $(COLLECT_SRC) rb.o pshift.a
+	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(COLLECT_SRC)
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(COLLECT_SRC))) rb.o pshift.a $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+test_surround: $(SUR_SRC) rb.o pshift.a
+	gcc $(CFLAGS) -O2 -DHAVE_RUBBERBAND -I$(RB) -c $(SUR_SRC)
+	g++ $(patsubst %.c,%.o,$(notdir $(SUR_SRC))) rb.o pshift.a $(LIBS) -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+
+# 1.4.21: extra sound cards (drifting clocks, other rates, Bluetooth-like blocks, the delays, the config file)
+test_outx: test_outx.c $(SRC)/outx.c
+	gcc $(CFLAGS) -O2 $(SAN) $^ -lm -o $@
+
+# 1.4.14: audio export (markers, cuts, gain/pan, warp, pitch, rates, every format, dither, the job)
+test_export: test_export.c $(SRC)/export.c $(SRC)/surround.c $(SRC)/mcfile.c $(SRC)/edit.c $(SRC)/stretch.c $(SRC)/stream_sndfile.c $(SRC)/stream_resample.c rb.o pshift.a
+	gcc -std=c11 -Wall -Wextra -O2 -g -DHAVE_RUBBERBAND -I$(RB) -I$(SRC) $(shell pkg-config --cflags sndfile) $^ $(LIBS) -lstdc++ -lpthread -lm -o $@
+
 TEMPO_SRC := test_tempo.c $(SRC)/session.c $(SRC)/mixer.c $(SRC)/midiq.c $(SRC)/smf.c $(SRC)/stream.c $(SRC)/stream_sndfile.c \
-             $(SRC)/stream_resample.c $(SRC)/peaks.c $(SRC)/wav.c $(SRC)/diskinfo.c $(SRC)/project.c \
+             $(SRC)/stream_resample.c $(SRC)/peaks.c $(SRC)/wav.c $(SRC)/diskinfo.c $(SRC)/project.c $(SRC)/schedule.c $(SRC)/surround.c $(SRC)/mcfile.c \
              $(SRC)/undo.c $(SRC)/bpm.c $(SRC)/stretch.c $(SRC)/edit.c plug_stub.c
-test_tempo: $(TEMPO_SRC) rb.o
+test_tempo: $(TEMPO_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(TEMPO_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(TEMPO_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(TEMPO_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
 REC_SRC := test_rec.c $(filter-out test_tempo.c,$(TEMPO_SRC))
-test_rec: $(REC_SRC) rb.o
+test_rec: $(REC_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(REC_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(REC_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(REC_SRC))) rb.o pshift.a $(LIBS) -o $@
 QUEUE_SRC := test_queue.c $(filter-out test_tempo.c,$(TEMPO_SRC))
 QUANT_SRC := test_quant.c $(filter-out test_tempo.c,$(TEMPO_SRC))
-test_quant: $(QUANT_SRC) rb.o
+test_quant: $(QUANT_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(QUANT_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(QUANT_SRC))) rb.o $(LIBS) -o $@
-test_queue: $(QUEUE_SRC) rb.o
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(QUANT_SRC))) rb.o pshift.a $(LIBS) -o $@
+test_queue: $(QUEUE_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(QUEUE_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(QUEUE_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(QUEUE_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
 XFADE_SRC := test_xfade.c $(filter-out test_tempo.c,$(TEMPO_SRC))
-test_xfade: $(XFADE_SRC) rb.o
+test_xfade: $(XFADE_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(XFADE_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(XFADE_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(XFADE_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
 # ===== Stress tests (step 21): make stress  (long, ~15-30 min; everything with ASan/UBSan) =====
 ENGINE_SRC := $(filter-out test_tempo.c,$(TEMPO_SRC))
-fuzz_engine: fuzz_engine.c $(ENGINE_SRC) rb.o
+fuzz_engine: fuzz_engine.c $(ENGINE_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c fuzz_engine.c $(ENGINE_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir fuzz_engine.c $(ENGINE_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir fuzz_engine.c $(ENGINE_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-fuzz_project: fuzz_project.c $(ENGINE_SRC) rb.o
+fuzz_project: fuzz_project.c $(ENGINE_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c fuzz_project.c $(ENGINE_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir fuzz_project.c $(ENGINE_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir fuzz_project.c $(ENGINE_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-test_edge: test_edge.c $(ENGINE_SRC) rb.o
+test_edge: test_edge.c $(ENGINE_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c test_edge.c $(ENGINE_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir test_edge.c $(ENGINE_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir test_edge.c $(ENGINE_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 gen_odd_audio: gen_odd_audio.c
 	gcc $(CFLAGS) $< $(LIBS) -o $@
@@ -84,14 +177,14 @@ stress: fuzz_engine fuzz_project test_edge gen_odd_audio $(DATA)/tone.wav
 
 LOOP_SRC := test_loop.c $(filter-out test_tempo.c,$(TEMPO_SRC))
 WARPSW_SRC := test_warpsw.c $(filter-out test_tempo.c,$(TEMPO_SRC))
-test_warpsw: $(WARPSW_SRC) rb.o
+test_warpsw: $(WARPSW_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(WARPSW_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(WARPSW_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(WARPSW_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
-test_loop: $(LOOP_SRC) rb.o
+test_loop: $(LOOP_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(LOOP_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(LOOP_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(LOOP_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
 # step 27: cutting
@@ -100,82 +193,101 @@ fuzz_edit: fuzz_edit.c $(SRC)/edit.c $(SRC)/edit.h
 test_edit: test_edit.c $(SRC)/edit.c $(SRC)/edit.h
 	gcc $(CFLAGS) $(SAN) test_edit.c $(SRC)/edit.c -lm -o $@
 CUT_SRC := test_cut.c $(filter-out test_tempo.c,$(TEMPO_SRC))
-test_cut: $(CUT_SRC) rb.o
+test_cut: $(CUT_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(CUT_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(CUT_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(CUT_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
 # step 36: exact level (0 dB = the file), the new fader, moving channels
 LEVEL_SRC := test_level.c $(filter-out test_tempo.c,$(TEMPO_SRC))
 TRIM_SRC := test_trimrace.c $(filter-out test_tempo.c,$(TEMPO_SRC))
-test_trimrace: $(TRIM_SRC) rb.o
+test_trimrace: $(TRIM_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(TRIM_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(TRIM_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(TRIM_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-test_level: $(LEVEL_SRC) rb.o
+test_level: $(LEVEL_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(LEVEL_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(LEVEL_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(LEVEL_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
 # step 28: mixer graph mode (PipeWire)
 GRAPH_SRC := test_graph.c $(filter-out test_tempo.c,$(TEMPO_SRC))
-test_graph: $(GRAPH_SRC) rb.o
+test_graph: $(GRAPH_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) -DHAVE_RUBBERBAND -I$(RB) -c $(GRAPH_SRC)
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(GRAPH_SRC))) rb.o $(LIBS) -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(GRAPH_SRC))) rb.o pshift.a $(LIBS) -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
 
 # step 34: plugins on the channel (needs the QTestGain test plugins: make test_fx QTEST=<folder>)
 PLUG_INC := -I../third_party/lv2 -I../third_party/lilv -I../third_party/clap/include -I../third_party/vst3
 SDL_FL := $(shell pkg-config --cflags sdl2)
 SDL_LB := $(shell pkg-config --libs sdl2) -lX11
-FX_SRC := test_fx.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
-test_fx: $(FX_SRC) rb.o
+FX_SRC := test_fx.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fx: $(FX_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FX_SRC)
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FX_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FX_SRC))) host_vst3.o rb.o pshift.a $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-FXR_SRC := test_fxrace.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
-test_fxrace: $(FXR_SRC) rb.o
+FXR_SRC := test_fxrace.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fxrace: $(FXR_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FXR_SRC)
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXR_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXR_SRC))) host_vst3.o rb.o pshift.a $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-FXW_SRC := test_fxwait.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
-test_fxwait: $(FXW_SRC) rb.o waitplug/waitplug.c
+FXW_SRC := test_fxwait.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fxwait: $(FXW_SRC) rb.o pshift.a waitplug/waitplug.c
 	gcc -shared -fPIC -O2 -I../third_party/clap/include waitplug/waitplug.c -o waitplug/waitplug.clap
 	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FXW_SRC)
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXW_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXW_SRC))) host_vst3.o rb.o pshift.a $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-FXS_SRC := test_fxslow.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
-test_fxslow: $(FXS_SRC) rb.o waitplug/slowplug.c
+FXS_SRC := test_fxslow.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_fxslow: $(FXS_SRC) rb.o pshift.a waitplug/slowplug.c
 	gcc -shared -fPIC -O2 -I../third_party/clap/include waitplug/slowplug.c -o waitplug/slowplug.clap
 	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FXS_SRC)
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXS_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXS_SRC))) host_vst3.o rb.o pshift.a $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
+# 2.0.0: plugins in a separate process (the test plugin is built here from tests/bridgeplug)
+BRIDGE_SRC := test_bridge.c fx_stubs.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_bridge: $(BRIDGE_SRC) bridgeplug/qtest_bridge.c
+	gcc -std=c11 -O1 -g -fPIC -shared $(PLUG_INC) bridgeplug/qtest_bridge.c -o qtest_bridge.clap
+	rm -rf qtest_gtk.lv2 && cp -r bridgeplug/qtest_gtk.lv2 . && gcc -std=c11 -O1 -fPIC -shared $(PLUG_INC) bridgeplug/qtest_gtk.c -o qtest_gtk.lv2/qtest_gtk.so -ldl
+	gcc $(CFLAGS) $(PLUG_INC) $(SDL_FL) -c $(BRIDGE_SRC)
+	g++ -std=c++17 -O1 -g -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(patsubst %.c,%.o,$(notdir $(BRIDGE_SRC))) host_vst3.o $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+bridge: test_bridge
+	cd /tmp && $(CURDIR)/test_bridge $(CURDIR)/qtest_bridge.clap $(CURDIR)/qtest_gtk.lv2 | grep -E "^(ok|FAIL|BRIDGE)"
 # 1.2: instruments (MIDI in, parameters): make inst INSTDIR=<folder with the DPF Kars/Nekobi plugins>
-INST_SRC := test_inst.c fx_stubs.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+INST_SRC := test_inst.c fx_stubs.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
 test_inst: $(INST_SRC)
 	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -c $(INST_SRC)
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
 	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(INST_SRC))) host_vst3.o $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-INSTMIX_SRC := test_instmix.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
-test_instmix: $(INSTMIX_SRC) rb.o
+INSTMIX_SRC := test_instmix.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_instmix: $(INSTMIX_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(INSTMIX_SRC)
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(INSTMIX_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(INSTMIX_SRC))) host_vst3.o rb.o pshift.a $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-MIDICLIP_SRC := test_midiclip.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
-test_midiclip: $(MIDICLIP_SRC) rb.o
+MIDICLIP_SRC := test_midiclip.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+test_midiclip: $(MIDICLIP_SRC) rb.o pshift.a
 	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(MIDICLIP_SRC)
 	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
-	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(MIDICLIP_SRC))) host_vst3.o rb.o $(LIBS) $(SDL_LB) -ldl -o $@
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(MIDICLIP_SRC))) host_vst3.o rb.o pshift.a $(LIBS) $(SDL_LB) -ldl -o $@
 	rm -f $(filter-out rb.o,$(wildcard *.o))
-inst: test_inst test_instmix test_midiclip
+FXMIDI_SRC := test_fxmidi.c fx_stubs.c $(filter-out plug_stub.c,$(ENGINE_SRC)) $(SRC)/fxchain.c $(SRC)/plughost.c $(SRC)/plugbridge.c $(SRC)/host_vst2.c $(SRC)/host_clap.c $(SRC)/host_lv2.c $(SRC)/plugwin.c
+# 1.4.14: MIDI Learn of plugin parameters (Nekobi in all 4 formats)
+test_fxmidi: $(FXMIDI_SRC) rb.o pshift.a
+	gcc $(CFLAGS) $(SAN) $(PLUG_INC) $(SDL_FL) -DHAVE_RUBBERBAND -I$(RB) -c $(FXMIDI_SRC)
+	g++ -std=c++17 -O1 -g $(SAN) -fno-sanitize=vptr -w $(PLUG_INC) -c $(SRC)/host_vst3.cpp
+	g++ $(SAN) $(patsubst %.c,%.o,$(notdir $(FXMIDI_SRC))) host_vst3.o rb.o pshift.a $(LIBS) $(SDL_LB) -ldl -o $@
+	rm -f $(filter-out rb.o,$(wildcard *.o))
+inst: test_inst test_instmix test_midiclip test_fxmidi
 	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_inst $(INSTDIR) | grep -E "^(ok|FAIL|INST|      )"
 	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_instmix $(INSTDIR) | grep -E "^(ok|FAIL|INSTMIX)"
+	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_fxmidi $(INSTDIR) | grep -E "^(ok|FAIL|FXMIDI)"
 	cd /tmp && ASAN_OPTIONS=detect_leaks=0 $(CURDIR)/test_midiclip $(INSTDIR) | grep -E "^(ok|FAIL|MIDICLIP)"
 
 fx: test_fx test_fxrace test_fxwait test_fxslow
@@ -187,7 +299,21 @@ fx: test_fx test_fxrace test_fxwait test_fxslow
 test_applog: test_applog.c $(SRC)/applog.c
 	gcc $(CFLAGS) $^ -lpthread -o $@
 
-test: test_applog test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_stretch test_bpm test_tempo test_queue test_quant test_rec test_xfade test_loop test_warpsw $(DATA)/tone.wav
+test: test_bridge test_roundtrip test_collect test_sniff test_export test_stems test_transition test_surround test_mc test_outx test_pitch test_midimap test_resample test_loudness test_applog test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_stretch test_bpm test_tempo test_queue test_quant test_rec test_xfade test_loop test_warpsw $(DATA)/tone.wav
+	./test_midimap
+	cd /tmp && $(CURDIR)/test_bridge $(CURDIR)/qtest_bridge.clap $(CURDIR)/qtest_gtk.lv2 | grep -E "^(FAIL|BRIDGE)"
+	sh gen_sniff.sh /tmp/qlim_sniff && ./test_sniff /tmp/qlim_sniff | grep -E "^(FAIL|SNIFF)"
+	./test_export | grep -E "^(ok|FAIL|EXPORT)"
+	./test_stems | grep -E "^(ok|FAIL|STEMS)"
+	./test_transition | grep -E "^(ok|FAIL|TRANSITION)"
+	./test_surround | grep -E "^(ok|FAIL|SURROUND)"
+	./test_mc | grep -E "^(ok|FAIL|MC)"
+	cd /tmp && $(CURDIR)/test_collect | grep -E "^(ok|FAIL|COLLECT)"
+	cd /tmp && $(CURDIR)/test_roundtrip | grep -E "^(ok|FAIL|ROUNDTRIP|   )"
+	./test_outx | grep -E "^(ok|FAIL|OUTX)"
+	./test_pitch | grep -E "^(ok|FAIL|PITCH)"
+	./test_resample | tail -1
+	./test_loudness | tail -1
 	./test_applog
 	./test_edit | grep -E "^(ok|FAIL|EDIT)"
 	./fuzz_edit 1500
@@ -218,4 +344,4 @@ pwcheck: test_pw
 	./test_pw check $(or $(PW_OUT),-) $(or $(PW_RATE),48000) $(or $(PW_BUF),256)
 
 clean:
-	rm -f test_pw test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_applog test_stretch test_bpm test_tempo test_queue test_quant test_rec test_xfade test_loop test_warpsw test_fx test_fxrace test_fxwait test_fxslow test_inst test_instmix test_midiclip fuzz_engine fuzz_project test_edge gen_odd_audio *.o
+	rm -f pshift.a qlim-separate test_collect test_roundtrip test_separate test_stems test_transition test_surround test_mc test_outx test_fxmidi test_sniff test_export test_pitch test_pw test_edit fuzz_edit test_trimrace test_cut test_level test_graph test_applog test_stretch test_bpm test_tempo test_queue test_quant test_rec test_xfade test_loop test_warpsw test_fx test_fxrace test_fxwait test_fxslow test_bridge qtest_bridge.clap qtest_gtk.lv2 test_inst test_instmix test_midiclip test_fxmidi fuzz_engine fuzz_project test_edge gen_odd_audio *.o

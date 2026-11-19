@@ -1,0 +1,21 @@
+# Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE)
+@prefix lv2:  <http://lv2plug.in/ns/lv2core#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix ui:   <http://lv2plug.in/ns/extensions/ui#> .
+@prefix doap: <http://usefulinc.com/ns/doap#> .
+
+<urn:qlim:test:gtk>
+    a lv2:Plugin, lv2:AmplifierPlugin ;
+    lv2:binary <qtest_gtk.so> ;
+    doap:name "QTestGtk" ;
+    ui:ui <urn:qlim:test:gtk#ui> ;
+    lv2:port [ a lv2:AudioPort, lv2:InputPort ; lv2:index 0 ; lv2:symbol "in_l" ; lv2:name "In L" ] ,
+             [ a lv2:AudioPort, lv2:InputPort ; lv2:index 1 ; lv2:symbol "in_r" ; lv2:name "In R" ] ,
+             [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 2 ; lv2:symbol "out_l" ; lv2:name "Out L" ] ,
+             [ a lv2:AudioPort, lv2:OutputPort ; lv2:index 3 ; lv2:symbol "out_r" ; lv2:name "Out R" ] ,
+             [ a lv2:ControlPort, lv2:InputPort ; lv2:index 4 ; lv2:symbol "gain" ; lv2:name "Gain" ;
+               lv2:default 0.5 ; lv2:minimum 0.0 ; lv2:maximum 1.0 ] .
+
+<urn:qlim:test:gtk#ui>
+    a ui:Gtk3UI ;
+    ui:binary <qtest_gtk.so> .

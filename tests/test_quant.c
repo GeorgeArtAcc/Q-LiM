@@ -6,6 +6,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "../src/session.h"
 #include "../src/mixer.h"
+#include "../src/project.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,6 +163,139 @@ int main(int argc, char **argv)
     session_toggle_mute(s, 0);
     session_stop_all(s);
     run_to(s, tape_len / (double)SR + 0.1);
+
+    /* 9) 1.4.8: the time signature. 7/8 at 120 BPM: a bar = 3.5 quarter beats = 1.75 s; "1 Bar" follows it */
+    session_set_clip_warp(s, 1, 0, false);
+    session_set_quant_mode(s, QUANT_BAR);
+    CHECK(session_set_time_sig(s, 7, 8) == 0 && fabs(session_get_quantize(s) - 3.5f) < 1e-6, "7/8: 1 Bar = 3.5 beats (%.3f)", session_get_quantize(s));
+    CHECK(session_set_time_sig(s, 7, 6) != 0 && session_set_time_sig(s, 0, 4) != 0 && session_set_time_sig(s, 33, 4) != 0, "invalid signatures refused");
+    { int n, d; session_get_time_sig(s, &n, &d); CHECK(n == 7 && d == 8, "still 7/8 after the refused ones"); }
+    session_set_quant_mode(s, QUANT_BEAT);
+    CHECK(fabs(session_get_quantize(s) - 0.5f) < 1e-6, "7/8: 1 Beat = an eighth (%.3f)", session_get_quantize(s));
+    session_set_quant_mode(s, QUANT_2BARS);
+    CHECK(fabs(session_get_quantize(s) - 7.0f) < 1e-6, "7/8: 2 Bars = 7 beats");
+    session_set_quant_mode(s, QUANT_BAR);
+    session_set_tempo(s, 120.0f);
+    session_toggle_mute(s, 0);
+    session_toggle_clip(s, 0, 0);               /* beat 1 (muted): the transport starts */
+    run_to(s, tape_len / (double)SR + 0.6);
+    CHECK(session_transport(s, &beats), "transport running in 7/8");
+    double tb = tape_len / (double)SR + (3.5 - beats) * 0.5;   /* the next 7/8 bar line */
+    mark = tape_len;
+    session_toggle_clip(s, 1, 0);
+    run_to(s, tb + 0.3);
+    on = first_sound(mark, tape_len);
+    CHECK(on != (size_t)-1 && fabs(on / (double)SR - tb) < 0.001, "7/8: the clip starts on the bar line %.4f s (want %.4f)", on / (double)SR, tb);
+    session_toggle_mute(s, 0);
+    session_stop_all(s);
+    run_to(s, tape_len / (double)SR + 0.1);
+    /* the old way of setting it (a number of beats, old projects) finds the mode in the signature */
+    session_set_time_sig(s, 4, 4);
+    session_set_quantize(s, 2.0f);
+    CHECK(session_get_quant_mode(s) == QUANT_HALF_BAR, "4/4: 2 beats = 1/2 Bar");
+    session_set_quantize(s, 3.0f);
+    CHECK(session_get_quant_mode(s) == -1 && session_get_quantize(s) == 3.0f, "3 beats in 4/4: kept as a number");
+
+    /* 10) the metronome in 7/8: a click every eighth (0.25 s at 120 BPM), the loud one every 7th */
+    session_set_quant_mode(s, QUANT_BAR);
+    session_set_time_sig(s, 7, 8);
+    for (int c = 0; c < s->channel_count; ++c) session_toggle_mute(s, c);   /* only the clicks */
+    atomic_store(&s->metronome, true);
+    session_toggle_clip(s, 0, 0);
+    size_t m0 = tape_len;
+    run_to(s, tape_len / (double)SR + 3.6);     /* 2 bars + */
+    atomic_store(&s->metronome, false);
+    {
+        size_t on_at[64]; float pk[64]; int nk = 0;
+        for (size_t i = m0; i < tape_len && nk < 64; ) {
+            if (fabsf(tape[i]) > 0.02f) {
+                float p = 0; for (size_t j = i; j < i + 2000 && j < tape_len; ++j) if (fabsf(tape[j]) > p) p = fabsf(tape[j]);
+                on_at[nk] = i; pk[nk] = p; ++nk; i += SR / 10;
+            } else ++i;
+        }
+        CHECK(nk >= 14, "metronome: %d clicks in 3.6 s (want >= 14)", nk);
+        bool even = true, acc_ok = true;
+        for (int k = 1; k < nk; ++k) if (fabs((double)(on_at[k] - on_at[k - 1]) / SR - 0.25) > 0.003) even = false;
+        for (int k = 0; k < nk; ++k) { bool loud = pk[k] > 0.45f; if (loud != (k % 7 == 0)) acc_ok = false; }
+        CHECK(even, "metronome: every eighth (0.25 s)");
+        CHECK(acc_ok, "metronome: the accent on every 7th click (the 1 of the 7/8 bar)");
+    }
+    for (int c = 0; c < s->channel_count; ++c) session_toggle_mute(s, c);
+    session_stop_all(s);
+    run_to(s, tape_len / (double)SR + 0.1);
+    /* 12) 1.4.9: the clip's own gain and pan. Channel 1 alone, clip (0,0): 0 dB / C = bit exact, -6 dB, full left */
+    {
+        session_stop_all(s);
+        run_to(s, tape_len / (double)SR + 0.1);
+        session_set_quant_mode(s, QUANT_NOW);
+        session_toggle_mute(s, 1);
+        session_toggle_clip(s, 0, 0);
+        float b0[BLK * 2], b1[BLK * 2];
+        double e0 = 0, e1 = 0, eL = 0, eR = 0;
+        for (int k = 0; k < 40; ++k) mixer_render(s, b0, BLK, 2);      /* past the fade-in */
+        for (int k = 0; k < 20; ++k) { mixer_render(s, b0, BLK, 2); for (int i = 0; i < BLK; ++i) e0 += (double)b0[2*i] * b0[2*i]; }
+        session_set_clip_gain(s, 0, 0, -6.0f);
+        CHECK(fabsf(session_get_clip_gain(s, 0, 0) + 6.0f) < 1e-6, "clip gain set to -6 dB");
+        mixer_render(s, b1, BLK, 2);                                  /* the glide */
+        for (int k = 0; k < 20; ++k) { mixer_render(s, b1, BLK, 2); for (int i = 0; i < BLK; ++i) e1 += (double)b1[2*i] * b1[2*i]; }
+        double db = 10 * log10(e1 / e0);
+        CHECK(fabs(db + 6.0) < 0.3, "clip gain -6 dB -> level %.2f dB", db);
+        session_set_clip_gain(s, 0, 0, 0.0f);
+        session_set_clip_pan(s, 0, 0, -1.0f);
+        mixer_render(s, b1, BLK, 2);
+        for (int k = 0; k < 20; ++k) { mixer_render(s, b1, BLK, 2); for (int i = 0; i < BLK; ++i) { eL += (double)b1[2*i] * b1[2*i]; eR += (double)b1[2*i+1] * b1[2*i+1]; } }
+        CHECK(eR < 1e-9 && fabs(10 * log10(eL / e0)) < 0.3, "clip pan full left: right silent, left as before (%.2f dB)", 10 * log10(eL / e0));
+        session_set_clip_pan(s, 0, 0, 0.0f);
+        session_set_clip_gain(s, 0, 0, -100.0f);
+        CHECK(session_get_clip_gain(s, 0, 0) == CLIP_GAIN_MIN_DB, "clip gain clamps at -60 (= silence)");
+        session_set_clip_gain(s, 0, 0, 0.0f);
+        for (int k = 0; k < 2; ++k) mixer_render(s, b1, BLK, 2);
+        CHECK(project_save(s, "/tmp/qlim_cgain.limproject") == 0, "saved");
+        session_set_clip_gain(s, 0, 0, 3.5f); session_set_clip_pan(s, 0, 0, 0.25f);
+        CHECK(project_save(s, "/tmp/qlim_cgain2.limproject") == 0 && project_load(s, "/tmp/qlim_cgain2.limproject") == 0, "saved + loaded with gain/pan");
+        CHECK(fabsf(session_get_clip_gain(s, 0, 0) - 3.5f) < 0.01f && fabsf(session_get_clip_pan(s, 0, 0) - 0.25f) < 0.002f,
+              "clip gain/pan come back from the project (%.2f dB, %.3f)", session_get_clip_gain(s, 0, 0), session_get_clip_pan(s, 0, 0));
+        session_set_clip_gain(s, 0, 0, 0.0f); session_set_clip_pan(s, 0, 0, 0.0f);
+
+        /* 13) 1.4.11: loudness normalization - measured in the background, put into effect by session_update_loudness */
+        float lu = 0, pk = 0, nd = 0;
+        for (int w = 0; w < 400 && !session_clip_loudness(s, 0, 0, &lu, &pk, &nd); ++w) { struct timespec t = { 0, 10000000 }; nanosleep(&t, NULL); }
+        CHECK(session_clip_loudness(s, 0, 0, &lu, &pk, &nd) && isfinite(lu), "clip measured: %.2f LUFS, peak %.2f dBFS", lu, pk);
+        session_set_loudness(s, -30, false);                  /* a target below it: turned down by (lu + 30) */
+        session_clip_loudness(s, 0, 0, &lu, &pk, &nd);
+        CHECK(fabsf(nd - (-30.0f - lu)) < 0.02f, "normalization -30 LUFS: %.2f dB (want %.2f)", nd, -30.0f - lu);
+        session_toggle_clip(s, 0, 0);
+        double e2 = 0;
+        /* 2.0.0: in real time (like the sound card) - the disk thread needs a moment to bring the clip in */
+        for (int k = 0; k < 41; ++k) { mixer_render(s, b1, BLK, 2); struct timespec t = { 0, (long)BLK * 1000000000L / 48000 }; nanosleep(&t, NULL); }
+        for (int k = 0; k < 20; ++k) { mixer_render(s, b1, BLK, 2); for (int i = 0; i < BLK; ++i) e2 += (double)b1[2*i] * b1[2*i]; }
+        CHECK(fabs(10 * log10(e2 / e0) - nd) < 0.3, "normalized output %.2f dB (want %.2f)", 10 * log10(e2 / e0), nd);
+        session_set_loudness(s, -5, false);                   /* far above: turned up only to -1 dBFS peak */
+        session_clip_loudness(s, 0, 0, &lu, &pk, &nd);
+        CHECK(fabsf(nd - (-1.0f - pk)) < 0.02f || nd == 0.0f, "turned up only to a -1 dBFS peak (%.2f dB, peak %.2f)", nd, pk);
+        session_set_loudness(s, -5, true);
+        session_clip_loudness(s, 0, 0, &lu, &pk, &nd);
+        CHECK(nd == 0.0f, "down only: never up");
+        session_set_loudness(s, 0, false);
+        session_clip_loudness(s, 0, 0, &lu, &pk, &nd);
+        CHECK(nd == 0.0f, "off: 0 dB");
+        session_stop_all(s);
+        run_to(s, tape_len / (double)SR + 0.1);
+    }
+
+    /* 11) saved and loaded with the project (7/8, 2 Bars) */
+    session_set_time_sig(s, 7, 8);
+    session_set_quant_mode(s, QUANT_2BARS);
+    CHECK(project_save(s, "/tmp/qlim_timesig.limproject") == 0, "project saved");
+    session_set_time_sig(s, 4, 4);
+    session_set_quant_mode(s, QUANT_NOW);
+    CHECK(project_load(s, "/tmp/qlim_timesig.limproject") == 0, "project loaded");
+    { int n, d; session_get_time_sig(s, &n, &d);
+      CHECK(n == 7 && d == 8 && session_get_quant_mode(s) == QUANT_2BARS && fabs(session_get_quantize(s) - 7.0f) < 1e-6,
+            "the project brings back 7/8 and 2 Bars (%d/%d, mode %d, %.2f beats)", n, d, session_get_quant_mode(s), session_get_quantize(s)); }
+    session_stop_all(s);
+    run_to(s, tape_len / (double)SR + 0.1);
+    session_set_time_sig(s, 4, 4);
 
     session_free(s);
     free(tape);

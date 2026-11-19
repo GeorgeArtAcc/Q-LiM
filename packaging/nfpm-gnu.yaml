@@ -37,6 +37,7 @@ overrides:
       - libgcc-s1
     recommends:
       - libgl1
+      - zenity
     suggests:
       - pipewire
       - liblilv-0-0
@@ -48,6 +49,7 @@ overrides:
       - libgcc_s.so.1()(64bit)
     recommends:
       - mesa-libGL
+      - zenity
 deb:
   fields:
     Bugs: mailto:georgeartacc@proton.me

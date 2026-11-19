@@ -7,11 +7,8 @@ release: 1
 section: sound
 priority: optional
 maintainer: Georgi Stanimirov Ivanov <georgeartacc@proton.me>
-description: |
-  Q-LiM - live clip launcher.
-  Clips and scenes, queue with crossfade, non-destructive cutting, tempo (Rubber Band),
-  faders/routing, MIDI, VST3/VST2/LV2/CLAP plugins, direct PipeWire output.
-  SDL2, FreeType, libsndfile (MP3/FLAC/Ogg/Opus) and PortAudio are built in.
+# 2.0.0: ONE line - apk (v3, Alpine 3.23+) does not accept a description on several lines in .PKGINFO
+description: "Q-LiM - live clip launcher: clips and scenes, crossfade queue, tempo, MIDI, VST3/VST2/LV2/CLAP plugins"
 vendor: Georgi Stanimirov Ivanov
 homepage: https://github.com/GeorgeArtAcc/Q-LiM
 license: GPL-3.0-or-later
@@ -35,3 +32,4 @@ overrides:
       - libx11
       - libgcc
       - mesa-gl
+      - zenity
