@@ -6,10 +6,12 @@
 
 *Темата Graphite в стил Modern: клипове свирят (тънка линия показва докъде е стигнал всеки) и вълната на избрания клип.*
 
-| | | |
-|---|---|---|
-| [![Плъгини](docs/screenshots/plugins.png)](docs/screenshots/plugins.png) | [![Тема Paper](docs/screenshots/light.png)](docs/screenshots/light.png) | [![Стил Classic](docs/screenshots/classic.png)](docs/screenshots/classic.png) |
-| Прозорци на плъгини (LSP Parametric Equalizer, Vitalium) | Светлата тема Paper (спокойно сиво, никога ярко бяло) | Стилът Classic с темата Aurora |
+| | |
+|---|---|
+| [![Piano roll](docs/screenshots/pianoroll.png)](docs/screenshots/pianoroll.png) | [![Плъгини](docs/screenshots/plugins.png)](docs/screenshots/plugins.png) |
+| Темата OLED Black в стил Modern, с MIDI клип в редактора (piano roll) | Прозорци на плъгини (LSP Parametric Equalizer, Vitalium) |
+| [![Тема Paper](docs/screenshots/light.png)](docs/screenshots/light.png) | [![Стил Classic](docs/screenshots/classic.png)](docs/screenshots/classic.png) |
+| Светлата тема Paper (спокойно сиво, никога ярко бяло) | Стилът Classic с темата Aurora |
 
 *[Read in English](README.md)* · **[Ръководство](docs/MANUAL.bg.md)**
 

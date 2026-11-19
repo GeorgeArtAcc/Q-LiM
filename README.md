@@ -6,10 +6,12 @@
 
 *The Graphite theme in the Modern style: clips playing (a thin line shows how far each one is) and the waveform of the selected clip.*
 
-| | | |
-|---|---|---|
-| [![Plugins](docs/screenshots/plugins.png)](docs/screenshots/plugins.png) | [![Paper theme](docs/screenshots/light.png)](docs/screenshots/light.png) | [![Classic style](docs/screenshots/classic.png)](docs/screenshots/classic.png) |
-| Plugin windows (LSP Parametric Equalizer, Vitalium) | The light Paper theme (a calm grey, never bright white) | The Classic style with the Aurora theme |
+| | |
+|---|---|
+| [![Piano roll](docs/screenshots/pianoroll.png)](docs/screenshots/pianoroll.png) | [![Plugins](docs/screenshots/plugins.png)](docs/screenshots/plugins.png) |
+| The OLED Black theme in the Modern style, with a MIDI clip in the piano roll | Plugin windows (LSP Parametric Equalizer, Vitalium) |
+| [![Paper theme](docs/screenshots/light.png)](docs/screenshots/light.png) | [![Classic style](docs/screenshots/classic.png)](docs/screenshots/classic.png) |
+| The light Paper theme (a calm grey, never bright white) | The Classic style with the Aurora theme |
 
 *[Прочети на български](README.bg.md)* · **[User Manual](docs/MANUAL.md)**
 
