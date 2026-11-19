@@ -11,7 +11,11 @@ tests-win/out/
 tests/*
 !tests/*.c
 !tests/*.py
+!tests/*.sh
 !tests/Makefile.linux
 !tests/waitplug/
 tests/waitplug/*.clap
+!tests/bridgeplug/
+tests/bridgeplug/**/*.so
 __pycache__/
+build-win32/
