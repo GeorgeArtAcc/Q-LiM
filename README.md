@@ -73,13 +73,13 @@ Ready-made builds are on the [Releases](../../releases) page:
 
 | System | File | Install |
 |---|---|---|
-| Ubuntu, Linux Mint, Debian | `qlim_2.0.0-2_amd64.deb` | `sudo apt install ./qlim_2.0.0-2_amd64.deb` (or double-click it) |
-| Fedora, RHEL, openSUSE | `qlim-2.0.0-2.x86_64.rpm` | `sudo dnf install ./qlim-2.0.0-2.x86_64.rpm` |
-| Alpine Linux | `qlim_2.0.0-r2_x86_64.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r2_x86_64.apk` |
+| Ubuntu, Linux Mint, Debian | `qlim_2.0.0-3_amd64.deb` | `sudo apt install ./qlim_2.0.0-3_amd64.deb` (or double-click it) |
+| Fedora, RHEL, openSUSE | `qlim-2.0.0-3.x86_64.rpm` | `sudo dnf install ./qlim-2.0.0-3.x86_64.rpm` |
+| Alpine Linux | `qlim_2.0.0-r3_x86_64.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r3_x86_64.apk` |
 | Any Linux (no install) | `Q-LiM-2.0.0-x86_64.AppImage` | make it executable, then run it |
-| 32-bit Linux (Debian, Ubuntu, Mint, antiX ...) | `qlim_2.0.0-2_i386.deb` | `sudo apt install ./qlim_2.0.0-2_i386.deb` |
-| 32-bit Linux (Fedora, openSUSE ...) | `qlim-2.0.0-2.i386.rpm` | `sudo dnf install ./qlim-2.0.0-2.i386.rpm` |
-| 32-bit Alpine | `qlim_2.0.0-r2_x86.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r2_x86.apk` |
+| 32-bit Linux (Debian, Ubuntu, Mint, antiX ...) | `qlim_2.0.0-3_i386.deb` | `sudo apt install ./qlim_2.0.0-3_i386.deb` |
+| 32-bit Linux (Fedora, openSUSE ...) | `qlim-2.0.0-3.i386.rpm` | `sudo dnf install ./qlim-2.0.0-3.i386.rpm` |
+| 32-bit Alpine | `qlim_2.0.0-r3_x86.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r3_x86.apk` |
 | Windows XP, Vista, 7, 8, 10, 11 (32 and 64-bit) | `Q-LiM-2.0.0-Setup-Windows-32bit-64bit.exe` | run the installer - it picks the right version itself |
 | Windows XP – 11, no install (portable) | `Q-LiM-2.0.0-Windows-32bit-portable.zip` | unzip anywhere (also a USB stick), run `qlim.exe` |
 

@@ -75,13 +75,13 @@
 
 | Система | Файл | Инсталиране |
 |---|---|---|
-| Ubuntu, Linux Mint, Debian | `qlim_2.0.0-2_amd64.deb` | двоен клик или `sudo apt install ./qlim_2.0.0-2_amd64.deb` |
-| Fedora, RHEL, openSUSE | `qlim-2.0.0-2.x86_64.rpm` | `sudo dnf install ./qlim-2.0.0-2.x86_64.rpm` |
-| Alpine Linux | `qlim_2.0.0-r2_x86_64.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r2_x86_64.apk` |
+| Ubuntu, Linux Mint, Debian | `qlim_2.0.0-3_amd64.deb` | двоен клик или `sudo apt install ./qlim_2.0.0-3_amd64.deb` |
+| Fedora, RHEL, openSUSE | `qlim-2.0.0-3.x86_64.rpm` | `sudo dnf install ./qlim-2.0.0-3.x86_64.rpm` |
+| Alpine Linux | `qlim_2.0.0-r3_x86_64.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r3_x86_64.apk` |
 | Всеки Linux (без инсталиране) | `Q-LiM-2.0.0-x86_64.AppImage` | направи го изпълним и го пусни |
-| 32-битов Linux (Debian, Ubuntu, Mint, antiX ...) | `qlim_2.0.0-2_i386.deb` | `sudo apt install ./qlim_2.0.0-2_i386.deb` |
-| 32-битов Linux (Fedora, openSUSE ...) | `qlim-2.0.0-2.i386.rpm` | `sudo dnf install ./qlim-2.0.0-2.i386.rpm` |
-| 32-битов Alpine | `qlim_2.0.0-r2_x86.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r2_x86.apk` |
+| 32-битов Linux (Debian, Ubuntu, Mint, antiX ...) | `qlim_2.0.0-3_i386.deb` | `sudo apt install ./qlim_2.0.0-3_i386.deb` |
+| 32-битов Linux (Fedora, openSUSE ...) | `qlim-2.0.0-3.i386.rpm` | `sudo dnf install ./qlim-2.0.0-3.i386.rpm` |
+| 32-битов Alpine | `qlim_2.0.0-r3_x86.apk` | `doas apk add --allow-untrusted qlim_2.0.0-r3_x86.apk` |
 | Windows XP, Vista, 7, 8, 10, 11 (32 и 64-битов) | `Q-LiM-2.0.0-Setup-Windows-32bit-64bit.exe` | пусни инсталатора - сам избира правилната версия |
 | Windows XP – 11, без инсталиране (portable) | `Q-LiM-2.0.0-Windows-32bit-portable.zip` | разархивирай където искаш (и на флашка) и пусни `qlim.exe` |
 

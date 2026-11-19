@@ -1,6 +1,12 @@
 # Changelog
 
 ## 2.0.0 — 2026-11-19
+- **Song separation (File -> Separate) works again.** Microsoft took the ONNX Runtime project off GitHub on
+  17.11.2026, together with its downloads, so the first separation stopped with "Could not download ONNX Runtime:
+  curl: (22) The requested URL returned error: 404". Q-LiM now gets the same official ONNX Runtime 1.22.0 from
+  Microsoft's NuGet package (nuget.org) and keeps only the one library from it. If separation was already set up on
+  a computer, nothing is downloaded again. On Linux the package is unpacked with `unzip`, `python3` or `bsdtar`.
+  (Corrected packages of 2.0.0, package number 3.)
 - **A fresh look.** Five new themes (Graphite, Slate, Aurora, Paper, Ember) and a **Modern** style next to the
   Classic one (Edit -> Appearance): rounder corners, the channel colour as a strip on the headers, clips tinted in their
   channel's colour. The light themes (Paper - a calm grey, never bright white - and Light) have clear outlines.
