@@ -23,6 +23,7 @@ typedef struct {
 
 typedef struct {
     char     current_dir[FB_MAX_PATH];
+    char     start_dir[FB_MAX_PATH];   // 1.4.12: where the library opens (the "home" button goes there)
     FbEntry  entries[FB_MAX_ENTRIES];
     int      entry_count;
     int      scroll_offset;      // for vertical scrolling of the list

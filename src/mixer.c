@@ -1,5 +1,6 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 #include "mixer.h"
+#include "surround.h"
 #include "stream.h"
 #include "fxchain.h"
 #include "midiq.h"
@@ -42,6 +43,52 @@ static void route_add(int dest, const float *src, unsigned n)
     for (unsigned i = 0; i < n; ++i) d[i] += src[i];
 }
 
+/* 1.4.19: the buffer of a sound card output (cleared the first time in this block) */
+static float *hw_buf(int k, unsigned n)
+{
+    if (k < 0 || k >= MAX_HW_OUT) return NULL;
+    if (!(s_hw_used & RBIT(k))) { memset(s_hw[k], 0, n * sizeof(float)); s_hw_used |= RBIT(k); }
+    return s_hw[k];
+}
+
+/* 1.4.19: surround - the channel (s_cl / s_cr after its fader) to its speakers; the gains glide over the block */
+static void sur_out(Channel *ch, const SurSetup *su, const SurAuto *sa, float t, const float *L, const float *R, unsigned n)
+{
+    float gl[SUR_MAX_SPK], gr[SUR_MAX_SPK], vis[5];
+    sur_pair_gains(su, sa ? sa->p : NULL, sa ? sa->n : 0, t, gl, gr, vis);   /* 1.4.23: the same as the export */
+    float az = vis[0], sp = vis[1], rx = vis[2], ry = vis[3], rw = vis[4];
+    if (!ch->sur_init) {
+        for (int k = 0; k < su->n; ++k) { ch->sur_g[0][k] = gl[k]; ch->sur_g[1][k] = gr[k]; }
+        ch->sur_init = true;
+    }
+    float inv = 1.0f / (float)n;
+    for (int k = 0; k < su->n; ++k) {
+        float a0 = ch->sur_g[0][k], b0 = ch->sur_g[1][k];
+        float da = (gl[k] - a0) * inv, db = (gr[k] - b0) * inv;
+        ch->sur_g[0][k] = gl[k]; ch->sur_g[1][k] = gr[k];
+        if (a0 == 0.0f && b0 == 0.0f && da == 0.0f && db == 0.0f) continue;
+        int oo[62];
+        int no = sur_mask_outputs(su->omask[k], su->out[k], oo);   /* 2.0: the Speaker Map (one or several outputs) */
+        if (no <= 0) continue;
+        float *d = hw_buf(oo[0], n);
+        if (!d) continue;
+        float *b = d;
+        for (unsigned i = 0; i < n; ++i) { a0 += da; b0 += db; b[i] += L[i] * a0 + R[i] * b0; }
+        for (int q = 1; q < no; ++q) {                       /* the same signal on the others too */
+            float *e = hw_buf(oo[q], n);
+            if (!e) continue;
+            float x0 = ch->sur_g[0][k] - da * (float)n, y0 = ch->sur_g[1][k] - db * (float)n;
+            for (unsigned i = 0; i < n; ++i) { x0 += da; y0 += db; e[i] += L[i] * x0 + R[i] * y0; }
+        }
+    }
+    atomic_store_explicit(&ch->sur_vis_az, az, memory_order_relaxed);
+    atomic_store_explicit(&ch->sur_vis_x, rx, memory_order_relaxed);
+    atomic_store_explicit(&ch->sur_vis_y, ry, memory_order_relaxed);
+    atomic_store_explicit(&ch->sur_vis_w, rw, memory_order_relaxed);
+    atomic_store_explicit(&ch->sur_vis_spread, sp, memory_order_relaxed);
+    atomic_store_explicit(&ch->sur_vis_on, true, memory_order_relaxed);
+}
+
 static void route_mask_add(RouteMask mask, const float *src, unsigned n)
 {
     while (mask) {                                   /* only the set bits */
@@ -51,7 +98,167 @@ static void route_mask_add(RouteMask mask, const float *src, unsigned n)
     }
 }
 
+#define DC_TAIL   128     /* ~2.7 ms: fade-out of stopped/skipped audio */
+#define DC_FADEIN 64      /* ~1.3 ms: fade-in at the start of started/skipped audio */
+
 static inline float fa(float x) { return x < 0 ? -x : x; }
+
+/* ===== 1.4.24: a multichannel clip - every channel of its file goes to its own output (mc_out + k), through the
+ * channel's fader (no pan, no plugins, no warp/pitch). The same fades as a stereo clip (start/stop/seek, the queue
+ * crossfade, a scene transition, the clip gain), as one gain curve for all its channels. ===== */
+static float s_mc[MAX_BLOCK * STREAM_MAX_CH];
+static float s_mg[MAX_BLOCK], s_mo[MAX_BLOCK];
+
+/* returns true when the clip ended (faded out / the end of the file) */
+static bool mc_block(Session *s, Clip *cl, int c, unsigned n, bool tail_alone, bool audible, bool graph,
+                     bool *ch_clip, float *gl_out, float *gr_out)
+{
+    const int C = stream_channels(cl->stream);
+    const float *rg = s_rg;
+    size_t got;
+    if (!tail_alone) {
+        unsigned gen = atomic_load(&cl->stretch_gen);
+        bool restarted = cl->dc_was_playing && gen != cl->dc_gen;
+        if (!cl->dc_was_playing || restarted) {
+            if (restarted) cl->dc_tail = DC_TAIL;
+            cl->dc_fadein = (cl->q_launch && !restarted) ? 0 : DC_FADEIN;
+        }
+        cl->q_launch = false;
+        cl->dc_gen = gen;
+        cl->dc_was_playing = true;
+    }
+    if (tail_alone) {
+        memset(s_mc, 0, (size_t)n * (size_t)C * sizeof(float));
+        got = 0;
+    } else if (cl->start_offset) {
+        unsigned off = cl->start_offset < n ? cl->start_offset : n;
+        memset(s_mc, 0, (size_t)off * (size_t)C * sizeof(float));
+        got = off + stream_read(cl->stream, s_mc + (size_t)off * (size_t)C, n - off);
+        cl->start_offset = 0;
+    } else {
+        got = stream_read(cl->stream, s_mc, n);
+    }
+    if (got < n) memset(s_mc + got * (size_t)C, 0, (size_t)(n - got) * (size_t)C * sizeof(float));
+    for (unsigned i = 0; i < n; ++i) s_mg[i] = 1.0f;
+    {   /* the clip gain (its pan does not apply: every channel has its place) */
+        float gdb = atomic_load_explicit(&cl->cgain_db, memory_order_relaxed);
+        if (gdb > CLIP_GAIN_MIN_DB) gdb += atomic_load_explicit(&cl->norm_db, memory_order_relaxed);
+        float tg = gdb <= CLIP_GAIN_MIN_DB ? 0.0f : (gdb == 0.0f ? 1.0f : powf(10.0f, gdb / 20.0f));
+        if (!cl->cg_set) { cl->cg_l = tg; cl->cg_set = true; }
+        float g = cl->cg_l, d = (tg - g) / (float)n;
+        if (g != 1.0f || d != 0.0f) for (unsigned i = 0; i < n; ++i) { g += d; s_mg[i] = g; }
+        cl->cg_l = cl->cg_r = tg;
+    }
+    if (cl->dc_fadein && got > 0) {
+        unsigned st = DC_FADEIN - cl->dc_fadein;
+        size_t lim = got < cl->dc_fadein ? got : cl->dc_fadein;
+        for (size_t i = 0; i < lim; ++i) {
+            float t = ((float)(st + i) + 0.5f) / (float)DC_FADEIN;
+            s_mg[i] *= 0.5f - 0.5f * cosf(t * (float)M_PI);
+        }
+        cl->dc_fadein -= (unsigned)lim;
+    }
+    bool fade_done = false;
+    if (!tail_alone) {
+        int xdir = atomic_load(&cl->xf_dir);
+        if (xdir && atomic_load(&cl->stretch_gen) != cl->xf_gen) { atomic_store(&cl->xf_dir, 0); xdir = 0; }
+        if (xdir) {
+            double inv = 1.0 / (double)cl->xf_len;
+            for (size_t i = 0; i < got; ++i) {
+                long p = cl->xf_pos + (long)i;
+                float g;
+                if (p <= 0)                g = xdir > 0 ? 0.0f : 1.0f;
+                else if (p >= cl->xf_len)  g = xdir > 0 ? 1.0f : 0.0f;
+                else {
+                    float t = (float)((double)p * inv) * (float)(M_PI * 0.5);
+                    g = xdir > 0 ? sinf(t) : cosf(t);
+                }
+                s_mg[i] *= g;
+            }
+            cl->xf_pos += (long)n;
+            if (cl->xf_pos >= cl->xf_len) { atomic_store(&cl->xf_dir, 0); if (xdir < 0) fade_done = true; }
+            long pe = cl->xf_pos;
+            if (pe > 0 && pe < cl->xf_len) {
+                float t = (float)((double)pe / (double)cl->xf_len) * (float)(M_PI * 0.5);
+                atomic_store(&cl->xf_vis, xdir > 0 ? sinf(t) : cosf(t));
+                atomic_store(&cl->xf_vis_on, true);
+            } else atomic_store(&cl->xf_vis_on, false);
+        } else if (atomic_load_explicit(&cl->xf_vis_on, memory_order_relaxed)) atomic_store(&cl->xf_vis_on, false);
+        long rq = atomic_exchange_explicit(&cl->tr_req_len, 0, memory_order_acq_rel);
+        if (rq < 0) { cl->tr_on = false; cl->tr_g = 1.0f; }
+        else if (rq > 0) {
+            float from = atomic_load(&cl->tr_req_from), to = atomic_load(&cl->tr_req_to);
+            if (from >= 0.0f) cl->tr_g = from;
+            else if (!cl->tr_on) cl->tr_g = 1.0f;
+            cl->tr_to = to;
+            cl->tr_step = (to - cl->tr_g) / (float)rq;
+            cl->tr_on = true;
+        }
+        if (cl->tr_on) {
+            bool hold = atomic_load_explicit(&s->auto_hold, memory_order_relaxed);
+            float g = cl->tr_g, st = cl->tr_step, to = cl->tr_to;
+            for (unsigned i = 0; i < n; ++i) {
+                if (!hold) { g += st; if ((st >= 0.0f && g >= to) || (st < 0.0f && g <= to)) g = to; }
+                s_mg[i] *= sinf(g * (float)(M_PI * 0.5));
+            }
+            cl->tr_g = g;
+            bool moving = g != to;
+            atomic_store(&cl->xf_vis, sinf(g * (float)(M_PI * 0.5)));
+            atomic_store(&cl->xf_vis_on, moving || hold);
+            if (!moving && !hold) { cl->tr_on = false; atomic_store(&cl->xf_vis_on, false); if (g <= 0.0f) fade_done = true; }
+        }
+    }
+    /* the gain on every channel, then the fade-out of the old sound (from its last values) */
+    for (unsigned i = 0; i < n; ++i) {
+        float g = s_mg[i];
+        float *f = s_mc + (size_t)i * (size_t)C;
+        for (int k = 0; k < C; ++k) f[k] *= g;
+    }
+    if (cl->dc_tail) {
+        unsigned st = DC_TAIL - cl->dc_tail;
+        size_t lim = n < cl->dc_tail ? n : cl->dc_tail;
+        for (size_t i = 0; i < lim; ++i) {
+            float t = ((float)(st + i) + 0.5f) / (float)DC_TAIL;
+            float g = 0.5f + 0.5f * cosf(t * (float)M_PI);
+            float *f = s_mc + i * (size_t)C;
+            for (int k = 0; k < C; ++k) f[k] += cl->mc_last[k] * g;
+        }
+        cl->dc_tail -= (unsigned)lim;
+        if (got < lim) got = lim;
+    }
+    /* to the outputs, through the channel's fader; the meters see the loudest channel */
+    int first = atomic_load_explicit(&cl->mc_out, memory_order_relaxed);
+    float pk = 0.0f;
+    for (int k = 0; k < C; ++k) {
+        float kp = 0.0f;
+        for (size_t i = 0; i < got; ++i) {
+            float v = s_mc[i * (size_t)C + (size_t)k] * rg[i];
+            s_mo[i] = v;
+            float a = fa(v);
+            if (a > kp) kp = a;
+        }
+        if (kp > pk) pk = kp;
+        if (!audible || got == 0) continue;
+        if (graph) {                                    /* (graph mode: a channel has 2 ports - the first two) */
+            if (k == 0) for (size_t i = 0; i < got; ++i) gl_out[i] += s_mo[i];
+            if (k == 1) for (size_t i = 0; i < got; ++i) gr_out[i] += s_mo[i];
+            continue;
+        }
+        int oo[62];
+        int no = sur_mask_outputs(cl->mc_map[k], first + k, oo);   /* 2.0: the Speaker Map */
+        for (int q = 0; q < no; ++q) {
+            float *d = hw_buf(oo[q], n);
+            if (d) for (size_t i = 0; i < got; ++i) d[i] += s_mo[i];
+        }
+    }
+    if (pk > s_chpeak[c]) s_chpeak[c] = pk;
+    if (pk * PAN_COMP > s_chpk_l[c]) s_chpk_l[c] = pk * PAN_COMP;
+    if (pk * PAN_COMP > s_chpk_r[c]) s_chpk_r[c] = pk * PAN_COMP;
+    if (pk > 1.0f) *ch_clip = true;
+    if (got > 0) for (int k = 0; k < C; ++k) cl->mc_last[k] = s_mc[(got - 1) * (size_t)C + (size_t)k];
+    if (tail_alone) return false;
+    return fade_done || stream_finished(cl->stream);
+}
 
 /* the stretch pulls audio from the clip's stream */
 static size_t pull_stream(void *ud, float *out, size_t n)
@@ -59,11 +266,11 @@ static size_t pull_stream(void *ud, float *out, size_t n)
     return stream_read((ClipStream *)ud, out, n);
 }
 
-/* Reads n frames from the clip: directly from the stream or (with warp on) through the stretch. */
+/* Reads n frames from the clip: directly from the stream or (with warp on or a pitch shift) through the stretch. */
 static size_t clip_read(Clip *cl, float *out, unsigned n)
 {
     Stretch *st = cl->stretch;
-    if (!atomic_load_explicit(&cl->warp, memory_order_acquire) || !st) {
+    if (!atomic_load_explicit(&cl->stretch_on, memory_order_acquire) || !st) {
         if (cl->stretch_live && st) {
             /* warp was just turned off: the background thread must let go of the stream before we read it ourselves */
             if (!stretch_release(st)) { memset(out, 0, (size_t)n * 2 * sizeof(float)); return n; }
@@ -77,7 +284,8 @@ static size_t clip_read(Clip *cl, float *out, unsigned n)
         cl->stretch_seen = gen;
         cl->stretch_live = true;
     }
-    return stretch_process(st, session_clip_speed(cl), out, n, pull_stream, cl->stream);
+    cl->st_speed = session_clip_speed(cl);
+    return stretch_process(st, cl->st_speed, out, n, pull_stream, cl->stream);
 }
 
 /* The same, but through the path chosen by the caller (used for the last block of the OLD path when warp
@@ -86,7 +294,7 @@ static size_t clip_read_path(Clip *cl, float *out, unsigned n, bool via_stretch)
 {
     Stretch *st = cl->stretch;
     if (via_stretch && st && cl->stretch_live)
-        return stretch_process(st, session_clip_speed_warp(cl), out, n, pull_stream, cl->stream);
+        return stretch_process(st, cl->st_speed > 0.0 ? cl->st_speed : session_clip_speed_warp(cl), out, n, pull_stream, cl->stream);
     if (!via_stretch && !(cl->stretch_live && st)) return stream_read(cl->stream, out, n);
     memset(out, 0, (size_t)n * 2 * sizeof(float));      /* the old path is not available any more: silence */
     return n;
@@ -173,8 +381,6 @@ static Clip *q_at(Session *s, int idx)
     return cl;
 }
 
-#define DC_TAIL   128     /* ~2.7 ms: fade-out of stopped/skipped audio */
-#define DC_FADEIN 64      /* ~1.3 ms: fade-in at the start of started/skipped audio */
 #define WSW_FADEIN 480    /* ~10 ms: fade-in of the new sound after warp is switched on/off while playing */
 
 static void queue_launch(Session *s, unsigned n)
@@ -333,6 +539,7 @@ static long long s_met_last = -1;                       /* the last beat that cl
 static double    s_met_ph, s_met_w;                     /* sine phase / step */
 static unsigned  s_met_left, s_met_pos;                 /* frames still to play / already played of the tick */
 static float     s_met_amp;
+static int       s_met_num = 4;                         /* 1.4.8: beats in a bar (the accent) */
 static double    s_met_end = -1.0;                      /* graph mode: the beat at the end of this part of the cycle */
 #define MET_LEN_S 0.045
 
@@ -346,8 +553,11 @@ static void metro_add(Session *s, float *oL, float *oR, unsigned n)
     if (on && run) {
         float T = atomic_load(&s->tempo);
         if (!(T > 0.0f)) T = 120.0f;
-        double bpf = (double)T / (60.0 * (double)sr);
-        double b1 = s_met_end >= 0.0 ? s_met_end : atomic_load(&s->tp_beats), b0 = b1 - (double)n * bpf;
+        /* 1.4.8: counted in the beats of the time signature (7/8: eighths, accent every 7th) */
+        double unit = 4.0 / (double)(atomic_load_explicit(&s->sig_den, memory_order_relaxed) > 0 ? atomic_load_explicit(&s->sig_den, memory_order_relaxed) : 4);
+        s_met_num = atomic_load_explicit(&s->sig_num, memory_order_relaxed) > 0 ? atomic_load_explicit(&s->sig_num, memory_order_relaxed) : 4;
+        double bpf = (double)T / (60.0 * (double)sr) / unit;
+        double b1 = (s_met_end >= 0.0 ? s_met_end : atomic_load(&s->tp_beats)) / unit, b0 = b1 - (double)n * bpf;
         long long k = (long long)ceil(b0 - 1e-7);
         if (k < 0) k = 0;
         if (k <= s_met_last) k = s_met_last + 1;
@@ -359,7 +569,7 @@ static void metro_add(Session *s, float *oL, float *oR, unsigned n)
     }
     for (unsigned i = 0; i < n; ++i) {
         if (kfire >= 0 && i == ffire) {
-            bool acc = kfire % 4 == 0;
+            bool acc = kfire % s_met_num == 0;
             s_met_w = 2.0 * M_PI * (acc ? 1760.0 : 1320.0) / (double)sr;
             s_met_amp = acc ? 0.55f : 0.35f;
             s_met_ph = 0.0; s_met_pos = 0; s_met_left = (unsigned)(MET_LEN_S * sr);
@@ -375,6 +585,82 @@ static void metro_add(Session *s, float *oL, float *oR, unsigned n)
 }
 
 /* Master: volume (smoothed), balance, metering. Input L/R -> output oL/oR (no clipping). May write into the same buffers. */
+/* 1.4.17: Export Scene - the master into the ring, from the first block in which the scene plays */
+/* how many frames of this block go into the capture (0 = not now); starts with the scene's first sound */
+static size_t capture_take(Session *s, Capture *c, unsigned n)
+{
+    if (!atomic_load(&c->started)) {
+        bool any = false;
+        for (int ch = 0; ch < s->channel_count && !any; ++ch) {
+            Clip *cl = &s->channels[ch].clips[c->scene];
+            if (atomic_load(&cl->has_clip) && atomic_load(&cl->playing)) any = true;
+        }
+        if (!any) return 0;
+        atomic_store(&c->started, true);
+    }
+    long left = atomic_load(&c->left);
+    size_t m = (long)n < left ? n : (size_t)(left > 0 ? left : 0);
+    size_t w = atomic_load(&c->w), r = atomic_load(&c->r);
+    if (c->cap - (w - r) < m) { atomic_store(&c->overflow, true); m = c->cap - (w - r); }
+    return m;
+}
+static void capture_done(Capture *c, size_t m)
+{
+    atomic_store_explicit(&c->w, atomic_load(&c->w) + m, memory_order_release);
+    atomic_fetch_sub(&c->left, (long)m);
+}
+
+/* 1.4.23: all outputs - the master before the metronome is kept here until the outputs are put together */
+static float s_capL[MAX_BLOCK], s_capR[MAX_BLOCK];
+static unsigned s_cap_n;
+
+static void capture_push(Session *s, const float *L, const float *R, unsigned n)
+{
+    Capture *c = atomic_load_explicit(&s->capture, memory_order_acquire);
+    if (!c || !atomic_load_explicit(&c->on, memory_order_acquire)) return;
+    if (c->nch > 0) {                                   /* the outputs come later (capture_push_outputs) */
+        memcpy(s_capL, L, n * sizeof(float)); memcpy(s_capR, R, n * sizeof(float));
+        s_cap_n = n;
+        return;
+    }
+    size_t m = capture_take(s, c, n);
+    if (!m) return;
+    size_t w = atomic_load(&c->w);
+    for (size_t i = 0; i < m; ++i) {
+        size_t k = (w + i) % c->cap;
+        c->ring[k * 2] = L[i];
+        c->ring[k * 2 + 1] = R[i];
+    }
+    capture_done(c, m);
+}
+
+/* 1.4.23: Export Scene in surround - every output 1 .. nch as it plays: the channels routed to it (also their
+ * surround speakers) + the master where it goes (before the metronome); before the clipping to +-1 */
+static void capture_push_outputs(Session *s, unsigned n, bool simple, RouteMask ml, RouteMask mr)
+{
+    Capture *c = atomic_load_explicit(&s->capture, memory_order_acquire);
+    if (!c || !atomic_load_explicit(&c->on, memory_order_acquire) || c->nch <= 0 || s_cap_n != n) return;
+    s_cap_n = 0;
+    size_t m = capture_take(s, c, n);
+    if (!m) return;
+    size_t w = atomic_load(&c->w);
+    int nch = c->nch;
+    for (size_t i = 0; i < m; ++i) {
+        float *d = c->ring + ((w + i) % c->cap) * (size_t)nch;
+        for (int k = 0; k < nch; ++k) {
+            float v = 0.0f;
+            if (!simple && k < MAX_HW_OUT && (s_hw_used & RBIT(k))) v = s_hw[k][i];
+            if (simple) { if (k == 0) v += s_capL[i]; else if (k == 1) v += s_capR[i]; }
+            else {
+                if (ml & RBIT(k)) v += s_capL[i];
+                if (mr & RBIT(k)) v += s_capR[i];
+            }
+            d[k] = v == v ? v : 0.0f;
+        }
+    }
+    capture_done(c, m);
+}
+
 static void master_block(Session *s, const float *inL, const float *inR, float *oL, float *oR, unsigned n,
                          float *master_peak, float *mpk_l, float *mpk_r)
 {
@@ -417,6 +703,7 @@ static void master_block(Session *s, const float *inL, const float *inR, float *
     atomic_store(&s->master_smooth_gain, mc);
     atomic_store(&s->master_smooth_pan, mp);
     if (clip) atomic_store(&s->master_clipped, true);
+    capture_push(s, oL, oR, n);                     /* 1.4.17: Export Scene (before the metronome: no click in it) */
     metro_add(s, oL, oR, n);
 }
 
@@ -565,12 +852,13 @@ static void midi_route(Session *s)
     for (int i = 0; i < n; ++i) {
         unsigned char *m = raw[i];
         unsigned st = m[0] & 0xF0, mc = m[0] & 0x0F, key = m[1] & 0x7F;
-        int direct = m[3] ? m[3] - 1 : -1;               /* 1.3: the editor's preview goes to its own channel */
+        bool free_in = (m[3] & 0x80) != 0;              /* 1.4.6: an input only for playing (not bound to pads) */
+        int direct = (m[3] & 0x7F) ? (m[3] & 0x7F) - 1 : -1;   /* 1.3: the editor's preview goes to its own channel */
         if (direct >= nch) continue;
         int tgt = direct >= 0 ? direct : armed;
         if (st == 0x90 && m[2] > 0) {
-            bool bound = direct < 0 && ((atomic_load_explicit(&s->midi_bound[key >> 5], memory_order_relaxed) >> (key & 31)) & 1u);
-            if (bound || (block && direct < 0) || tgt < 0) continue;   /* a pad bound to a clip/button does not play notes */
+            bool bound = direct < 0 && !free_in && ((atomic_load_explicit(&s->midi_bound[key >> 5], memory_order_relaxed) >> (key & 31)) & 1u);
+            if (bound || (block && direct < 0 && !free_in) || tgt < 0) continue;   /* a pad bound to a clip/button does not play notes */
             if (s_held[mc][key] && s_held[mc][key] - 1 != tgt) {   /* still sounding on another channel: end it there */
                 unsigned char off[3] = { (unsigned char)(0x80 | mc), (unsigned char)key, 0 };
                 ch_ev(s_held[mc][key] - 1, off);
@@ -776,6 +1064,8 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
         bool fxm = plug || mon;                         /* 1.4: the input is heard through the channel (and its plugins) */
 
         if (na == 0 && !fxm) {
+            ch->sur_init = false;                       /* 1.4.19: the next sound starts with the right gains */
+            atomic_store_explicit(&ch->sur_vis_on, false, memory_order_relaxed);
             /* silent channel: do not spend CPU; the knobs simply "jump" to the target */
             atomic_store(&ch->smooth_gain, atomic_load(&ch->gain));
             atomic_store(&ch->smooth_pan,  atomic_load(&ch->pan));
@@ -790,7 +1080,19 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
         bool audible = !muted && !(any_solo && !soloed);
 
         RouteMask rl = atomic_load(&ch->route_l), rr = atomic_load(&ch->route_r);
-        bool custom = gouts || !(rl == ROUTE_DEFAULT_L && rr == ROUTE_DEFAULT_R);
+        SurSetup *sur = gouts ? NULL : atomic_load_explicit(&ch->sur, memory_order_acquire);   /* 1.4.19 */
+        if (sur && sur->n <= 0) sur = NULL;
+        const SurAuto *sur_a = NULL;
+        float sur_t = 0.0f;
+        if (sur)                                        /* the clip that plays leads the movement */
+            for (int k = 0; k < na; ++k) {
+                if (tail_only[k]) continue;
+                Clip *cl = &ch->clips[idx[k]];
+                sur_a = atomic_load_explicit(&cl->sur_auto, memory_order_acquire);
+                sur_t = (float)((double)atomic_load(&cl->position) / (double)(s->sample_rate > 0 ? s->sample_rate : 48000));
+                break;
+            }
+        bool custom = gouts || sur || !(rl == ROUTE_DEFAULT_L && rr == ROUTE_DEFAULT_R);
         if (custom) { memset(s_cl, 0, n * sizeof(float)); memset(s_cr, 0, n * sizeof(float)); }
         if (fxm) { memset(s_fxl, 0, n * sizeof(float)); memset(s_fxr, 0, n * sizeof(float)); }
 
@@ -798,8 +1100,22 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
             Clip *cl = &ch->clips[idx[k]];
             size_t got;
             bool tail_alone = tail_only[k];
+            if (stream_channels(cl->stream) > 2) {          /* 1.4.24: a multichannel clip */
+                if (mc_block(s, cl, c, n, tail_alone, audible, gouts != NULL, &ch_clip, s_cl, s_cr)) {
+                    cl->dc_was_playing = false;
+                    cl->dc_tail = 0;
+                    size_t sm = atomic_load(&cl->start_marker);
+                    size_t cl_len = __atomic_load_n(&cl->wav.frame_count, __ATOMIC_RELAXED);
+                    if (sm > cl_len) sm = cl_len;
+                    atomic_store(&cl->ended, true);
+                    atomic_store(&cl->playing, false);
+                    stream_stop(cl->stream);
+                    atomic_store(&cl->position, sm);
+                } else if (!tail_alone) atomic_store(&cl->position, stream_position(cl->stream));
+                continue;
+            }
             /* warp switched on/off while playing: this block still plays the OLD path and fades it out */
-            bool wnow = atomic_load_explicit(&cl->warp, memory_order_acquire) && cl->stretch;
+            bool wnow = atomic_load_explicit(&cl->stretch_on, memory_order_acquire) && cl->stretch;
             bool wswitch = !tail_alone && cl->dc_was_playing && cl->wsw_init && wnow != cl->wsw_warp && !cl->start_offset;
             if (wswitch) {
                 got = clip_read_path(cl, s_blk, n, cl->wsw_warp);
@@ -823,6 +1139,14 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
                 if (!cl->dc_was_playing || restarted) {
                     if (restarted) cl->dc_tail = DC_TAIL;
                     cl->dc_fadein = (cl->q_launch && !restarted) ? 0 : DC_FADEIN;   /* the seamless queue - without */
+                    if (restarted && wnow) {
+                        /* 1.4.13: through the Stretch the new sound comes a few ms later (the background thread starts
+                         * again): fade it in from its first sample, not over the silence before it */
+                        cl->dc_fadein = 0;
+                        cl->wsw_wait = true;
+                        cl->wsw_fadein = WSW_FADEIN;
+                        cl->wsw_blocks = 0;
+                    }
                 }
                 cl->q_launch = false;
                 cl->dc_gen = gen;
@@ -844,6 +1168,25 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
 
             /* no clicks: fade-in of the new audio + fade-out of the old one (from its last value) */
             if (got < n) memset(s_blk + got * 2, 0, (size_t)(n - got) * 2 * sizeof(float));
+            {   /* 1.4.9: the clip's own gain + pan (0 dB / centre = not touched at all); changes glide over the block */
+                float gdb = atomic_load_explicit(&cl->cgain_db, memory_order_relaxed);
+                if (gdb > CLIP_GAIN_MIN_DB) gdb += atomic_load_explicit(&cl->norm_db, memory_order_relaxed);   /* 1.4.11 */
+                float cp  = atomic_load_explicit(&cl->cpan, memory_order_relaxed);
+                if (gdb != 0.0f || cp != 0.0f || (cl->cg_set && (cl->cg_l != 1.0f || cl->cg_r != 1.0f))) {
+                    float g = gdb <= CLIP_GAIN_MIN_DB ? 0.0f : powf(10.0f, gdb / 20.0f), ppl, ppr;
+                    pan_law(cp, &ppl, &ppr);
+                    float tl = g * ppl, tr = g * ppr;
+                    if (!cl->cg_set) { cl->cg_l = tl; cl->cg_r = tr; cl->cg_set = true; }
+                    float dl = (tl - cl->cg_l) / (float)n, dr = (tr - cl->cg_r) / (float)n;
+                    float gl = cl->cg_l, gr = cl->cg_r;
+                    for (unsigned i = 0; i < n; ++i) {
+                        gl += dl; gr += dr;
+                        s_blk[i * 2 + 0] *= gl;
+                        s_blk[i * 2 + 1] *= gr;
+                    }
+                    cl->cg_l = tl; cl->cg_r = tr;
+                } else { cl->cg_l = cl->cg_r = 1.0f; cl->cg_set = true; }
+            }
             if (cl->wsw_wait && !wswitch) {
                 /* after a warp switch: silence until the new path really sounds (Rubber Band needs a few ms),
                  * then a smooth fade-in from that sample on */
@@ -933,6 +1276,42 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
                 atomic_store(&cl->xf_vis_on, false);
             }
 
+            /* 1.4.17: a scene transition: the clip's own ramp (equal power); "Stop automations" holds it where it is */
+            {
+                long rq = atomic_exchange_explicit(&cl->tr_req_len, 0, memory_order_acq_rel);
+                if (rq < 0) { cl->tr_on = false; cl->tr_g = 1.0f; }
+                else if (rq > 0) {
+                    float from = atomic_load(&cl->tr_req_from), to = atomic_load(&cl->tr_req_to);
+                    if (from >= 0.0f) cl->tr_g = from;
+                    else if (!cl->tr_on) cl->tr_g = 1.0f;
+                    cl->tr_to = to;
+                    cl->tr_step = (to - cl->tr_g) / (float)rq;
+                    cl->tr_on = true;
+                }
+                if (cl->tr_on) {
+                    bool hold = atomic_load_explicit(&s->auto_hold, memory_order_relaxed);
+                    float g = cl->tr_g, st = cl->tr_step, to = cl->tr_to;
+                    for (unsigned i = 0; i < n; ++i) {
+                        if (!hold) {
+                            g += st;
+                            if ((st >= 0.0f && g >= to) || (st < 0.0f && g <= to)) g = to;
+                        }
+                        float e = sinf(g * (float)(M_PI * 0.5));
+                        s_blk[i * 2 + 0] *= e;
+                        s_blk[i * 2 + 1] *= e;
+                    }
+                    cl->tr_g = g;
+                    bool moving = g != to;
+                    atomic_store(&cl->xf_vis, sinf(g * (float)(M_PI * 0.5)));       /* the "ghost" fader shows it */
+                    atomic_store(&cl->xf_vis_on, moving || hold);
+                    if (!moving && !hold) {
+                        cl->tr_on = false;
+                        atomic_store(&cl->xf_vis_on, false);
+                        if (g <= 0.0f) fade_done = true;      /* faded out -> stops */
+                    }
+                }
+            }
+
             for (size_t i = 0; i < got; ++i) {
                 float l = s_blk[i * 2 + 0];
                 float r = s_blk[i * 2 + 1];
@@ -1008,6 +1387,8 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
                 if (gouts[2 * c])     memcpy(gouts[2 * c] + goff, s_cl, n * sizeof(float));
                 if (gouts[2 * c + 1]) memcpy(gouts[2 * c + 1] + goff, s_cr, n * sizeof(float));
             }
+        } else if (sur) {
+            if (audible) sur_out(ch, sur, sur_a, sur_t, s_cl, s_cr, n);
         } else if (custom) {
             route_mask_add(rl, s_cl, n);
             route_mask_add(rr, s_cr, n);
@@ -1019,6 +1400,7 @@ static void render_sub(Session *s, float *out, unsigned n, int out_ch,
     RouteMask ml = atomic_load(&s->master_route_l), mr = atomic_load(&s->master_route_r);
     bool simple = (ml == MASTER_ROUTE_DEFAULT_L && mr == MASTER_ROUTE_DEFAULT_R && s_hw_used == 0);
     master_block(s, s_mixL, s_mixR, s_cl, s_cr, n, master_peak, mpk_l, mpk_r);   /* s_cl/s_cr: the master after the volume */
+    if (s_cap_n) capture_push_outputs(s, n, simple, ml, mr);   /* 1.4.23 (before the master is added to the outputs) */
     if (simple) {
         for (unsigned i = 0; i < n; ++i) {
             out[(size_t)i * out_ch + 0] = clip1(s_cl[i]);

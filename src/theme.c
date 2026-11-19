@@ -12,6 +12,8 @@ Theme g_theme;
 int   g_font_size = 14;
 char  g_theme_name[32]  = "dark";
 char  g_accent_name[32] = "yellow";
+int   g_ui_style = 0;
+int   g_clip_time = 0;
 
 // ============ Preset themes ============
 
@@ -54,42 +56,118 @@ static void apply_dark(void)
     strcpy(g_theme_name, "dark");
 }
 
+
+/* 2.0.0: the new themes - built from a few base colours (the rest is worked out from them) */
+static Color mixc(Color a, Color b, float t)
+{
+    return (Color){ (unsigned char)(a.r + (b.r - a.r) * t), (unsigned char)(a.g + (b.g - a.g) * t),
+                    (unsigned char)(a.b + (b.b - a.b) * t), 255 };
+}
+static void build_theme(const char *name, Color bg, Color panel, Color text, Color accent, Color wave, bool light)
+{
+    g_theme.bg           = bg;
+    g_theme.panel_bg     = panel;
+    g_theme.panel_bg2    = mixc(bg, panel, 0.55f);
+    g_theme.text         = text;
+    g_theme.text_dim     = mixc(panel, text, 0.64f);          /* clear second text, not washed out */
+    g_theme.selection    = accent;
+    g_theme.cell_empty   = mixc(panel, light ? bg : text, light ? 0.35f : 0.05f);
+    g_theme.cell_hover   = mixc(panel, text, light ? 0.12f : 0.15f);
+    g_theme.note_bg      = mixc(accent, (Color){ 255, 255, 255, 255 }, 0.35f);
+    g_theme.note_border  = mixc(accent, bg, 0.30f);
+    g_theme.note_text    = mixc(bg, (Color){ 0, 0, 0, 255 }, light ? 0.85f : 0.4f);
+    g_theme.mute         = (Color){ 226, 84, 84, 255 };
+    g_theme.solo         = (Color){ 236, 196, 72, 255 };
+    g_theme.stop_btn     = (Color){ 220, 76, 76, 255 };
+    g_theme.btn_add      = mixc(panel, text, 0.08f);
+    g_theme.btn_add_hover = mixc(panel, accent, 0.30f);
+    g_theme.scroll_bg    = mixc(bg, panel, 0.3f);
+    g_theme.scroll_fg    = mixc(panel, text, 0.35f);
+    g_theme.vu_green     = light ? (Color){ 40, 160, 90, 255 } : (Color){ 72, 210, 130, 255 };
+    g_theme.vu_yellow    = (Color){ 232, 196, 64, 255 };
+    g_theme.vu_red       = (Color){ 236, 72, 72, 255 };
+    g_theme.grid_line    = mixc(panel, text, 0.20f);
+    g_theme.ruler_bg     = mixc(bg, panel, 0.4f);
+    g_theme.ruler_line   = mixc(panel, text, 0.22f);
+    g_theme.ruler_tick   = mixc(panel, text, 0.14f);
+    g_theme.wave_bg      = light ? mixc(bg, (Color){ 255, 255, 255, 255 }, 0.5f) : mixc(bg, (Color){ 0, 0, 0, 255 }, 0.35f);
+    g_theme.wave_fg      = wave;
+    strcpy(g_theme_name, name);
+}
+static void apply_graphite(void)
+{
+    build_theme("graphite", (Color){ 22, 23, 25, 255 }, (Color){ 38, 40, 43, 255 }, (Color){ 238, 240, 242, 255 },
+                (Color){ 255, 163, 26, 255 }, (Color){ 150, 205, 240, 255 }, false);
+}
+static void apply_slate(void)
+{
+    build_theme("slate", (Color){ 18, 23, 31, 255 }, (Color){ 33, 41, 54, 255 }, (Color){ 234, 240, 250, 255 },
+                (Color){ 86, 170, 255, 255 }, (Color){ 110, 200, 250, 255 }, false);
+}
+static void apply_aurora(void)
+{
+    build_theme("aurora", (Color){ 17, 13, 30, 255 }, (Color){ 34, 28, 56, 255 }, (Color){ 242, 238, 255, 255 },
+                (Color){ 64, 224, 196, 255 }, (Color){ 190, 140, 255, 255 }, false);
+}
+static void apply_paper(void)
+{
+    /* never pure white (tiring for the eyes): a calm mid grey, like the light look of Ableton Live */
+    build_theme("paper", (Color){ 168, 170, 173, 255 }, (Color){ 190, 192, 195, 255 }, (Color){ 16, 18, 22, 255 },
+                (Color){ 214, 96, 10, 255 }, (Color){ 36, 70, 140, 255 }, true);
+    g_theme.panel_bg2  = (Color){ 182, 184, 187, 255 };
+    g_theme.cell_empty = (Color){ 178, 180, 183, 255 };
+    g_theme.cell_hover = (Color){ 162, 165, 169, 255 };
+    g_theme.text_dim   = (Color){ 66, 70, 78, 255 };
+    g_theme.scroll_bg  = (Color){ 160, 162, 165, 255 };
+    g_theme.scroll_fg  = (Color){ 96, 100, 106, 255 };
+    g_theme.grid_line  = (Color){ 140, 143, 147, 255 };
+    g_theme.wave_bg    = (Color){ 196, 198, 201, 255 };
+    g_theme.outline    = (Color){ 104, 108, 114, 255 };
+}
+static void apply_ember(void)
+{
+    build_theme("ember", (Color){ 23, 17, 14, 255 }, (Color){ 42, 33, 28, 255 }, (Color){ 250, 240, 230, 255 },
+                (Color){ 255, 128, 48, 255 }, (Color){ 255, 190, 120, 255 }, false);
+}
+
 static void apply_light(void)
 {
-    g_theme.bg           = (Color){ 240, 240, 245, 255 };
-    g_theme.panel_bg     = (Color){ 220, 220, 228, 255 };
-    g_theme.panel_bg2    = (Color){ 230, 230, 236, 255 };
-    g_theme.text         = (Color){ 30, 30, 40, 255 };
-    g_theme.text_dim     = (Color){ 120, 120, 130, 255 };
-    g_theme.selection    = (Color){ 200, 100, 30, 255 };
+    /* 1.4.12: warm cream instead of near-white - easier on the eyes */
+    g_theme.bg           = (Color){ 232, 225, 210, 255 };
+    g_theme.panel_bg     = (Color){ 218, 209, 191, 255 };
+    g_theme.panel_bg2    = (Color){ 226, 218, 202, 255 };
+    g_theme.text         = (Color){ 38, 32, 24, 255 };
+    g_theme.text_dim     = (Color){ 112, 102, 88, 255 };
+    g_theme.selection    = (Color){ 196, 98, 28, 255 };
 
-    g_theme.cell_empty   = (Color){ 210, 210, 218, 255 };
-    g_theme.cell_hover   = (Color){ 190, 190, 205, 255 };
-    g_theme.note_bg      = (Color){ 255, 230, 100, 255 };
-    g_theme.note_border  = (Color){ 200, 170, 40, 255 };
+    g_theme.cell_empty   = (Color){ 210, 201, 183, 255 };
+    g_theme.cell_hover   = (Color){ 196, 186, 166, 255 };
+    g_theme.note_bg      = (Color){ 246, 218, 120, 255 };
+    g_theme.note_border  = (Color){ 190, 158, 50, 255 };
     g_theme.note_text    = (Color){ 60, 40, 10, 255 };
 
-    g_theme.mute         = (Color){ 200, 60, 60, 255 };
-    g_theme.solo         = (Color){ 230, 180, 50, 255 };
-    g_theme.stop_btn     = (Color){ 200, 60, 60, 255 };
-    g_theme.btn_add      = (Color){ 180, 190, 210, 255 };
-    g_theme.btn_add_hover = (Color){ 140, 170, 200, 255 };
+    g_theme.mute         = (Color){ 196, 64, 56, 255 };
+    g_theme.solo         = (Color){ 222, 172, 52, 255 };
+    g_theme.stop_btn     = (Color){ 196, 64, 56, 255 };
+    g_theme.btn_add      = (Color){ 196, 186, 166, 255 };
+    g_theme.btn_add_hover = (Color){ 178, 164, 138, 255 };
 
-    g_theme.scroll_bg    = (Color){ 210, 210, 220, 255 };
-    g_theme.scroll_fg    = (Color){ 130, 130, 145, 255 };
+    g_theme.scroll_bg    = (Color){ 214, 205, 187, 255 };
+    g_theme.scroll_fg    = (Color){ 140, 128, 108, 255 };
 
-    g_theme.vu_green     = (Color){ 40, 180, 80, 255 };
-    g_theme.vu_yellow    = (Color){ 210, 180, 40, 255 };
-    g_theme.vu_red       = (Color){ 210, 50, 50, 255 };
+    g_theme.vu_green     = (Color){ 40, 160, 72, 255 };
+    g_theme.vu_yellow    = (Color){ 200, 166, 36, 255 };
+    g_theme.vu_red       = (Color){ 200, 52, 46, 255 };
 
-    g_theme.grid_line    = (Color){ 180, 180, 190, 255 };
-    g_theme.ruler_bg     = (Color){ 210, 210, 218, 255 };
-    g_theme.ruler_line   = (Color){ 150, 150, 160, 255 };
-    g_theme.ruler_tick   = (Color){ 170, 170, 180, 255 };
+    g_theme.grid_line    = (Color){ 184, 174, 154, 255 };
+    g_theme.ruler_bg     = (Color){ 214, 205, 187, 255 };
+    g_theme.ruler_line   = (Color){ 150, 138, 118, 255 };
+    g_theme.ruler_tick   = (Color){ 168, 156, 136, 255 };
 
-    g_theme.wave_bg      = (Color){ 245, 245, 250, 255 };
-    g_theme.wave_fg      = (Color){ 50, 100, 180, 255 };
+    g_theme.wave_bg      = (Color){ 238, 231, 217, 255 };
+    g_theme.wave_fg      = (Color){ 46, 92, 160, 255 };
 
+    g_theme.outline      = (Color){ 150, 138, 116, 255 };   /* 2.0.0: clear edges */
     strcpy(g_theme_name, "light");
 }
 
@@ -134,15 +212,17 @@ static void apply_midnight(void)
 
 static void apply_solarized(void)
 {
-    g_theme.bg           = (Color){ 0, 43, 54, 255 };
+    /* 2.0.0: clearer - the deep Solarized base, panels and cells clearly apart from it, the cream "base2" text and
+     * "base1" for the second text (it looked like a teal filter over everything) */
+    g_theme.bg           = (Color){ 0, 32, 41, 255 };
     g_theme.panel_bg     = (Color){ 7, 54, 66, 255 };
-    g_theme.panel_bg2    = (Color){ 0, 55, 70, 255 };
-    g_theme.text         = (Color){ 147, 161, 161, 255 };
-    g_theme.text_dim     = (Color){ 88, 110, 117, 255 };
-    g_theme.selection    = (Color){ 181, 137, 0, 255 };
+    g_theme.panel_bg2    = (Color){ 4, 46, 57, 255 };
+    g_theme.text         = (Color){ 238, 232, 213, 255 };
+    g_theme.text_dim     = (Color){ 147, 161, 161, 255 };
+    g_theme.selection    = (Color){ 203, 155, 0, 255 };
 
-    g_theme.cell_empty   = (Color){ 0, 55, 70, 255 };
-    g_theme.cell_hover   = (Color){ 7, 70, 85, 255 };
+    g_theme.cell_empty   = (Color){ 10, 62, 75, 255 };
+    g_theme.cell_hover   = (Color){ 22, 82, 97, 255 };
     g_theme.note_bg      = (Color){ 181, 137, 0, 255 };
     g_theme.note_border  = (Color){ 120, 90, 0, 255 };
     g_theme.note_text    = (Color){ 253, 246, 227, 255 };
@@ -160,13 +240,13 @@ static void apply_solarized(void)
     g_theme.vu_yellow    = (Color){ 181, 137, 0, 255 };
     g_theme.vu_red       = (Color){ 220, 50, 47, 255 };
 
-    g_theme.grid_line    = (Color){ 7, 54, 66, 255 };
-    g_theme.ruler_bg     = (Color){ 0, 43, 54, 255 };
+    g_theme.grid_line    = (Color){ 30, 80, 92, 255 };
+    g_theme.ruler_bg     = (Color){ 0, 36, 46, 255 };
     g_theme.ruler_line   = (Color){ 88, 110, 117, 255 };
     g_theme.ruler_tick   = (Color){ 88, 110, 117, 255 };
 
-    g_theme.wave_bg      = (Color){ 0, 30, 40, 255 };
-    g_theme.wave_fg      = (Color){ 42, 161, 152, 255 };
+    g_theme.wave_bg      = (Color){ 0, 24, 31, 255 };
+    g_theme.wave_fg      = (Color){ 72, 196, 186, 255 };
 
     strcpy(g_theme_name, "solarized");
 }
@@ -209,11 +289,11 @@ static void apply_oled(void)
 /* Nord: the well-known cool "arctic" palette (Arctic Ice Studio, free) */
 static void apply_nord(void)
 {
-    g_theme.bg           = (Color){ 36, 41, 51, 255 };
+    g_theme.bg           = (Color){ 32, 36, 45, 255 };    /* 2.0.0: a bit deeper, the text brighter - clearer */
     g_theme.panel_bg     = (Color){ 46, 52, 64, 255 };
     g_theme.panel_bg2    = (Color){ 52, 59, 74, 255 };
-    g_theme.text         = (Color){ 216, 222, 233, 255 };
-    g_theme.text_dim     = (Color){ 132, 143, 163, 255 };
+    g_theme.text         = (Color){ 236, 239, 244, 255 };
+    g_theme.text_dim     = (Color){ 160, 170, 188, 255 };
     g_theme.selection    = (Color){ 136, 192, 208, 255 };
     g_theme.cell_empty   = (Color){ 59, 66, 82, 255 };
     g_theme.cell_hover   = (Color){ 76, 86, 106, 255 };
@@ -279,6 +359,7 @@ static void apply_gruvbox(void)
 void theme_apply_preset(ThemePreset preset)
 {
     switch (preset) {
+    g_theme.outline = (Color){ 0, 0, 0, 0 };              /* 2.0.0: only light themes set it */
     case THEME_DARK:      apply_dark();      break;
     case THEME_LIGHT:     apply_light();     break;
     case THEME_MIDNIGHT:  apply_midnight();  break;
@@ -286,6 +367,11 @@ void theme_apply_preset(ThemePreset preset)
     case THEME_OLED:      apply_oled();      break;
     case THEME_NORD:      apply_nord();      break;
     case THEME_GRUVBOX:   apply_gruvbox();   break;
+    case THEME_GRAPHITE:  apply_graphite();  break;
+    case THEME_SLATE:     apply_slate();     break;
+    case THEME_AURORA:    apply_aurora();    break;
+    case THEME_PAPER:     apply_paper();     break;
+    case THEME_EMBER:     apply_ember();     break;
     case THEME_CUSTOM:    strcpy(g_theme_name, "custom"); break;
     default: break;
     }
@@ -306,33 +392,7 @@ void theme_apply_accent(AccentPreset accent)
     g_theme.selection = sel;
 }
 
-const char *theme_preset_name(ThemePreset preset)
-{
-    switch (preset) {
-    case THEME_DARK:      return "Dark";
-    case THEME_LIGHT:     return "Light";
-    case THEME_MIDNIGHT:  return "Midnight";
-    case THEME_SOLARIZED: return "Solarized";
-    case THEME_OLED:      return "OLED Black";
-    case THEME_NORD:      return "Nord";
-    case THEME_GRUVBOX:   return "Gruvbox";
-    case THEME_CUSTOM:    return "Custom";
-    default:              return "?";
-    }
-}
 
-const char *theme_accent_name(AccentPreset accent)
-{
-    switch (accent) {
-    case ACCENT_YELLOW: return "Yellow";
-    case ACCENT_BLUE:   return "Blue";
-    case ACCENT_GREEN:  return "Green";
-    case ACCENT_RED:    return "Red";
-    case ACCENT_PURPLE: return "Purple";
-    case ACCENT_ORANGE: return "Orange";
-    default:            return "?";
-    }
-}
 
 ThemePreset theme_preset_from_name(const char *name)
 {
@@ -343,6 +403,11 @@ ThemePreset theme_preset_from_name(const char *name)
     if (strcmp(name, "oled") == 0)      return THEME_OLED;
     if (strcmp(name, "nord") == 0)      return THEME_NORD;
     if (strcmp(name, "gruvbox") == 0)   return THEME_GRUVBOX;
+    if (strcmp(name, "graphite") == 0)  return THEME_GRAPHITE;
+    if (strcmp(name, "slate") == 0)     return THEME_SLATE;
+    if (strcmp(name, "aurora") == 0)    return THEME_AURORA;
+    if (strcmp(name, "paper") == 0)     return THEME_PAPER;
+    if (strcmp(name, "ember") == 0)     return THEME_EMBER;
     if (strcmp(name, "custom") == 0)    return THEME_CUSTOM;
     return THEME_DARK;
 }
@@ -429,8 +494,8 @@ static bool read_str(const char *line, const char *key, char *out, size_t out_si
 
 void theme_load(void)
 {
-    // First apply Dark as the default
-    apply_dark();
+    // 1.4.12: OLED Black is the default (a new installation / no theme.conf)
+    apply_oled();
     theme_apply_accent(ACCENT_ORANGE);       /* step 36g: the main colour of Q-LiM (as in the logo) */
     g_font_size = 14;
 
@@ -439,11 +504,11 @@ void theme_load(void)
 
     FILE *f = fopen(path, "r");
     if (!f) {
-        printf("theme_load: no config, using Dark defaults\n");
+        printf("theme_load: no config, using OLED Black defaults\n");
         return;
     }
 
-    char theme_name_buf[32] = "dark";
+    char theme_name_buf[32] = "oled";
     char accent_name_buf[32] = "orange";
     int  font_size = 14;
     int  accent_rev = 0;
@@ -454,6 +519,9 @@ void theme_load(void)
         read_str(line, "accent", accent_name_buf, sizeof(accent_name_buf));
         read_int(line, "font_size", &font_size);
         read_int(line, "accent_rev", &accent_rev);
+        char st[16] = "";
+        if (read_str(line, "style", st, sizeof st)) g_ui_style = strcmp(st, "modern") == 0;
+        if (read_str(line, "clip_time", st, sizeof st)) g_clip_time = !strcmp(st, "line") ? 1 : !strcmp(st, "both") ? 2 : 0;
     }
     if (accent_rev < 2) strcpy(accent_name_buf, "orange");   /* step 36g: once - the Q-LiM orange */
 
@@ -535,6 +603,8 @@ void theme_save(void)
     fprintf(f, "theme=%s\n",  g_theme_name);
     fprintf(f, "accent=%s\n", g_accent_name);
     fprintf(f, "accent_rev=2\n");
+    fprintf(f, "style=%s\n", g_ui_style ? "modern" : "classic");
+    fprintf(f, "clip_time=%s\n", g_clip_time == 1 ? "line" : g_clip_time == 2 ? "both" : "counter");
     fprintf(f, "font_size=%d\n\n", g_font_size);
 
     // If custom – save all the colours

@@ -42,7 +42,11 @@ void audio_shutdown(void);
 // ============ 1.4: input (recording) ============
 int         audio_input_channels(void);      /* 0 = no input (cannot record audio) */
 unsigned    audio_roundtrip_frames(void);    /* the delay out + in (frames): recordings are shifted back by this much */
-const char *audio_input_name(void);
+/* 1.4.9: PipeWire graph mode and the sample rate: a note for the user ("" = none), the rate chosen in the dialog,
+ * and the main-loop check that the graph did not change its rate under us (> 0 = it did: open the audio again) */
+const char *audio_rate_note(void);
+int         audio_rate_wanted(void);
+int         audio_rate_drift(void);
 void        audio_input_want(bool on);       /* PipeWire: the input is opened only while a channel is armed */
 
 // ============ Lost sound card ============
@@ -99,6 +103,25 @@ bool audio_actual_buffer(int *frames, double *out_ms);
 bool audio_graph_poll(void);
 // true = the audio is currently going through PipeWire graph mode
 bool audio_graph_active(void);
+
+// ============ 1.4.21: extra sound cards ============
+#include "outx.h"
+typedef struct {
+    char   name[160];
+    int    first, count;          /* outputs first+1 .. first+count */
+    int    state;                 /* 0 = playing, 1 = starting, 2 = not connected / failed (why), 3 = off (graph mode) */
+    char   why[96];
+    double lat_ms;                /* extra: the ring + the card's own delay; main: the card's delay */
+    double ppm;                   /* extra: its clock against the main card's */
+    int    rate;
+    unsigned dropouts;
+} AudioOutGroup;
+int  audio_total_outputs(void);                   /* the main card's + the extra cards' outputs */
+int  audio_output_groups(AudioOutGroup *g, int max);   /* [0] = the main card, then every extra card */
+bool audio_outx_possible(void);                   /* false in the PipeWire graph mode */
+int  audio_outx_add(const OutxDevCfg *c);         /* live; saved */
+void audio_outx_remove(int i);
+int  audio_outx_candidates(OutxDevCfg *out, int *maxch, int max);
 
 // ============ Current configuration ============
 

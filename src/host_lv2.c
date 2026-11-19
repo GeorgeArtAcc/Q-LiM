@@ -17,6 +17,22 @@
 #include <lv2/instance-access/instance-access.h>
 #include <lv2/data-access/data-access.h>
 #include <stdatomic.h>
+
+/* 2.0.0: the kxstudio "external UI" extension (public, used by DISTRHO/DPF, JUCE LV2 ports, Carla, ZynAddSubFX ...).
+ * The plugin opens its own top-level window; the host calls run() regularly and gets ui_closed() when it is closed. */
+#define LV2_EXTERNAL_UI_URI          "http://kxstudio.sf.net/ns/lv2ext/external-ui"
+#define LV2_EXTERNAL_UI__Host        LV2_EXTERNAL_UI_URI "#Host"
+#define LV2_EXTERNAL_UI__Widget      LV2_EXTERNAL_UI_URI "#Widget"
+#define LV2_EXTERNAL_UI_DEPRECATED   "http://lv2plug.in/ns/extensions/ui#external"
+typedef struct LV2_External_UI_Widget {
+    void (*run)(struct LV2_External_UI_Widget *w);
+    void (*show)(struct LV2_External_UI_Widget *w);
+    void (*hide)(struct LV2_External_UI_Widget *w);
+} LV2_External_UI_Widget;
+typedef struct {
+    void (*ui_closed)(void *controller);
+    const char *plugin_human_id;
+} LV2_External_UI_Host;
 #include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
@@ -81,7 +97,7 @@ static struct {
 
 static int        g_lstate = 0;          /* 0 = not tried, 1 = present, -1 = no liblilv */
 static LilvWorld *g_world;
-static LilvNode  *n_audio, *n_control, *n_atom, *n_cv, *n_input, *n_output, *n_instr, *n_x11ui;
+static LilvNode  *n_audio, *n_control, *n_atom, *n_cv, *n_input, *n_output, *n_instr, *n_x11ui, *n_extui, *n_extui_old, *n_gtk2ui, *n_gtk3ui;
 static LilvNode  *n_midi_ev, *n_integer, *n_toggled, *n_enum, *n_not_gui;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -126,6 +142,10 @@ static int lv_load(char *err, int esz)
     n_output = L.new_uri(g_world, LV2_CORE__OutputPort);
     n_instr = L.new_uri(g_world, LV2_CORE__InstrumentPlugin);
     n_x11ui = L.new_uri(g_world, LV2_UI__X11UI);
+    n_extui = L.new_uri(g_world, LV2_EXTERNAL_UI__Widget);
+    n_extui_old = L.new_uri(g_world, LV2_EXTERNAL_UI_DEPRECATED);
+    n_gtk2ui = L.new_uri(g_world, LV2_UI__GtkUI);
+    n_gtk3ui = L.new_uri(g_world, LV2_UI__Gtk3UI);
     n_midi_ev = L.new_uri(g_world, "http://lv2plug.in/ns/ext/midi#MidiEvent");
     n_integer = L.new_uri(g_world, LV2_CORE__integer);
     n_toggled = L.new_uri(g_world, LV2_CORE__toggled);
@@ -246,6 +266,11 @@ typedef struct {
     float *ui_last;                                  /* the values last sent to the interface */
     LV2UI_Resize ui_resize;
     LV2_Extension_Data_Feature ext_data;
+    /* 2.0.0: "external" interfaces (kxstudio external-ui) - the plugin opens and runs its own window */
+    LV2_External_UI_Host ext_host;
+    LV2_External_UI_Widget *ext_widget;
+    char ext_name[200];
+    void *gtk_win;                                   /* 2.0.0: Gtk window (only in a separate process) */
     /* 1.2 */
     int midi_port;                                   /* index into atom_in[] of the MIDI input, -1 = none */
     LV2_URID u_midi;
@@ -384,23 +409,124 @@ static int ui_resize_cb(LV2UI_Feature_Handle h, int w, int hh)
     return 0;
 }
 
-static const LilvUI *find_x11_ui(LV *v, LilvUIs **uis_out)
+/* the window to use: an embedded X11 one first, else (2.0.0) an "external" one, else - only in a separate process -
+ * a Gtk one (Gtk 3 / Gtk 2). *kind says which. */
+enum { UIK_NONE = 0, UIK_X11, UIK_EXT, UIK_GTK3, UIK_GTK2 };
+static const LilvUI *find_ui_of(const LilvPlugin *plug, LilvUIs **uis_out, int *kind, bool allow_gtk)
 {
-    LilvUIs *uis = L.plugin_get_uis(v->plug);
+    LilvUIs *uis = L.plugin_get_uis(plug);
     *uis_out = uis;
+    if (kind) *kind = UIK_NONE;
     if (!uis) return NULL;
+    const LilvUI *best = NULL;
+    int bk = UIK_NONE;
     for (LilvIter *it = L.uis_begin(uis); !L.uis_is_end(uis, it); it = L.uis_next(uis, it)) {
         const LilvUI *u = L.uis_get(uis, it);
-        if (L.ui_is_a(u, n_x11ui)) return u;
+        int k = UIK_NONE;
+        if (L.ui_is_a(u, n_x11ui)) k = UIK_X11;
+        else if (L.ui_is_a(u, n_extui) || L.ui_is_a(u, n_extui_old)) k = UIK_EXT;
+        else if (allow_gtk && L.ui_is_a(u, n_gtk3ui)) k = UIK_GTK3;
+        else if (allow_gtk && L.ui_is_a(u, n_gtk2ui)) k = UIK_GTK2;
+        if (k != UIK_NONE && (bk == UIK_NONE || k < bk)) { best = u; bk = k; }
     }
-    return NULL;
+    if (kind) *kind = bk;
+    return best;
+}
+static const LilvUI *find_x11_ui(LV *v, LilvUIs **uis_out, int *kind)
+{
+    return find_ui_of(v->plug, uis_out, kind, qplug_is_child());
+}
+
+/* ---- 2.0.0: Gtk windows (LV2 GtkUI / Gtk3UI), loaded at run time - only in a separate plugin process ---- */
+typedef struct {
+    int  (*init_check)(int *, char ***);
+    void *(*window_new)(int);
+    void (*set_title)(void *, const char *);
+    void (*container_add)(void *, void *);
+    void (*show_all)(void *);
+    void (*destroy)(void *);
+    int  (*events_pending)(void);
+    int  (*main_iteration_do)(int);
+    void (*present)(void *);
+    unsigned long (*signal_connect)(void *, const char *, void (*)(void), void *, void *, int);
+} GtkApi;
+static GtkApi G;
+static int g_gtk_ver;                                /* 0 = not loaded, 2 / 3 */
+
+static bool gtk_load(int ver, char *err, int esz)
+{
+    if (g_gtk_ver == ver) return true;
+    if (g_gtk_ver) { snprintf(err, (size_t)esz, "Gtk %d is already in use in this process", g_gtk_ver); return false; }
+    void *h = dlopen(ver == 3 ? "libgtk-3.so.0" : "libgtk-x11-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { snprintf(err, (size_t)esz, "this window needs Gtk %d, which is not installed", ver); return false; }
+#define GS(f, n) if (!(*(void **)&G.f = dlsym(h, n))) { snprintf(err, (size_t)esz, "Gtk: %s missing", n); return false; }
+    GS(init_check, "gtk_init_check"); GS(window_new, "gtk_window_new"); GS(set_title, "gtk_window_set_title");
+    GS(container_add, "gtk_container_add"); GS(show_all, "gtk_widget_show_all"); GS(destroy, "gtk_widget_destroy");
+    GS(events_pending, "gtk_events_pending"); GS(main_iteration_do, "gtk_main_iteration_do"); GS(present, "gtk_window_present");
+    GS(signal_connect, "g_signal_connect_data");
+#undef GS
+    if (!G.init_check(NULL, NULL)) { snprintf(err, (size_t)esz, "Gtk %d could not start (no display?)", ver); return false; }
+    g_gtk_ver = ver;
+    return true;
+}
+
+static int gtk_delete_cb(void *widget, void *event, void *data)    /* the user closes the Gtk window */
+{
+    (void)widget; (void)event;
+    LV *v = data;
+    if (v && v->win) plugwin_request_close(v->win);
+    return 1;                                        /* we close it ourselves */
+}
+static void gtk_raise(void *ud)
+{
+    LV *v = ud;
+    if (v && v->gtk_win) G.present(v->gtk_win);
+}
+static void gtk_pump(void)
+{
+    for (int i = 0; g_gtk_ver && i < 200 && G.events_pending(); ++i) G.main_iteration_do(0);
+}
+
+bool lv2_ui_needs_separate(const char *id)
+{
+    char err[200];
+    if (lv_load(err, (int)sizeof err) < 0) return false;
+    char bundle[1024];
+    snprintf(bundle, sizeof bundle, "%s", id);
+    char *bar = strrchr(bundle, '|');
+    if (!bar) return false;
+    *bar = 0;
+    load_bundle(bundle);
+    LilvNode *un = L.new_uri(g_world, bar + 1);
+    const LilvPlugin *p = L.plugins_get_by_uri(L.world_get_all_plugins(g_world), un);
+    L.node_free(un);
+    if (!p) return false;
+    LilvUIs *uis;
+    int k1 = UIK_NONE, k2 = UIK_NONE;
+    find_ui_of(p, &uis, &k1, false);
+    if (uis) L.uis_free(uis);
+    if (k1 != UIK_NONE) return false;                /* it has an X11 / external window: fine inside Q-LiM */
+    find_ui_of(p, &uis, &k2, true);
+    if (uis) L.uis_free(uis);
+    return k2 == UIK_GTK3 || k2 == UIK_GTK2;
+}
+
+static void ext_ui_closed(void *controller)          /* the plugin's own window was closed by the user */
+{
+    LV *v = controller;
+    if (v && v->win) plugwin_request_close(v->win);
+}
+static void ext_ui_raise(void *ud)                    /* opening it again while open: show it again */
+{
+    LV *v = ud;
+    if (v && v->ext_widget && v->ext_widget->show) v->ext_widget->show(v->ext_widget);
 }
 
 static bool lv_has_editor(void *h)
 {
     LV *v = h;
     LilvUIs *uis;
-    bool ok = find_x11_ui(v, &uis) != NULL;
+    bool ok = find_ui_of(v->plug, &uis, NULL, true) != NULL;   /* a Gtk one counts: opening it explains what to do */
     if (uis) L.uis_free(uis);
     return ok;
 }
@@ -410,8 +536,16 @@ static int lv_ed_open(void *h, PlugWin *w, int *W, int *H, char *err, int esz)
     LV *v = h;
     (void)W; (void)H;
     LilvUIs *uis;
-    const LilvUI *u = find_x11_ui(v, &uis);
-    if (!u) { if (uis) L.uis_free(uis); snprintf(err, (size_t)esz, "this LV2 plugin has no X11 window (Gtk/Qt windows are not supported)"); return -1; }
+    int kind = UIK_NONE;
+    const LilvUI *u = find_x11_ui(v, &uis, &kind);
+    bool external = kind == UIK_EXT, gtk = kind == UIK_GTK3 || kind == UIK_GTK2;
+    if (!u) {
+        if (uis) L.uis_free(uis);
+        snprintf(err, (size_t)esz, qplug_is_child() ? "this LV2 plugin's window type is not supported (Qt?)"
+                 : "this LV2 plugin's window needs Gtk - set Edit -> Plugins -> Safety to 'Automatic' or 'All plugins'");
+        return -1;
+    }
+    if (gtk && !gtk_load(kind == UIK_GTK3 ? 3 : 2, err, esz)) { L.uis_free(uis); return -1; }
     L.world_load_resource(g_world, L.ui_get_uri(u));
     char *bin = L.file_uri_parse(L.node_as_uri(L.ui_get_binary_uri(u)), NULL);
     char *bnd = L.file_uri_parse(L.node_as_uri(L.ui_get_bundle_uri(u)), NULL);
@@ -438,7 +572,18 @@ static int lv_ed_open(void *h, PlugWin *w, int *W, int *H, char *err, int esz)
     LV2_Feature f_inst = { LV2_INSTANCE_ACCESS_URI, lilv_instance_get_handle(v->inst) };
     LV2_Feature f_data = { LV2_DATA_ACCESS_URI, &v->ext_data };
     LV2_Feature f_idle = { LV2_UI__idleInterface, NULL };
-    const LV2_Feature *feats[] = { &v->f_map, &v->f_unmap, &v->f_opt, &v->f_log, &f_parent, &f_resize, &f_inst, &f_data, &f_idle, NULL };
+    v->ext_host.ui_closed = ext_ui_closed;
+    if (!v->ext_name[0]) {
+        LilvNode *nm = L.plugin_get_name(v->plug);
+        snprintf(v->ext_name, sizeof v->ext_name, "%s", nm ? L.node_as_string(nm) : "LV2 plugin");
+        if (nm) L.node_free(nm);
+    }
+    v->ext_host.plugin_human_id = v->ext_name;         /* the title of its window */
+    LV2_Feature f_ext = { LV2_EXTERNAL_UI__Host, &v->ext_host }, f_ext_old = { LV2_EXTERNAL_UI_DEPRECATED, &v->ext_host };
+    const LV2_Feature *feats_x11[] = { &v->f_map, &v->f_unmap, &v->f_opt, &v->f_log, &f_parent, &f_resize, &f_inst, &f_data, &f_idle, NULL };
+    const LV2_Feature *feats_ext[] = { &v->f_map, &v->f_unmap, &v->f_opt, &v->f_log, &f_inst, &f_data, &f_idle, &f_ext, &f_ext_old, NULL };
+    const LV2_Feature *feats_gtk[] = { &v->f_map, &v->f_unmap, &v->f_opt, &v->f_log, &f_inst, &f_data, &f_idle, NULL };
+    const LV2_Feature **feats = external ? feats_ext : gtk ? feats_gtk : feats_x11;
     LV2UI_Widget widget = NULL;
     const char *plug_uri = L.node_as_uri(L.plugin_get_uri(v->plug));
     v->ui_desc = d;
@@ -446,12 +591,28 @@ static int lv_ed_open(void *h, PlugWin *w, int *W, int *H, char *err, int esz)
     v->ui = d->instantiate(d, plug_uri, bundle, ui_write, v, &widget, feats);
     if (!v->ui) { dlclose(lib); v->ui_lib = NULL; v->ui_desc = NULL; v->win = NULL; snprintf(err, (size_t)esz, "the plugin window failed to start"); return -1; }
     v->ui_idle = d->extension_data ? d->extension_data(LV2_UI__idleInterface) : NULL;
-    /* the initial values of the knobs */
+    v->ext_widget = NULL;
+    if (external) {                                  /* its own window: ours only keeps the place, hidden */
+        v->ext_widget = (LV2_External_UI_Widget *)widget;
+        plugwin_set_external(w, ext_ui_raise, v);
+    }
+    if (gtk) {                                       /* a Gtk window around the plugin's Gtk widget */
+        if (!widget) { d->cleanup(v->ui); v->ui = NULL; dlclose(lib); v->ui_lib = NULL; v->ui_desc = NULL; v->win = NULL;
+                       snprintf(err, (size_t)esz, "the plugin window failed to start"); return -1; }
+        v->gtk_win = G.window_new(0);
+        G.set_title(v->gtk_win, plugwin_title(w));
+        G.container_add(v->gtk_win, widget);
+        G.signal_connect(v->gtk_win, "delete-event", (void (*)(void))gtk_delete_cb, v, NULL, 0);
+        G.show_all(v->gtk_win);
+        plugwin_set_external(w, gtk_raise, v);
+    }
+    /* the initial values of the knobs (2.0: port_event is optional in LV2 - a window without it crashed Q-LiM) */
     for (int i = 0; i < v->nports; ++i) if (v->is_ctrl[i]) {
         float val = v->ctrl[i];
-        d->port_event(v->ui, (uint32_t)i, sizeof(float), 0, &val);
+        if (d->port_event) d->port_event(v->ui, (uint32_t)i, sizeof(float), 0, &val);
         v->ui_last[i] = val;
     }
+    if (v->ext_widget && v->ext_widget->show) v->ext_widget->show(v->ext_widget);
     return 0;
 }
 
@@ -467,18 +628,22 @@ static void lv_ed_idle(void *h)
     for (int i = 0; i < v->nports; ++i) {                /* output controls (meters) */
         if (!v->is_ctrl[i] || v->ctrl_in[i]) continue;
         float val = v->ctrl[i];
-        if (val != v->ui_last[i]) { v->ui_last[i] = val; v->ui_desc->port_event(v->ui, (uint32_t)i, sizeof(float), 0, &val); }
+        if (val != v->ui_last[i]) { v->ui_last[i] = val; if (v->ui_desc->port_event) v->ui_desc->port_event(v->ui, (uint32_t)i, sizeof(float), 0, &val); }
     }
-    if (v->ui_idle && v->ui_idle->idle(v->ui) != 0) {   /* the interface wants to be closed */
-        /* closed by qplug (there is no close_requested for LV2) - here we just leave it */
-    }
+    if (v->ext_widget && v->ext_widget->run) v->ext_widget->run(v->ext_widget);   /* external window: let it work */
+    if (v->gtk_win) gtk_pump();
+    if (v->ui && v->ui_idle && v->ui_idle->idle(v->ui) != 0 && v->win)            /* the interface wants to be closed */
+        plugwin_request_close(v->win);
 }
 
 static void lv_ed_close(void *h)
 {
     LV *v = h;
     if (!v->ui) return;
+    if (v->ext_widget && v->ext_widget->hide) v->ext_widget->hide(v->ext_widget);
+    v->ext_widget = NULL;
     v->ui_desc->cleanup(v->ui);
+    if (v->gtk_win) { G.destroy(v->gtk_win); v->gtk_win = NULL; gtk_pump(); }
     v->ui = NULL;
     dlclose(v->ui_lib);
     v->ui_lib = NULL; v->ui_desc = NULL; v->ui_idle = NULL; v->win = NULL;

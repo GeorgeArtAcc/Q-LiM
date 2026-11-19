@@ -18,8 +18,14 @@ void          plugwin_show(PlugWin *w);
 void          plugwin_raise(PlugWin *w);
 unsigned long plugwin_xid(PlugWin *w);
 void          plugwin_resize(PlugWin *w, int width, int height);
-void          plugwin_get_size(PlugWin *w, int *width, int *height);
 bool          plugwin_close_requested(PlugWin *w);     /* the user pressed X on the window */
+void          plugwin_request_close(PlugWin *w);       /* 2.0.0: the plugin itself asked to be closed */
+/* 2.0.0: the plugin opens its OWN window (LV2 external UI) - ours stays hidden and only keeps the place */
+void          plugwin_set_external(PlugWin *w, void (*raise)(void *ud), void *ud);
+const char   *plugwin_title(PlugWin *w);
+/* 2.0.0: the Q-LiM main window (plugin windows stay above it) - a separate plugin process gets it from Q-LiM */
+void          plugwin_set_main_xid(unsigned long xid);
+unsigned long plugwin_main_xid(void);
 void          plugwin_destroy(PlugWin *w);
 #ifdef _WIN32
 void         *plugwin_native(PlugWin *w);              /* Windows: the HWND the plugin attaches to */

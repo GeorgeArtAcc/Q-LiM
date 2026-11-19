@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 #include "sdlgfx.h"
 #include "audio.h"
+#include "outx.h"
 #include "stream.h"
 #include "session.h"
 #include "stretch.h"
@@ -16,14 +17,18 @@
 #include "ui.h"
 #include "filebrowser.h"
 #include "project.h"
+#include "wav.h"
 #include "settings.h"
 #include "midi.h"
+#include "midimap.h"
+#include "schedule.h"
 #include "theme.h"
 #include "dropfiles.h"
 #include "undo.h"
 #include "plugins.h"
 #include "fxchain.h"
 #include "perf.h"
+#include "plughost.h"
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
@@ -44,12 +49,112 @@ static bool g_recovered_unsaved = false;      /* the work was recovered from an 
 /* 1.3: the clipboard "path" of a copied MIDI clip (its notes are in the clipboard edits text) */
 #define MIDI_CLIP_MARK "<midi clip>"
 
+
+/* Enter (and 1.4.2: a controller's Launch button): play what is selected */
+static void launch_cell(Session *session, int sel_ch, int sel_sc);
+
+static void launch_selection(Session *session)
+{
+    int sel_ch = -1, sel_sc = -1;
+    ui_get_selection(&sel_ch, &sel_sc);
+    launch_cell(session, sel_ch, sel_sc);
+}
+
+/* a cell: a clip plays (or starts again), an empty cell stops its channel; ch == -1 = the whole scene */
+static void launch_cell(Session *session, int sel_ch, int sel_sc)
+{
+    if (sel_sc < 0 || sel_sc >= session->scene_count || sel_ch >= session->channel_count) return;
+    if (sel_ch == -1) {
+        session_play_scene(session, sel_sc);
+        return;
+    }
+    Clip *cl = &session->channels[sel_ch].clips[sel_sc];
+    if (atomic_load(&cl->has_clip) && !atomic_load(&cl->is_note)) {
+        session_toggle_clip(session, sel_ch, sel_sc);           // playing -> restart; not playing -> play
+    } else if (atomic_load(&cl->has_clip) && atomic_load(&cl->is_note)) {
+        ui_flash_message("Note (not playable)");
+    } else {
+        for (int sc = 0; sc < session->scene_count; ++sc) {     // an empty cell = stop the channel
+            Clip *other = &session->channels[sel_ch].clips[sc];
+            if (atomic_load(&other->has_clip)) {
+                atomic_store(&other->playing, false);
+                atomic_store(&other->paused, false);
+            }
+        }
+    }
+}
+
+/* 1.4.2: the controller buttons of MIDI Settings (midimap.h) */
+static void on_midimap(int action, int delta, void *user)
+{
+    Session *s = (Session *)user;
+    if (!s) return;
+    int steps = delta < 0 ? -delta : delta, dir = delta < 0 ? -1 : 1;
+    if (steps > 8) steps = 8;
+    switch (action) {
+    case MM_UP: case MM_DOWN:       ui_move_selection(s, 0, dir); break;
+    case MM_LEFT: case MM_RIGHT:    ui_move_selection(s, dir, 0); break;
+    case MM_WHEEL_V:                for (int i = 0; i < steps; ++i) ui_move_selection(s, 0, dir); break;
+    case MM_WHEEL_H:                for (int i = 0; i < steps; ++i) ui_move_selection(s, dir, 0); break;
+    case MM_PAD: {                  /* 1.4.8: a pad of the box: its cell */
+        int c0, r0, w, h;
+        ui_pad_box(s, &c0, &r0, &w, &h);
+        int i = delta;
+        if (i < 0 || i >= w * h) break;
+        launch_cell(s, c0 + i % w, r0 + i / w);
+        break;
+    }
+    case MM_LAUNCH:                 /* 1.4.8: with a pad box (as in Ableton): the scene of the selected row */
+        if (midimap_pads_active()) {
+            int c0, r0, w, h;
+            ui_pad_box(s, &c0, &r0, &w, &h);
+            if (r0 >= 0) session_play_scene(s, r0);
+        } else launch_selection(s);
+        break;
+    case MM_STOP: {
+        int ch = -1, sc = -1;
+        ui_get_selection(&ch, &sc);
+        if (midimap_pads_active()) {                /* 1.4.8: the channels of the box */
+            int c0, r0, w, h;
+            ui_pad_box(s, &c0, &r0, &w, &h);
+            for (int c = c0; c < c0 + w && c < s->channel_count; ++c)
+                for (int k = 0; k < s->scene_count; ++k) if (atomic_load(&s->channels[c].clips[k].playing)) session_stop_clip(s, c, k);
+        } else if (sc >= 0) { if (ch == -1) session_stop_scene(s, sc); else session_stop_clip(s, ch, sc); }
+        break;
+    }
+    case MM_STOP_ALL:               session_stop_all(s); break;
+    case MM_MASTER_MUTE:            atomic_store(&s->master_muted, !atomic_load(&s->master_muted)); break;
+    case MM_SCENE_NEXT:             ui_scene_next(s); break;           /* 1.4.17 */
+    case MM_SCENE_BACK:             ui_scene_back(s); break;
+    case MM_AUTO_STOP:              ui_automation_toggle(s); break;
+    case MM_FADE_TIME:              ui_fade_time_midi(s, delta); break;   /* (steps, or 1000 + the knob 0..127) */
+    }
+}
+
 static void on_midi_cc(int cc, int value, int channel, void *user_data)
 {
     (void)channel;
     Session *s = (Session *)user_data;
     if (!s) return;
     undo_poke(GetTime());
+    if (midimap_learning() >= 0 || midimap_pads_learning() >= 0) { midimap_handle(MIDI_BIND_CC, cc, value); return; }   /* 1.4.2 */
+    {   /* 1.4.14: MIDI Learn of a plugin parameter */
+        char lm[200];
+        if (fxchain_learn_cc(s, cc, lm, sizeof lm)) { ui_flash_message(lm); return; }
+    }
+    {   /* 1.4.17: MIDI Learn of a separated part's level */
+        int lc, ls, lk;
+        if (session_stem_learn_armed(&lc, &ls, &lk)) {
+            session_stem_learn_arm(-1, -1, -1);
+            if (session_clip_stem_count(s, lc, ls) > lk) {
+                session_clip_set_stem_cc(s, lc, ls, lk, cc);
+                char lm[160];
+                snprintf(lm, sizeof lm, "MIDI: CC %d now moves the %s level", cc, session_clip_stem_name(s, lc, ls, lk));
+                ui_flash_message(lm);
+            }
+            return;
+        }
+    }
 
     int pan_armed = session_get_armed_pan_channel(s);
     if (pan_armed != -2) {
@@ -76,6 +181,10 @@ static void on_midi_cc(int cc, int value, int channel, void *user_data)
         session_handle_midi_button(s, MIDI_BIND_CC, cc, value);
         return;
     }
+
+    if (midimap_handle(MIDI_BIND_CC, cc, value)) return;        /* 1.4.2: a controller button / jog wheel */
+    fxchain_midi_cc(s, cc, value);                               /* 1.4.14: MIDI-learned plugin parameters */
+    session_stems_midi_cc(s, cc, value);                         /* 1.4.17: the levels of separated parts */
 
     for (int c = 0; c < s->channel_count; ++c) {
         int mapped_cc = session_get_midi_cc(s, c);
@@ -111,6 +220,7 @@ static void on_midi_note(int note, int velocity, bool on, int channel, void *use
     undo_poke(GetTime());
     // Note Off does nothing (the pads are "press = play/toggle")
     if (!on) return;
+    if (!session_get_button_learn(s, NULL, NULL, NULL) && midimap_handle(MIDI_BIND_NOTE, note, velocity)) return;  /* 1.4.2 */
     session_handle_midi_button(s, MIDI_BIND_NOTE, note, velocity);
 }
 
@@ -170,6 +280,66 @@ static bool do_save_as(Session *session)
     return false;
 }
 
+static void do_open_path(Session *session, const char *path);
+static char g_coll_dir[1200], g_coll_name[128];          /* 2.0: waiting for the answer about compressed files */
+
+/* 2.0: Collect All & Save runs in its own thread - the window stays alive and shows a progress bar (converting a long
+ * MP3 takes a while on an old computer); the window is modal meanwhile, so nothing changes the clips under it */
+static volatile int g_coll_state;                       /* 0 = idle, 1 = running, 2 = finished (the main loop ends it) */
+static int g_coll_rc, g_coll_conv;
+static pthread_t g_coll_thr;
+static Session *g_coll_session;
+static int g_coll_fmt;
+static void *collect_thread(void *arg)
+{
+    (void)arg;
+    int conv = 0;
+    g_coll_rc = project_collect_and_save(g_coll_session, g_coll_dir, g_coll_name, g_coll_fmt, &conv);
+    g_coll_conv = conv;
+    __atomic_store_n(&g_coll_state, 2, __ATOMIC_RELEASE);
+    return NULL;
+}
+static void collect_finish(Session *session, int fmt)
+{
+    if (fmt < 0) { ui_flash_message("Collect cancelled"); return; }
+    if (g_coll_state != 0) return;
+    g_coll_session = session; g_coll_fmt = fmt;
+    g_coll_state = 1;
+    ui_collect_busy(true);
+    if (pthread_create(&g_coll_thr, NULL, collect_thread, NULL) != 0) {   /* no thread: do it here */
+        collect_thread(NULL);
+        g_coll_thr = (pthread_t)0;
+    }
+}
+/* main loop: the collect thread is done -> the messages, and the collected project is opened if files were converted */
+static void collect_poll(Session *session)
+{
+    if (__atomic_load_n(&g_coll_state, __ATOMIC_ACQUIRE) != 2) return;
+    if (g_coll_thr) pthread_join(g_coll_thr, NULL);
+    g_coll_thr = (pthread_t)0;
+    g_coll_state = 0;
+    ui_collect_busy(false);
+    int conv = g_coll_conv;
+    if (g_coll_rc == 0) {
+        char proj_file[1400];
+        snprintf(proj_file, sizeof(proj_file), "%s/%s.limproject", g_coll_dir, g_coll_name);
+        if (conv > 0) {
+            /* 2.0: open the collected project, so the show plays from the new files right away */
+            do_open_path(session, proj_file);
+        } else {
+            project_set_current_path(proj_file);
+            undo_mark_saved(session);
+            g_recovered_unsaved = false;
+        }
+        char msg[1600];
+        if (conv > 0) snprintf(msg, sizeof msg, "Collected to: %s (%d file%s converted - it plays from there now)", g_coll_dir, conv, conv == 1 ? "" : "s");
+        else snprintf(msg, sizeof msg, "Collected to: %s", g_coll_dir);
+        ui_flash_message(msg);
+    } else {
+        ui_flash_message("Collect failed");
+    }
+}
+
 static void do_collect(Session *session)
 {
     /* 1) the name of the project folder, 2) WHERE it should be (it used to always go into ~/qlim/Projects without asking) */
@@ -179,21 +349,13 @@ static void do_collect(Session *session)
     char base[1024];
     if (ext_project_ask_directory(base, sizeof(base)) != 0) return;
 
-    char project_dir[1200];
-    snprintf(project_dir, sizeof(project_dir), "%s/%s", base, name);
-
-    if (project_collect_and_save(session, project_dir, name) == 0) {
-        char proj_file[1400];
-        snprintf(proj_file, sizeof(proj_file), "%s/%s.limproject", project_dir, name);
-        project_set_current_path(proj_file);
-        undo_mark_saved(session);
-        g_recovered_unsaved = false;
-        char msg[1500];
-        snprintf(msg, sizeof msg, "Collected to: %s", project_dir);
-        ui_flash_message(msg);
-    } else {
-        ui_flash_message("Collect failed");
-    }
+    snprintf(g_coll_dir, sizeof(g_coll_dir), "%s/%s", base, name);
+    snprintf(g_coll_name, sizeof g_coll_name, "%s", name);
+    /* 2.0: compressed files -> ask what they become (the answer arrives in the main loop) */
+    int nc = project_collect_count_compressed(session);
+    if (g_coll_state != 0) return;                     /* one is running already */
+    if (nc > 0) { ui_open_collect_choice(nc); return; }
+    collect_finish(session, WAV_OUT_KEEP);
 }
 
 static void do_new(Session *session)
@@ -375,6 +537,7 @@ static bool take_open_request(char *out, size_t n)
 static char g_crash_file[1024];       /* 1.3.13: ~/.config/qlim/crash-report.txt (made ready at the start) */
 static void crash_handler(int sig)
 {
+    qplug_crash_note();                             /* 2.0.0: a plugin did it -> next time it runs in a separate process */
 #ifdef QLIM_HAVE_BACKTRACE
     void *bt[40];
     int n = backtrace(bt, 40);
@@ -413,6 +576,7 @@ static void crash_handler(int sig)
 static atomic_long g_main_beat;                       /* frame counter */
 static pthread_t   g_main_tid;
 static Session    *g_watch_session;
+static pthread_mutex_t g_watch_mu = PTHREAD_MUTEX_INITIALIZER;   /* 2.1: the session is not freed while the watchdog reads it */
 
 #ifdef _WIN32
 static void freeze_report(void)
@@ -448,6 +612,7 @@ static void *freeze_watch(void *arg)
         if (GfxExternalDialogActive()) still = 0;       /* step 36l: the file chooser window is open - we are waiting for the human */
         if (b == last) { if (++still >= 10 && !told) {
             told = true;
+            qplug_freeze_note(false);
 #ifdef _WIN32
             freeze_report();
 #else
@@ -456,6 +621,7 @@ static void *freeze_watch(void *arg)
         } }
         else { if (told) fprintf(stderr, ">>> Q-LiM: the interface is responding again\n"); still = 0; told = false; }
         last = b;
+        pthread_mutex_lock(&g_watch_mu);
         Session *s = g_watch_session;
         if (s && atomic_load(&s->audio_running)) {
             unsigned ac = atomic_load(&s->audio_cycles);
@@ -463,19 +629,23 @@ static void *freeze_watch(void *arg)
                 if (++a_still >= 4 && !a_told) {
                     a_told = true;
                     fprintf(stderr, ">>> Q-LiM: audio is stuck for 4 s (a plugin is not answering?)\n");
+                    qplug_freeze_note(true);
                 }
             } else { a_still = 0; a_told = false; }
             last_ac = ac;
         }
+        pthread_mutex_unlock(&g_watch_mu);
     }
     return NULL;
 }
 
 /* Ctrl+C in the terminal: the first two times - a normal close (asks to save); the third - exit immediately */
 static void (*g_old_sigint)(int);
+static volatile sig_atomic_t g_sigint_quit;       /* 2.1: Ctrl+C (or kill -INT) = a normal quit, which asks about unsaved work */
 static void sigint_handler(int sig)
 {
     static volatile sig_atomic_t n;
+    g_sigint_quit = 1;
     if (++n >= 3) {
         static const char m[] = "\n>>> Q-LiM: Ctrl+C x3 - exiting now (your work is in the autosave)\n";
         if (write(2, m, sizeof m - 1) < 0) {}
@@ -527,13 +697,24 @@ int main(int argc, char **argv)
     qw_init(&argc, &argv);                          /* UTF-8 arguments, HOME, the folder of qlim.exe */
 #endif
     if (argc >= 4 && strcmp(argv[1], "--plugin-scan") == 0) return plugins_scan_child_main(argc, argv);
+    /* 2.0.0: one plugin in a separate process (started by Q-LiM itself, see plugbridge.c) */
+    if (argc >= 4 && strcmp(argv[1], "--plugin-host") == 0) return qplug_host_child_main(argc, argv);
     applog_init();                                  // everything written also goes into the log (the indicator at the top right)
 #ifdef _WIN32
     setvbuf(stdout, NULL, _IONBF, 0);              /* msvcrt has no line buffering */
 #else
     setvbuf(stdout, NULL, _IOLBF, 0);
 #endif
+    {
+        char sp[1024];
+        qlim_cfg_path(sp, sizeof sp, "plugins-separate.txt");
+        qplug_separate_init(sp);                    /* 2.0.0: which plugins run in a separate process */
+    }
 #ifdef _WIN32
+    {
+        extern void (*qw_crash_hook)(const char *module_file);
+        qw_crash_hook = qplug_crash_note_module;
+    }
     qw_install_crash_handler();
 #else
     qlim_cfg_path(g_crash_file, sizeof g_crash_file, "crash-report.txt");
@@ -544,6 +725,7 @@ int main(int argc, char **argv)
     signal(SIGILL, crash_handler);
 #endif
     printf("Q-LiM %s build: %s %s  [%s]\n", QLIM_VERSION, __DATE__, __TIME__, QLIM_STEP);
+    qplug_set_report_hook(ui_flash_message);       /* 2.0.0: "plugin X crashed" on the screen */
     /* step 36l: a project from the command line / the file manager */
     char open_abs[PATH_MAX] = "";
     if (argc >= 2 && argv[1][0] != '-') {
@@ -569,6 +751,13 @@ int main(int argc, char **argv)
     const char *home = getenv("HOME");
     char music_dir[512];
     snprintf(music_dir, sizeof(music_dir), "%s/Music", home ? home : "");
+    {   /* 1.4.12: the start folder chosen in the library (if it is still there) */
+        char saved[512];
+        struct stat st_;
+        if (settings_load_library_dir(saved, sizeof saved) && stat(saved, &st_) == 0 && S_ISDIR(st_.st_mode))
+            snprintf(music_dir, sizeof music_dir, "%s", saved);
+        else if (stat(music_dir, &st_) != 0) snprintf(music_dir, sizeof music_dir, "%s", home ? home : ".");
+    }
 
     FileBrowser fb;
     fb_init(&fb, music_dir);
@@ -589,6 +778,7 @@ int main(int argc, char **argv)
 
     AudioConfig cfg;
     settings_load_audio(&cfg);
+    outx_load();                                   /* 1.4.21: the extra sound cards and the delays of the outputs */
 
     if (audio_init(session, &cfg) != 0) {
         TraceLog(LOG_ERROR, "Audio init failed");
@@ -600,12 +790,21 @@ int main(int argc, char **argv)
 
     if (cfg.backend == AUDIO_BACKEND_PIPEWIRE && audio_get_current_config().backend != AUDIO_BACKEND_PIPEWIRE)
         ui_flash_message("PipeWire is not available - using PortAudio (see log)");
+    else if (audio_rate_note()[0]) ui_flash_message(audio_rate_note());     /* 1.4.9 */
 
     // The session rate = the real rate of the audio stream (not always 48000), and the file mode
     session->sample_rate = audio_get_current_config().sample_rate;
     session_set_convert_files(session, cfg.convert_files != 0);
     streams_set_disk_mode(cfg.disk_mode);
 
+    {   /* 1.4.11: loudness normalization */
+        int lt; bool ld;
+        settings_load_loudness(&lt, &ld);
+        session_set_loudness(session, lt, ld);
+    }
+    midimap_load();                                      /* 1.4.2: controller buttons */
+    midimap_set_handler(on_midimap, session);
+    sched_set_waker(GfxWakeFromThread);                  /* 1.4.17: a launch at a clock time wakes the loop */
     if (midi_init() != 0) {
         TraceLog(LOG_WARNING, "MIDI init failed (continuing anyway)");
     } else {
@@ -672,8 +871,9 @@ int main(int argc, char **argv)
             unsigned e = qplug_edit_count();
             if (e != seen_edits) { seen_edits = e; undo_mark_plugin_changed(); }
         }
-        if (WindowShouldClose()) {
+        if (WindowShouldClose() || g_sigint_quit) {
             ClearWindowShouldClose();                 // do not close right away: there may be unsaved work
+            g_sigint_quit = 0;
             request_action(session, PENDING_QUIT);
         }
         if (g_quit_now) break;
@@ -702,34 +902,7 @@ int main(int argc, char **argv)
                 }
             }
 
-            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-                int sel_ch = -1, sel_sc = -1;
-                ui_get_selection(&sel_ch, &sel_sc);
-
-                if (sel_sc >= 0) {
-                    if (sel_ch == -1) {
-                        session_play_scene(session, sel_sc);
-                    } else {
-                        Clip *cl = &session->channels[sel_ch].clips[sel_sc];
-                        if (atomic_load(&cl->has_clip) &&
-                            !atomic_load(&cl->is_note)) {
-                            // playing -> restart; not playing -> play (toggle does both)
-                            session_toggle_clip(session, sel_ch, sel_sc);
-                        } else if (atomic_load(&cl->has_clip) &&
-                                   atomic_load(&cl->is_note)) {
-                            ui_flash_message("Note (not playable)");
-                        } else {
-                            for (int sc = 0; sc < session->scene_count; ++sc) {
-                                Clip *other = &session->channels[sel_ch].clips[sc];
-                                if (atomic_load(&other->has_clip)) {
-                                    atomic_store(&other->playing, false);
-                                    atomic_store(&other->paused, false);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) launch_selection(session);
 
             if (IsKeyPressed(KEY_DELETE) || IsKeyPressed(KEY_BACKSPACE)) {
                 /* step 36: a selected channel -> deletes the channel(s); marked clips -> deletes all of them */
@@ -870,7 +1043,7 @@ int main(int argc, char **argv)
                             ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
                             { char *mt_ = session_midi_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(mt_); free(mt_); }
                         } else if (!atomic_load(&cl->is_note)) {
-                            ui_clipboard_copy_clip(cl->path, cl->name);
+                            ui_clipboard_copy_clip(cl->path, cl->name); ui_clipboard_set_mc(cl->mc_mode, atomic_load(&cl->mc_out), cl->mc_orig ? cl->mc_orig : "");
                             { char *et_ = session_clip_edits_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
                             ui_clipboard_copy_clip("", cl->name);
@@ -891,7 +1064,7 @@ int main(int argc, char **argv)
                             ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
                             { char *mt_ = session_midi_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(mt_); free(mt_); }
                         } else if (!atomic_load(&cl->is_note)) {
-                            ui_clipboard_copy_clip(cl->path, cl->name);
+                            ui_clipboard_copy_clip(cl->path, cl->name); ui_clipboard_set_mc(cl->mc_mode, atomic_load(&cl->mc_out), cl->mc_orig ? cl->mc_orig : "");
                             { char *et_ = session_clip_edits_text(session, sel_ch, sel_sc); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
                             ui_clipboard_copy_clip("", cl->name);
@@ -917,6 +1090,7 @@ int main(int argc, char **argv)
                         session_set_note(session, sel_ch, sel_sc, name);
                         ui_flash_message("Pasted note");
                     } else if (path[0] != '\0') {
+                        ui_clipboard_mc_next();
                         if (session_set_clip(session, sel_ch, sel_sc, path) == 0) {
                             session_clip_set_edits_text(session, sel_ch, sel_sc, ui_clipboard_edits());
                             if (name[0] != '\0') {
@@ -953,6 +1127,11 @@ int main(int argc, char **argv)
             }
         }
 
+        {   int cfmt;                              /* 2.0: the answer of the Collect question */
+            if (ui_take_collect_choice(&cfmt)) collect_finish(session, cfmt);
+            collect_poll(session);
+        }
+
         EditMenuAction em_act;
         if (ui_take_edit_action(&em_act)) {
             switch (em_act) {
@@ -986,9 +1165,32 @@ int main(int argc, char **argv)
         session_poll_bpm(session);                 // the finished tempo detections from the background thread
         session_queue_tick(session);               // the queue: prepares the next one / cleans up
         session_quant_tick(session);               // 1.1: quantized launch - finishes what the audio thread did
+        {   /* 1.4.8: the notes of the controller buttons / pad box do not play the instruments either */
+            unsigned nm[4];
+            midimap_note_mask(nm);
+            session_set_extra_bound(session, nm, midimap_learning() >= 0 || midimap_pads_learning() >= 0);
+        }
+        {   /* 1.4.11: the measured loudness of the clips -> their normalization (4 times a second) */
+            static double s_loud_t;
+            double now_l = GetTime();
+            if (now_l - s_loud_t > 0.25) { s_loud_t = now_l; session_update_loudness(session); }
+        }
         session_midi_tick(session);                // 1.2: notes bound to pads do not play the instruments
         session_rec_tick(session);                 // 1.4: recordings -> files / notes; finished ones become clips
         health_watch(session);                     // xrun, overload... -> log
+        {   /* 1.4.9: PipeWire graph mode: the graph changed its rate under us -> open the audio again (else: transposed) */
+            int drift = audio_rate_drift();
+            if (drift > 0) {
+                AudioConfig cur = audio_get_current_config();
+                cur.sample_rate = audio_rate_wanted();
+                printf(">>> PipeWire graph is at %d Hz now - opening the audio again\n", drift);
+                audio_shutdown();
+                if (audio_init(session, &cur) == 0) {
+                    session_set_sample_rate(session, audio_get_current_config().sample_rate);
+                    if (audio_rate_note()[0]) ui_flash_message(audio_rate_note());
+                }
+            }
+        }
         if (ui_take_audio_refresh()) {
             /* PortAudio remembers the list from startup -> close it and open it again */
             bool was_lost = audio_is_lost();
@@ -1048,13 +1250,17 @@ int main(int argc, char **argv)
 
                 if (audio_init(session, &new_cfg) == 0) {
                     AudioConfig applied = audio_get_current_config();
+                    int actual_sr = applied.sample_rate;
                     applied.convert_files = want_convert;
                     applied.disk_mode = new_cfg.disk_mode;
+                    if (applied.backend == AUDIO_BACKEND_PIPEWIRE) applied.sample_rate = audio_rate_wanted();   /* 1.4.9: the choice is kept */
                     settings_save_audio(&applied);
                     // new rate -> the clips are reloaded for it (the markers are scaled)
-                    int failed = session_set_sample_rate(session, applied.sample_rate);
+                    int failed = session_set_sample_rate(session, actual_sr);
                     if (new_cfg.backend == AUDIO_BACKEND_PIPEWIRE && applied.backend != AUDIO_BACKEND_PIPEWIRE)
                         ui_flash_message("PipeWire could not start - using PortAudio instead (see log)");
+                    else if (audio_rate_note()[0])
+                        ui_flash_message(audio_rate_note());
                     else
                         ui_flash_message(failed > 0 ? "Audio applied (some clips could not be reloaded)"
                                                     : "Audio settings applied");
@@ -1147,7 +1353,7 @@ int main(int argc, char **argv)
                             ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
                             { char *mt_ = session_midi_text(session, act.ch, act.scene); ui_clipboard_set_edits(mt_); free(mt_); }
                         } else if (!atomic_load(&cl->is_note)) {
-                            ui_clipboard_copy_clip(cl->path, cl->name);
+                            ui_clipboard_copy_clip(cl->path, cl->name); ui_clipboard_set_mc(cl->mc_mode, atomic_load(&cl->mc_out), cl->mc_orig ? cl->mc_orig : "");
                             { char *et_ = session_clip_edits_text(session, act.ch, act.scene); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
                             ui_clipboard_copy_clip("", cl->name);
@@ -1166,7 +1372,7 @@ int main(int argc, char **argv)
                             ui_clipboard_copy_clip(MIDI_CLIP_MARK, cl->name);
                             { char *mt_ = session_midi_text(session, act.ch, act.scene); ui_clipboard_set_edits(mt_); free(mt_); }
                         } else if (!atomic_load(&cl->is_note)) {
-                            ui_clipboard_copy_clip(cl->path, cl->name);
+                            ui_clipboard_copy_clip(cl->path, cl->name); ui_clipboard_set_mc(cl->mc_mode, atomic_load(&cl->mc_out), cl->mc_orig ? cl->mc_orig : "");
                             { char *et_ = session_clip_edits_text(session, act.ch, act.scene); ui_clipboard_set_edits(et_); free(et_); }
                         } else {
                             ui_clipboard_copy_clip("", cl->name);
@@ -1187,6 +1393,7 @@ int main(int argc, char **argv)
                     } else if (path[0] == '\0' && name[0] != '\0') {
                         session_set_note(session, act.ch, act.scene, name);
                     } else if (path[0] != '\0') {
+                        ui_clipboard_mc_next();
                         if (session_set_clip(session, act.ch, act.scene, path) == 0) {
                             session_clip_set_edits_text(session, act.ch, act.scene, ui_clipboard_edits());
                             if (name[0] != '\0') {
@@ -1219,10 +1426,14 @@ int main(int argc, char **argv)
         }
 
         midi_poll();
+        session_stems_poll(session, GetTime());                   /* 1.4.17 */
+        if (sched_count() > 0) { sched_tick(session); GfxWakeDone(); }   /* 1.4.17: launches at a clock time */
 
         // We left MIDI Learn -> nothing must stay "waiting"
         if (!ui_midi_learn_is_active()) {
             session_disarm_button_learn(session);
+            if (!ui_midi_settings_is_open() && midimap_learning() >= 0) midimap_learn(-1);   /* 1.4.2 */
+            if (!ui_midi_settings_is_open() && midimap_pads_learning() >= 0) midimap_pads_learn(false);   /* 1.4.8 */
         }
 
         // Undo/redo: takes a snapshot when something has changed and the mouse is released
@@ -1268,6 +1479,7 @@ int main(int argc, char **argv)
         EndDrawing();
     }
 
+    if (g_coll_state != 0 && g_coll_thr) pthread_join(g_coll_thr, NULL);   /* 2.0: a running collect ends first */
     autosave_clean_exit();
     undo_shutdown();
     midi_shutdown();
@@ -1275,6 +1487,9 @@ int main(int argc, char **argv)
     GfxGLRelease();
     fxchain_shutdown(session);
     GfxGLRestore();
+    pthread_mutex_lock(&g_watch_mu);                  /* 2.1: the watchdog thread no longer looks at it (it read a freed */
+    g_watch_session = NULL;                           /* session at exit - found by the GUI monkey test under ASan) */
+    pthread_mutex_unlock(&g_watch_mu);
     session_free(session);
     free(session);
     CloseWindow();

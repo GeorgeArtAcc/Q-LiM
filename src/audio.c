@@ -6,12 +6,22 @@
 #include "dsp_meter.h"
 #include "devwatch.h"
 #include "audio_pw.h"
+#include "outx.h"
+#include <stdint.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <portaudio.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#ifndef _WIN32
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -78,7 +88,7 @@ static int pa_callback(const void *input, void *output,
     uint64_t t0 = dsp_meter_now_ns();
     int ich = atomic_load_explicit(&g_in_ch, memory_order_acquire);
     if (input && ich > 0) mixer_set_input((const float *)input, ich, frame_count);   /* 1.4 */
-    mixer_render(g_session, (float *)output, frame_count, atomic_load_explicit(&g_cb_ch, memory_order_acquire));
+    outx_render(g_session, (float *)output, (unsigned)frame_count, atomic_load_explicit(&g_cb_ch, memory_order_acquire));   /* 1.4.21 */
     dsp_meter_end(t0, frame_count, g_config.sample_rate);
     return paContinue;
 }
@@ -98,6 +108,7 @@ static int win_api_rank(const PaDeviceInfo *info)
 }
 #endif
 
+static bool api_unusable_here(PaHostApiIndex api);
 static PaDeviceIndex find_device_by_name(const char *needle)
 {
     int n = Pa_GetDeviceCount();
@@ -106,7 +117,7 @@ static PaDeviceIndex find_device_by_name(const char *needle)
     int best_rank = 99;
     for (int i = 0; i < n; ++i) {
         const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
-        if (info && info->maxOutputChannels > 0 && strstr(info->name, needle)) {
+        if (info && info->maxOutputChannels > 0 && strstr(info->name, needle) && !api_unusable_here(info->hostApi)) {
             int r = win_api_rank(info);
             if (r < best_rank) { best_rank = r; best = i; }
         }
@@ -125,11 +136,53 @@ static PaDeviceIndex find_device_by_name(const char *needle)
 }
 
 /* the system's default output; on Windows the WASAPI one (if there is WASAPI) */
+/* 1.4.1: crash guard. A marker file is written before the sound card is opened and removed once the sound runs
+ * (or at a normal exit). If Q-LiM finds it at start, the last start crashed inside the driver: the saved audio
+ * settings are set aside (audio.conf -> audio.conf.crashed) and the default device is used, so Q-LiM can start. */
+#include "settings.h"
+static bool g_start_mark;
+static void start_mark_path(char *out, size_t n)
+{
+    char p[1024];
+    settings_get_config_path(p, sizeof p);
+    char *slash = strrchr(p, '/');
+    if (slash) slash[1] = 0;
+    snprintf(out, n, "%saudio-starting", p);
+}
+static bool start_mark_found(void)
+{
+    char m[1100]; start_mark_path(m, sizeof m);
+    FILE *f = fopen(m, "r");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+static void start_mark_set(bool on)
+{
+    char m[1100]; start_mark_path(m, sizeof m);
+    if (on) { FILE *f = fopen(m, "w"); if (f) { fputs("Q-LiM is opening the sound card\n", f); fclose(f); } }
+    else remove(m);
+    g_start_mark = on;
+}
+#ifdef _WIN32
+/* WASAPI exists only since Vista; on XP PortAudio may still list it, and opening it crashes */
+#include <windows.h>
+static bool api_unusable_here(PaHostApiIndex api)
+{
+    const PaHostApiInfo *h = Pa_GetHostApiInfo(api);
+    if (!h || h->type != paWASAPI) return false;
+    OSVERSIONINFOA v; memset(&v, 0, sizeof v); v.dwOSVersionInfoSize = sizeof v;
+    return GetVersionExA(&v) && v.dwMajorVersion < 6;
+}
+#else
+static bool api_unusable_here(PaHostApiIndex api) { (void)api; return false; }
+#endif
+
 static PaDeviceIndex default_output_device(void)
 {
 #ifdef _WIN32
     PaHostApiIndex w = Pa_HostApiTypeIdToHostApiIndex(paWASAPI);
-    if (w >= 0) {
+    if (w >= 0 && !api_unusable_here(w)) {            /* (on XP: DirectSound) */
         const PaHostApiInfo *h = Pa_GetHostApiInfo(w);
         if (h && h->defaultOutputDevice != paNoDevice) return h->defaultOutputDevice;
     }
@@ -138,8 +191,15 @@ static PaDeviceIndex default_output_device(void)
         const PaHostApiInfo *h = Pa_GetHostApiInfo(d);
         if (h && h->defaultOutputDevice != paNoDevice) return h->defaultOutputDevice;
     }
+    PaHostApiIndex m = Pa_HostApiTypeIdToHostApiIndex(paMME);
+    if (m >= 0) {
+        const PaHostApiInfo *h = Pa_GetHostApiInfo(m);
+        if (h && h->defaultOutputDevice != paNoDevice) return h->defaultOutputDevice;
+    }
 #endif
-    return Pa_GetDefaultOutputDevice();
+    PaDeviceIndex def = Pa_GetDefaultOutputDevice();
+    const PaDeviceInfo *di = def != paNoDevice ? Pa_GetDeviceInfo(def) : NULL;
+    return di && api_unusable_here(di->hostApi) ? paNoDevice : def;
 }
 
 
@@ -187,7 +247,7 @@ static void pw_render(float *out, uint32_t frames, int ch, void *user)
     atomic_fetch_add_explicit(&g_cb_count, 1u, memory_order_relaxed);
     uint64_t t0 = dsp_meter_now_ns();
     pw_input(frames);
-    mixer_render(g_session, out, frames, ch);
+    outx_render(g_session, out, frames, ch);              /* 1.4.21: + the extra cards, the delays */
     dsp_meter_end(t0, frames, g_config.sample_rate);
 }
 
@@ -245,6 +305,173 @@ static const PwbSink *pw_sink_by_name(const char *name)
 
 static double mono_s(void);
 
+/* ===== 1.4.9: the sample rate in PipeWire graph mode =====
+ * In graph mode the channels are DSP nodes: they run at the rate of the PipeWire graph and PipeWire does NOT convert
+ * them. If the graph stays at 48000 while Q-LiM computes at 88200, everything plays slower and lower (transposed).
+ * So: Q-LiM asks PipeWire to allow the chosen rate (clock.allowed-rates - only for this login, until PipeWire restarts;
+ * most systems allow only 48000), and if the graph (or the sound card) still does not follow, Q-LiM works at the
+ * graph's rate: the files are converted with Q-LiM's resampler and the pitch is right. */
+static char g_rate_note[200];
+static int  g_rate_wanted;                     /* the rate chosen in the dialog (0 = the one in use) */
+static double g_rate_bad_since = -1.0;
+
+const char *audio_rate_note(void) { return g_rate_note; }
+int audio_rate_wanted(void) { return g_rate_wanted > 0 ? g_rate_wanted : g_config.sample_rate; }
+
+static void sleep_ms(int ms)
+{
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    struct timespec t = { ms / 1000, (long)(ms % 1000) * 1000000L };
+    nanosleep(&t, NULL);
+#endif
+}
+
+/* the rate the graph runs at, once our node has run (0 = not known within max_ms) */
+static unsigned pw_wait_graph_rate(int max_ms)
+{
+    unsigned r = 0;
+    for (int t = 0; t < max_ms; t += 20) {
+        PwbStatus st;
+        memset(&st, 0, sizeof st);
+        pwb_get_status(&st);
+        if (st.state == 3 && st.graph_rate > 0 && st.quantum > 0) {
+            r = st.graph_rate;
+            if (t >= 200) break;                         /* give a rate switch a moment to happen */
+        }
+        sleep_ms(20);
+    }
+    return r;
+}
+
+#ifndef _WIN32
+/* runs pw-metadata with these arguments (output thrown away); true = it worked. Never waits more than 3 s. */
+static bool pw_meta_run(const char *key, const char *value)
+{
+    pid_t pid = fork();
+    if (pid == 0) {
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) { dup2(nul, 1); dup2(nul, 2); }
+        execlp("pw-metadata", "pw-metadata", "-n", "settings", "0", key, value, (char *)NULL);
+        _exit(127);
+    }
+    if (pid < 0) return false;
+    int stt = 0;
+    for (int t = 0; t < 3000; t += 20) {
+        pid_t r = waitpid(pid, &stt, WNOHANG);
+        if (r == pid) return WIFEXITED(stt) && WEXITSTATUS(stt) == 0;
+        if (r < 0) return false;
+        sleep_ms(20);
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, &stt, 0);
+    return false;
+}
+
+/* the value of a key of the PipeWire "settings" metadata ("" = not there / no pw-metadata) */
+static void pw_meta_get(const char *key, char *out, size_t n)
+{
+    out[0] = 0;
+    char cmd[160];
+    snprintf(cmd, sizeof cmd, "pw-metadata -n settings 0 %s 2>/dev/null", key);
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+    char line[512], want[96];
+    snprintf(want, sizeof want, "key:'%s'", key);
+    while (fgets(line, sizeof line, p)) {
+        if (!strstr(line, want)) continue;
+        char *v = strstr(line, "value:'");
+        if (!v) continue;
+        v += 7;
+        char *e = strchr(v, '\'');
+        if (e) *e = 0;
+        snprintf(out, n, "%s", v);
+    }
+    pclose(p);
+}
+#endif
+
+/* adds 'rate' to PipeWire's clock.allowed-rates (keeps the ones there, + 44100 and 48000). true = it was run */
+static bool pw_allow_rate(int rate)
+{
+#ifdef _WIN32
+    (void)rate;
+    return false;
+#else
+    int rates[16], n = 0;
+    char cur[256];
+    pw_meta_get("clock.allowed-rates", cur, sizeof cur);    /* "[ 48000 ]" */
+    for (char *q = cur; *q && n < 12; ) {
+        if (*q >= '0' && *q <= '9') { int x = (int)strtol(q, &q, 10); if (x >= 8000 && x <= 768000) rates[n++] = x; }
+        else ++q;
+    }
+    int add[3] = { 44100, 48000, rate };
+    for (int k = 0; k < 3; ++k) {
+        bool have = false;
+        for (int i = 0; i < n; ++i) if (rates[i] == add[k]) have = true;
+        if (!have && n < 16) rates[n++] = add[k];
+    }
+    for (int i = 0; i < n; ++i)                          /* sorted */
+        for (int j = i + 1; j < n; ++j) if (rates[j] < rates[i]) { int t = rates[i]; rates[i] = rates[j]; rates[j] = t; }
+    char list[200] = "[";
+    for (int i = 0; i < n; ++i) { char b[16]; snprintf(b, sizeof b, " %d", rates[i]); strncat(list, b, sizeof list - strlen(list) - 1); }
+    strncat(list, " ]", sizeof list - strlen(list) - 1);
+    printf(">>> PipeWire: allowing %d Hz: clock.allowed-rates '%s'\n", rate, list);
+    return pw_meta_run("clock.allowed-rates", list);
+#endif
+}
+
+/* 1.4.10: PipeWire did not switch by itself (some systems never do) -> hold it at our rate while Q-LiM runs
+ * (clock.force-rate, like "pw-metadata -n settings 0 clock.force-rate 88200"). The old value comes back when the
+ * audio is closed (Q-LiM ends, another rate / card is chosen). Other programs still play right: PipeWire converts them. */
+static bool g_rate_forced;
+static char g_rate_force_prev[32];
+
+static bool pw_force_rate(int rate)
+{
+#ifdef _WIN32
+    (void)rate;
+    return false;
+#else
+    if (!g_rate_forced) pw_meta_get("clock.force-rate", g_rate_force_prev, sizeof g_rate_force_prev);
+    char v[16];
+    snprintf(v, sizeof v, "%d", rate);
+    printf(">>> PipeWire: holding the graph at %d Hz while Q-LiM runs (clock.force-rate, was '%s')\n", rate, g_rate_force_prev);
+    if (!pw_meta_run("clock.force-rate", v)) return false;
+    g_rate_forced = true;
+    return true;
+#endif
+}
+
+static void pw_force_rate_release(void)
+{
+#ifndef _WIN32
+    if (!g_rate_forced) return;
+    const char *prev = g_rate_force_prev[0] ? g_rate_force_prev : "0";
+    printf(">>> PipeWire: clock.force-rate back to %s\n", prev);
+    pw_meta_run("clock.force-rate", prev);
+    g_rate_forced = false;
+    g_rate_force_prev[0] = 0;
+#endif
+}
+
+/* main loop: in graph mode the graph changed its rate under us (another program, a new card ...) -> the rate it runs at
+ * now (once, after it stayed so for 1.5 s), otherwise 0. The caller opens the audio again. */
+int audio_rate_drift(void)
+{
+    if (!g_use_pw || !g_use_graph) { g_rate_bad_since = -1.0; return 0; }
+    PwbStatus st;
+    memset(&st, 0, sizeof st);
+    pwb_get_status(&st);
+    if (st.state != 3 || !st.graph_rate || st.graph_rate == (unsigned)g_config.sample_rate) { g_rate_bad_since = -1.0; return 0; }
+    double now = mono_s();
+    if (g_rate_bad_since < 0) { g_rate_bad_since = now; return 0; }
+    if (now - g_rate_bad_since < 1.5) return 0;
+    g_rate_bad_since = -1.0;
+    return (int)st.graph_rate;
+}
+
 /* 0 = playing through PipeWire; otherwise - it did not work (the caller falls back to PortAudio) */
 static int pw_start(void)
 {
@@ -275,6 +502,44 @@ static int pw_start(void)
         if (pwb_graph_open(g_config.pw_target, g_config.sample_rate, g_config.buffer_size, nch, g_names,
                            pwg_channels, pwg_master, NULL, &ch, err, (int)sizeof err) == 0) {
             g_use_graph = true;
+            /* 1.4.9: does the graph run at our rate? (otherwise everything would be transposed) */
+            int want_sr = g_config.sample_rate;
+            g_rate_wanted = want_sr;
+            g_rate_note[0] = 0;
+            g_rate_bad_since = -1.0;
+            unsigned gr = pw_wait_graph_rate(1500);
+            if (gr && gr != (unsigned)want_sr) {
+                printf(">>> PipeWire graph runs at %u Hz, Q-LiM wants %d Hz\n", gr, want_sr);
+                if (pw_allow_rate(want_sr)) {                /* allowed now -> open again, the graph may switch */
+                    pwb_close();
+                    if (pwb_graph_open(g_config.pw_target, want_sr, g_config.buffer_size, nch, g_names,
+                                       pwg_channels, pwg_master, NULL, &ch, err, (int)sizeof err) != 0) { gr = 0; g_use_graph = false; }
+                    else gr = pw_wait_graph_rate(2000);
+                }
+                /* 1.4.10: still not (PipeWire 1.0 often never switches by itself) -> hold it at our rate */
+                if (g_use_graph && gr && gr != (unsigned)want_sr && pw_force_rate(want_sr)) {
+                    gr = pw_wait_graph_rate(2500);
+                    if (gr == (unsigned)want_sr)
+                        snprintf(g_rate_note, sizeof g_rate_note, "PipeWire held at %d Hz while Q-LiM runs (given back when it closes)", want_sr);
+                    else pw_force_rate_release();             /* the card cannot: nothing stays changed */
+                }
+                if (g_use_graph && gr && gr != (unsigned)want_sr) {   /* still not: Q-LiM works at the graph's rate */
+                    pwb_close();
+                    g_config.sample_rate = (int)gr;
+                    if (pwb_graph_open(g_config.pw_target, (int)gr, g_config.buffer_size, nch, g_names,
+                                       pwg_channels, pwg_master, NULL, &ch, err, (int)sizeof err) != 0) {
+                        g_use_graph = false;
+                        g_config.sample_rate = want_sr;     /* the single stream converts by itself */
+                    } else {
+                        snprintf(g_rate_note, sizeof g_rate_note,
+                                 "PipeWire / the sound card runs at %u Hz - Q-LiM uses %u Hz (%d Hz is not possible there)",
+                                 gr, gr, want_sr);
+                    }
+                } else if (gr == (unsigned)want_sr && !g_rate_note[0]) {
+                    snprintf(g_rate_note, sizeof g_rate_note, "PipeWire switched to %d Hz", want_sr);
+                }
+                if (g_rate_note[0]) printf(">>> %s\n", g_rate_note);
+            } else if (gr == 0 && g_use_graph) printf(">>> PipeWire: the graph rate is not known yet\n");
             if (ch > MAX_OUTPUT_CHANNELS) ch = MAX_OUTPUT_CHANNELS;
             if (ch < 2) ch = 2;
             printf(">>> PipeWire: graph mode - every channel and the master are visible in Patchance/qpwgraph\n");
@@ -287,6 +552,27 @@ static int pw_start(void)
                  (int)sizeof err) != 0) {
         fprintf(stderr, ">>> PipeWire native output failed: %s\n", err);
         return 1;
+    }
+    if (!g_use_graph) {
+        /* 1.4.10: a single stream plays at the right pitch anyway (PipeWire converts it), but for the full quality the
+         * graph should run at our rate: if it does not, hold it there while Q-LiM runs */
+        int want_sr = g_config.sample_rate;
+        g_rate_wanted = want_sr;
+        g_rate_note[0] = 0;
+        unsigned gr = pw_wait_graph_rate(1500);
+        if (gr && gr != (unsigned)want_sr) {
+            printf(">>> PipeWire graph runs at %u Hz, Q-LiM plays %d Hz\n", gr, want_sr);
+            pw_allow_rate(want_sr);
+            if (pw_force_rate(want_sr)) {
+                gr = pw_wait_graph_rate(2500);
+                if (gr == (unsigned)want_sr)
+                    snprintf(g_rate_note, sizeof g_rate_note, "PipeWire held at %d Hz while Q-LiM runs (given back when it closes)", want_sr);
+                else pw_force_rate_release();
+            }
+            if (gr && gr != (unsigned)want_sr)
+                snprintf(g_rate_note, sizeof g_rate_note, "PipeWire / the sound card runs at %u Hz - it converts Q-LiM's %d Hz", gr, want_sr);
+            printf(">>> %s\n", g_rate_note);
+        }
     }
     g_use_pw = true;
     g_config.output_channels = ch;
@@ -301,6 +587,310 @@ static int pw_start(void)
     g_pw_xruns_seen = 0;
     g_pw_paused_since = 0;
     return 0;
+}
+
+/* ===================== 1.4.21: extra sound cards (outx.c does the mixing side) =====================
+ * Each extra card has its own stream (PortAudio or PipeWire), opened after the main card. If it is not there
+ * (a Bluetooth speaker switched off, a USB card unplugged) it is tried again every few seconds; meanwhile its outputs
+ * keep their numbers and are silent. */
+typedef struct {
+    bool      open;
+    PaStream *pa;
+    int       pwh;
+    int       dev_ch, dev_rate;
+    double    dev_lat;              /* the card's own output delay (s), as its driver reports it */
+    double    next_try;
+    uint64_t  last_pulls;
+    double    last_move;
+    char      why[96];
+} XDev;
+static XDev g_xd[OUTX_MAX];
+
+static int pa_x_cb(const void *in, void *out, unsigned long n, const PaStreamCallbackTimeInfo *ti,
+                   PaStreamCallbackFlags fl, void *u)
+{
+    (void)in; (void)ti; (void)fl;
+    int i = (int)(intptr_t)u;
+    outx_pull(i, (float *)out, (unsigned)n, g_xd[i].dev_ch);
+    return paContinue;
+}
+static void pw_x_cb(float *out, uint32_t n, int ch, void *u) { outx_pull((int)(intptr_t)u, out, n, ch); }
+
+static double xnow(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+static bool xdev_open(int i)
+{
+    const OutxDevCfg *c = outx_cfg_get(i);
+    XDev *x = &g_xd[i];
+    if (!c || x->open) return x->open;
+    x->pa = NULL; x->pwh = -1; x->dev_lat = 0;
+    char err[160] = "";
+    if (c->kind == OUTX_KIND_PW) {
+#ifdef _WIN32
+        snprintf(x->why, sizeof x->why, "PipeWire is Linux only");
+        return false;
+#else
+        int ch = 0;
+        int h = pwb_extra_open(c->name, g_config.sample_rate, c->channels, pw_x_cb, (void *)(intptr_t)i, &ch, err, (int)sizeof err);
+        if (h < 0) { snprintf(x->why, sizeof x->why, "%s", err[0] ? err : "cannot open"); return false; }
+        x->pwh = h; x->dev_ch = ch; x->dev_rate = g_config.sample_rate;   /* PipeWire converts to the card's rate itself */
+        outx_slot_attach(i, x->dev_rate, ch);
+#endif
+    } else {
+        PaDeviceIndex dev = paNoDevice;
+        for (int d = 0; d < Pa_GetDeviceCount(); ++d) {
+            const PaDeviceInfo *di = Pa_GetDeviceInfo(d);
+            const PaHostApiInfo *ha = di ? Pa_GetHostApiInfo(di->hostApi) : NULL;
+            if (di && ha && di->maxOutputChannels > 0 && !strcmp(di->name, c->name) && (!c->api[0] || !strcmp(ha->name, c->api))) { dev = d; break; }
+        }
+        if (dev == paNoDevice) { snprintf(x->why, sizeof x->why, "not connected now"); return false; }
+        if (g_stream && dev == g_config.device_index) { snprintf(x->why, sizeof x->why, "this is the main card"); return false; }
+        const PaDeviceInfo *di = Pa_GetDeviceInfo(dev);
+        int ch = c->channels < di->maxOutputChannels ? c->channels : di->maxOutputChannels;
+        if (ch < 1) { snprintf(x->why, sizeof x->why, "no outputs"); return false; }
+        int rates[2] = { g_config.sample_rate, (int)di->defaultSampleRate };
+#ifdef _WIN32
+        rates[0] = (int)di->defaultSampleRate; rates[1] = g_config.sample_rate;   /* WASAPI shared: only the Windows mixer's rate */
+#endif
+        PaError e = paInvalidDevice;
+        for (int ri = 0; ri < 2 && !x->pa; ++ri) {
+            if (rates[ri] <= 0 || (ri == 1 && rates[1] == rates[0])) continue;
+            PaStreamParameters op;
+            memset(&op, 0, sizeof op);
+            op.device = dev; op.channelCount = ch; op.sampleFormat = paFloat32;
+            op.suggestedLatency = di->defaultLowOutputLatency > 0.02 ? di->defaultLowOutputLatency : 0.02;
+            x->dev_ch = ch;
+            e = Pa_OpenStream(&x->pa, NULL, &op, rates[ri], paFramesPerBufferUnspecified, paClipOff, pa_x_cb, (void *)(intptr_t)i);
+            if (e == paNoError) x->dev_rate = rates[ri]; else x->pa = NULL;
+        }
+        if (!x->pa) { snprintf(x->why, sizeof x->why, "%s", Pa_GetErrorText(e)); return false; }
+        outx_slot_attach(i, x->dev_rate, ch);
+        e = Pa_StartStream(x->pa);
+        if (e != paNoError) {
+            outx_slot_detach(i);
+            Pa_CloseStream(x->pa); x->pa = NULL;
+            outx_slot_free(i);
+            snprintf(x->why, sizeof x->why, "%s", Pa_GetErrorText(e));
+            return false;
+        }
+        const PaStreamInfo *si = Pa_GetStreamInfo(x->pa);
+        x->dev_lat = si ? si->outputLatency : 0.0;
+    }
+    x->open = true;
+    x->why[0] = 0;
+    x->last_pulls = 0;
+    x->last_move = xnow();
+    printf(">>> Extra output %d: %s - outputs %d-%d, %d Hz\n", i + 1, c->desc,
+           outx_first(i, g_config.output_channels) + 1, outx_first(i, g_config.output_channels) + c->channels, x->dev_rate);
+    return true;
+}
+
+static void xdev_close(int i)
+{
+    XDev *x = &g_xd[i];
+    outx_slot_detach(i);                                  /* the main callback stops feeding it */
+    if (x->pa) {
+        if (Pa_IsStreamActive(x->pa) == 1) Pa_AbortStream(x->pa);
+        Pa_CloseStream(x->pa);
+        x->pa = NULL;
+    }
+#ifndef _WIN32
+    if (x->pwh >= 0) { pwb_extra_close(x->pwh); x->pwh = -1; }
+#endif
+    /* the main callback may still be inside the push: one of its cycles must pass */
+    unsigned c0 = atomic_load(&g_cb_count);
+    for (int t = 0; t < 50 && atomic_load(&g_cb_count) == c0 && (g_stream || g_use_pw); ++t) sleep_ms(2);
+    outx_slot_free(i);
+    x->open = false;
+}
+
+static void xdev_start_all(void)
+{
+    outx_engine_start(g_config.sample_rate, g_config.output_channels, !g_use_graph);
+    if (g_use_graph) return;                              /* graph mode: the outputs are links in the PipeWire graph */
+    double now = xnow();
+    for (int i = 0; i < outx_cfg_count(); ++i) {
+        memset(&g_xd[i], 0, sizeof g_xd[i]);
+        g_xd[i].pwh = -1;
+        if (!xdev_open(i)) {
+            g_xd[i].next_try = now + 3.0;
+            printf(">>> Extra output %d (%s): %s - will try again\n", i + 1, outx_cfg_get(i)->desc, g_xd[i].why);
+        }
+    }
+}
+
+static void xdev_close_all(void)
+{
+    for (int i = 0; i < OUTX_MAX; ++i) if (g_xd[i].open) xdev_close(i);
+}
+
+/* main thread (~2.5 times a second): a card that stopped taking audio is closed and tried again later */
+static void xdev_poll(void)
+{
+    if (g_use_graph) return;
+    double now = xnow();
+    for (int i = 0; i < outx_cfg_count(); ++i) {
+        XDev *x = &g_xd[i];
+        const OutxDevCfg *c = outx_cfg_get(i);
+        if (x->open) {
+            OutxStat st;
+            outx_slot_stat(i, &st);
+            bool gone = false, waiting = false;
+#ifndef _WIN32
+            if (c->kind == OUTX_KIND_PW) {
+                int ps = pwb_extra_state(x->pwh);
+                if (!pwb_sink_present(c->name) || ps <= 0) gone = true;
+                else if (ps == 2) waiting = true;          /* paused: not linked to its output (yet) - not a loss */
+            }
+#endif
+            if (!gone && st.pulls != x->last_pulls) { x->last_pulls = st.pulls; x->last_move = now; x->why[0] = 0; continue; }
+            if (waiting) { x->last_move = now; snprintf(x->why, sizeof x->why, "waiting for PipeWire to connect it"); continue; }
+            if (gone || now - x->last_move > 3.0) {
+                printf(">>> Extra output %d (%s) stopped - %s\n", i + 1, c->desc, gone ? "disconnected" : "not responding");
+                xdev_close(i);
+                snprintf(x->why, sizeof x->why, "%s", gone ? "disconnected" : "stopped responding");
+                x->next_try = now + 3.0;
+            }
+        } else if (now >= x->next_try) {
+            bool may = true;
+#ifndef _WIN32
+            if (c->kind == OUTX_KIND_PW) may = pwb_available() && pwb_sink_present(c->name);   /* (no waiting while it is off) */
+#endif
+            if (c->kind == OUTX_KIND_PW && !may) { x->next_try = now + 2.0; if (!x->why[0]) snprintf(x->why, sizeof x->why, "not connected now"); continue; }
+            if (!xdev_open(i)) x->next_try = now + 5.0;
+        }
+    }
+}
+
+int audio_total_outputs(void)
+{
+    int m = g_config.output_channels < 2 ? 2 : g_config.output_channels;
+    if (g_use_graph) return m;
+    return outx_total(m);
+}
+
+bool audio_outx_possible(void) { return !g_use_graph && (g_stream || g_use_pw); }
+
+int audio_output_groups(AudioOutGroup *g, int max)
+{
+    if (max < 1) return 0;
+    int m = g_config.output_channels < 2 ? 2 : g_config.output_channels;
+    memset(&g[0], 0, sizeof g[0]);
+    snprintf(g[0].name, sizeof g[0].name, "%s", g_dev_name[0] ? g_dev_name : "Main card");
+    g[0].first = 0; g[0].count = m; g[0].state = 0;
+    g[0].lat_ms = g_out_lat * 1000.0;
+    int n = 1;
+    for (int i = 0; i < outx_cfg_count() && n < max; ++i, ++n) {
+        const OutxDevCfg *c = outx_cfg_get(i);
+        AudioOutGroup *o = &g[n];
+        memset(o, 0, sizeof *o);
+        snprintf(o->name, sizeof o->name, "%s", c->desc[0] ? c->desc : c->name);
+        o->first = outx_first(i, m);
+        o->count = c->channels;
+        if (o->first < 0) { o->state = 2; snprintf(o->why, sizeof o->why, "past output 62"); continue; }
+        if (o->first + o->count > MAX_HW_OUT) o->count = MAX_HW_OUT - o->first;
+        if (g_use_graph) { o->state = 3; snprintf(o->why, sizeof o->why, "not in PipeWire graph mode"); continue; }
+        if (!g_xd[i].open) { o->state = 2; snprintf(o->why, sizeof o->why, "%s", g_xd[i].why[0] ? g_xd[i].why : "not open"); continue; }
+        OutxStat st;
+        outx_slot_stat(i, &st);
+        o->state = st.running ? 0 : 1;
+        if (!st.running && g_xd[i].why[0]) snprintf(o->why, sizeof o->why, "%s", g_xd[i].why);
+        o->lat_ms = st.latency_ms + g_xd[i].dev_lat * 1000.0;
+        o->ppm = st.ppm;
+        o->rate = g_xd[i].dev_rate;
+        o->dropouts = st.underruns;
+    }
+    return n;
+}
+
+int audio_outx_add(const OutxDevCfg *c)
+{
+    int i = outx_cfg_add(c);
+    if (i < 0) return -1;
+    outx_save();
+    if (audio_outx_possible()) {
+        memset(&g_xd[i], 0, sizeof g_xd[i]);
+        g_xd[i].pwh = -1;
+        if (!xdev_open(i)) g_xd[i].next_try = xnow() + 3.0;
+    }
+    return 0;
+}
+
+void audio_outx_remove(int i)
+{
+    if (i < 0 || i >= outx_cfg_count()) return;
+    xdev_close_all();                                     /* the ones after it get new numbers */
+    outx_cfg_remove(i);
+    outx_save();
+    if (audio_outx_possible()) {
+        double now = xnow();
+        for (int k = 0; k < outx_cfg_count(); ++k) {
+            memset(&g_xd[k], 0, sizeof g_xd[k]);
+            g_xd[k].pwh = -1;
+            if (!xdev_open(k)) g_xd[k].next_try = now + 3.0;
+        }
+    }
+}
+
+/* what can be added: the PipeWire outputs (Linux with PipeWire - every card and Bluetooth is there), otherwise the
+ * PortAudio devices of the main card's driver (JACK -> the ALSA ones); not the main card itself */
+int audio_outx_candidates(OutxDevCfg *out, int *maxch, int max)
+{
+    int n = 0;
+#ifndef _WIN32
+    if (pwb_available()) {
+        static PwbSink sk[PWB_MAX_SINKS];
+        int ns = pwb_list_sinks(sk, PWB_MAX_SINKS);
+        const char *main_name = NULL;
+        if (g_use_pw) {
+            main_name = g_config.pw_target;
+            if (!main_name[0]) for (int k = 0; k < ns; ++k) if (sk[k].is_default) main_name = sk[k].name;
+        }
+        for (int k = 0; k < ns && n < max; ++k) {
+            if (main_name && main_name[0] && !strcmp(sk[k].name, main_name)) continue;
+            memset(&out[n], 0, sizeof out[n]);
+            out[n].kind = OUTX_KIND_PW;
+            out[n].channels = sk[k].channels > 0 ? sk[k].channels : 2;
+            snprintf(out[n].name, sizeof out[n].name, "%s", sk[k].name);
+            snprintf(out[n].desc, sizeof out[n].desc, "%s", sk[k].desc);
+            if (maxch) maxch[n] = out[n].channels;
+            n++;
+        }
+        return n;
+    }
+#endif
+    int main_api = -1;
+    if (g_stream && g_config.device_index >= 0) {
+        const PaDeviceInfo *md = Pa_GetDeviceInfo(g_config.device_index);
+        if (md) main_api = md->hostApi;
+    }
+    const PaHostApiInfo *mha = main_api >= 0 ? Pa_GetHostApiInfo(main_api) : NULL;
+    bool main_jack = mha && mha->type == paJACK;
+    for (int d = 0; d < Pa_GetDeviceCount() && n < max; ++d) {
+        const PaDeviceInfo *di = Pa_GetDeviceInfo(d);
+        if (!di || di->maxOutputChannels <= 0 || d == g_config.device_index) continue;
+        if (api_unusable_here(di->hostApi)) continue;
+        const PaHostApiInfo *ha = Pa_GetHostApiInfo(di->hostApi);
+        if (!ha) continue;
+        if (main_jack) { if (ha->type != paALSA) continue; }
+        else if (main_api >= 0 && di->hostApi != main_api) continue;
+        if (is_virtual_device(di)) continue;
+        memset(&out[n], 0, sizeof out[n]);
+        out[n].kind = OUTX_KIND_PA;
+        out[n].channels = usable_channels(di);
+        if (out[n].channels < 1) out[n].channels = di->maxOutputChannels;
+        snprintf(out[n].api, sizeof out[n].api, "%s", ha->name);
+        snprintf(out[n].name, sizeof out[n].name, "%s", di->name);
+        snprintf(out[n].desc, sizeof out[n].desc, "%s", di->name);
+        if (maxch) maxch[n] = out[n].channels;
+        n++;
+    }
+    return n;
 }
 
 int audio_init(Session *session, const AudioConfig *config)
@@ -353,6 +943,30 @@ int audio_init(Session *session, const AudioConfig *config)
                 if (found >= 0) g_config.device_index = found;
             }
         }
+    }
+
+    if (g_config.backend != AUDIO_BACKEND_PIPEWIRE) {
+        if (start_mark_found()) {
+            char cp[1024], bad[1100];
+            settings_get_config_path(cp, sizeof cp);
+            snprintf(bad, sizeof bad, "%s.crashed", cp);
+            remove(bad);
+            rename(cp, bad);
+            fprintf(stderr, ">>> The last start of the sound card ('%s' / '%s') crashed Q-LiM - starting with the default "
+                    "device. Those settings are kept in audio.conf.crashed.\n", g_config.api_name, g_config.dev_name);
+            g_config.host_api_index = -1; g_config.device_index = -1;
+            g_config.api_name[0] = 0; g_config.dev_name[0] = 0;
+            if (g_config.buffer_size < 2048) g_config.buffer_size = 2048;
+        }
+        if (g_config.host_api_index >= 0 && api_unusable_here(g_config.host_api_index)) {
+            fprintf(stderr, ">>> WASAPI does not work on this Windows (it needs Vista or newer) - using the default device\n");
+            g_config.host_api_index = -1; g_config.device_index = -1;
+        }
+        if (g_config.device_index >= 0) {
+            const PaDeviceInfo *di = Pa_GetDeviceInfo(g_config.device_index);
+            if (di && api_unusable_here(di->hostApi)) g_config.device_index = -1;
+        }
+        start_mark_set(true);
     }
 
     /* The numbers saved in audio.conf may be stale (after a restart/USB change the numbers shift).
@@ -408,6 +1022,7 @@ int audio_init(Session *session, const AudioConfig *config)
     g_use_pw = false;
     if (g_config.backend == AUDIO_BACKEND_PIPEWIRE) {
         if (pw_start() == 0) {
+            xdev_start_all();                             /* 1.4.21 */
             atomic_store(&session->audio_running, true);
             atomic_store(&g_lost, false);
             heartbeat_reset(&g_hb);
@@ -454,6 +1069,15 @@ int audio_init(Session *session, const AudioConfig *config)
                 /* 1.3.1: the delay follows the buffer chosen in Edit -> Audio (before, the driver's "low" default was
                  * used, which on ALSA/PulseAudio devices is often 20-40 ms whatever the buffer was) */
                 double want_lat = (double)g_config.buffer_size / (double)g_config.sample_rate;
+#ifdef _WIN32
+                /* MME and DirectSound (the drivers of Windows XP) cannot run with a few-ms device buffer: the sound
+                 * breaks up. There the buffer size only sets the block size; the driver keeps its own safe minimum. */
+                {
+                    const PaHostApiInfo *hai = Pa_GetHostApiInfo(dev->hostApi);
+                    if (hai && (hai->type == paMME || hai->type == paDirectSound) && want_lat < dev->defaultLowOutputLatency)
+                        want_lat = dev->defaultLowOutputLatency;
+                }
+#endif
                 out_params.suggestedLatency = want_lat;
                 out_params.hostApiSpecificStreamInfo = NULL;
 
@@ -544,9 +1168,11 @@ int audio_init(Session *session, const AudioConfig *config)
             continue;
         }
         Pa_Terminate();
+        if (g_start_mark) start_mark_set(false);      /* no device is not a crash */
         return 1;
     }
 
+    xdev_start_all();                                     /* 1.4.21 */
     atomic_store(&session->audio_running, true);
     atomic_store(&g_lost, false);
     heartbeat_reset(&g_hb);
@@ -558,11 +1184,13 @@ int audio_init(Session *session, const AudioConfig *config)
 
 void audio_shutdown(void)
 {
+    xdev_close_all();                        /* 1.4.21: the extra cards first (they use the main card's ring) */
     if (g_use_pw) {
         pwb_close();
         g_use_pw = false;
         g_use_graph = false;
     }
+    pw_force_rate_release();                 /* 1.4.10: PipeWire's rate as it was */
     pwb_forget_availability();               /* the next "is there PipeWire" query - from scratch */
     if (g_stream) {
         /* with a lost card Stop may hang -> Abort is safe */
@@ -573,11 +1201,20 @@ void audio_shutdown(void)
     }
     if (g_session) atomic_store(&g_session->audio_running, false);
     atomic_store(&g_lost, false);
+    outx_engine_stop();
+#ifndef _WIN32
+    pwb_close();                             /* the extra PipeWire outputs may have connected even without PipeWire as the main */
+#endif
     Pa_Terminate();
+    if (g_start_mark) start_mark_set(false);
     printf("Audio shut down.\n");
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) && defined(QLIM_NO_ASIO)
+/* 32-bit build without the ASIO SDK: MME / DirectSound / WASAPI / WDM-KS only */
+bool audio_device_is_asio(int dev) { return false; }
+int audio_asio_panel(int dev) { return -1; }
+#elif defined(_WIN32)
 #include "pa_asio.h"
 bool audio_device_is_asio(int dev)
 {
@@ -618,6 +1255,7 @@ const char *audio_get_host_api_name(int index)
     if (audio_host_api_is_pipewire(index)) return "PipeWire (native)";
     if (index < 0 || index >= Pa_GetHostApiCount()) return "?";
     const PaHostApiInfo *info = Pa_GetHostApiInfo(index);
+    if (info && api_unusable_here(index)) return "Windows WASAPI (needs Vista or newer)";
     return info ? info->name : "?";
 }
 
@@ -633,6 +1271,7 @@ int audio_get_device_count(int host_api_index)
         const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
         if (!info || info->maxOutputChannels <= 0) continue;
         if (host_api_index >= 0 && info->hostApi != host_api_index) continue;
+        if (api_unusable_here(info->hostApi)) continue;           /* WASAPI on XP: nothing to choose */
         count++;
     }
     return count;
@@ -664,6 +1303,7 @@ const char *audio_get_device_name(int host_api_index,
         const PaDeviceInfo *info = Pa_GetDeviceInfo(i);
         if (!info || info->maxOutputChannels <= 0) continue;
         if (host_api_index >= 0 && info->hostApi != host_api_index) continue;
+        if (api_unusable_here(info->hostApi)) continue;
 
         if (idx == device_local_index) {
             if (out_global_index) *out_global_index = i;
@@ -717,6 +1357,7 @@ static double mono_s(void)
 void audio_health_poll(void)
 {
     if ((!g_stream && !g_use_pw) || atomic_load(&g_lost)) return;
+    xdev_poll();                                          /* 1.4.21 */
     double now = mono_s();
     if (now - g_last_poll < 0.4) return;                 /* not more often than ~2.5 times per second */
     g_last_poll = now;
@@ -746,6 +1387,7 @@ void audio_health_poll(void)
         return;
     }
 
+    if (g_start_mark && atomic_load(&g_cb_count) > 50) start_mark_set(false);     /* the sound runs: not a crash */
     if (Pa_IsStreamActive(g_stream) != 1) why = "stream stopped";
     else if (devwatch_present(&g_watch) == 0) why = "sound card disappeared";
     else if (heartbeat_stalled(&g_hb, atomic_load(&g_cb_count), now, 2.0)) why = "audio stopped responding";
@@ -770,7 +1412,6 @@ unsigned audio_roundtrip_frames(void)
     if (g_use_pw) return pwb_input_latency_frames();
     return g_rt_frames;
 }
-const char *audio_input_name(void) { return g_use_pw ? "PipeWire default input" : g_in_name; }
 void audio_input_want(bool on) { if (g_use_pw) pwb_input_enable(on); }
 const char *audio_lost_name(void) { return g_lost_name; }
 

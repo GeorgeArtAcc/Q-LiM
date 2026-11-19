@@ -60,7 +60,6 @@ static int  g_nloc[PF_COUNT];
 static bool g_loc_loaded;
 
 const char *plugins_fmt_name(int pf) { return (pf >= 0 && pf < PF_COUNT) ? k_fmt_name[pf] : "?"; }
-const char *plugins_fmt_code(int pf) { return (pf >= 0 && pf < PF_COUNT) ? k_fmt_code[pf] : "?"; }
 int plugins_fmt_index(const char *code)
 {
     for (int i = 0; i < PF_COUNT; ++i) if (!strcmp(code, k_fmt_code[i]) || !strcmp(code, k_fmt_name[i])) return i;
@@ -460,11 +459,12 @@ static double scan_timeout(void)
 }
 
 #ifdef _WIN32
-static char *run_child(const char *code, const char *path, int *status, bool *timed_out)
+static char *run_child(const char *code, const char *path, int skip, int *status, bool *timed_out)
 {
-    char exe[PATH_MAX];
+    char exe[PATH_MAX], sk[16];
     snprintf(exe, sizeof exe, "%s/qlim.exe", qw_exe_dir());
-    const char *argv[] = { exe, "--plugin-scan", code, path, NULL };
+    snprintf(sk, sizeof sk, "%d", skip);
+    const char *argv[] = { exe, "--plugin-scan", code, path, sk, NULL };
     int to = 0;
     char *out = qw_spawn_capture(argv, scan_timeout(), status, &to);
     *timed_out = to != 0;
@@ -474,7 +474,7 @@ static char *run_child(const char *code, const char *path, int *status, bool *ti
 #define CHILD_FAILED(st) ((st) != 0)
 #else
 #define CHILD_FAILED(st) (WIFSIGNALED(st) || (WIFEXITED(st) && WEXITSTATUS(st)))
-static char *run_child(const char *code, const char *path, int *status, bool *timed_out)
+static char *run_child(const char *code, const char *path, int skip, int *status, bool *timed_out)
 {
     *timed_out = false;
     *status = 0;
@@ -489,7 +489,9 @@ static char *run_child(const char *code, const char *path, int *status, bool *ti
     ssize_t el = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (el <= 0) { close(pfd[0]); close(pfd[1]); posix_spawn_file_actions_destroy(&fa); return NULL; }
     exe[el] = 0;
-    char *argv[] = { exe, (char *)"--plugin-scan", (char *)code, (char *)path, NULL };
+    char sk[16];
+    snprintf(sk, sizeof sk, "%d", skip);
+    char *argv[] = { exe, (char *)"--plugin-scan", (char *)code, (char *)path, sk, NULL };
     pid_t pid;
     int rc = posix_spawn(&pid, exe, &fa, NULL, argv, environ);
     posix_spawn_file_actions_destroy(&fa);
@@ -518,6 +520,7 @@ static char *run_child(const char *code, const char *path, int *status, bool *ti
         memcpy(out + len, buf, (size_t)r);
         len += (size_t)r;
         out[len] = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);             /* 2.0.0: the time limit is per plugin (it goes on) */
     }
     close(pfd[0]);
     int st = 0;
@@ -651,11 +654,24 @@ static void *scan_worker(void *arg)
             pthread_mutex_lock(&g_mu);
             snprintf(g_current, sizeof g_current, "%s  %.150s", k_fmt_name[c->pf], b ? b + 1 : c->path);
             pthread_mutex_unlock(&g_mu);
-            int status; bool to;
-            char *raw = run_child(code, c->path, &status, &to);
-            g_res[i].lines = child_to_lines(code, c->path, raw ? raw : "", status, to);
+            /* 2.0.0: one file can hold many plugins (an LV2 bundle: LSP has ~200). If one of them crashes or hangs,
+             * the others after it are scanned too - a new child starts after it. */
+            char *all = NULL;
+            int skip = 0;
+            for (int round = 0; round < 64; ++round) {
+                int status; bool to;
+                char *raw = run_child(code, c->path, skip, &status, &to);
+                char *ln = child_to_lines(code, c->path, raw ? raw : "", status, to);
+                int answered = 0;                          /* every plugin of the file gets exactly one PLUG/ERR line */
+                for (const char *q = ln; q && *q; q = strchr(q, '\n') ? strchr(q, '\n') + 1 : NULL) ++answered;
+                bool cut = raw && (to || CHILD_FAILED(status)) && strstr(raw, "TRY\t");
+                free(raw);
+                if (ln) { str_append(&all, ln); free(ln); }
+                if (!cut || answered == 0) break;          /* finished (or nothing more can be learned) */
+                skip += answered;
+            }
+            g_res[i].lines = all;
             g_res[i].fresh = true;
-            free(raw);
         }
         g_res[i].mt = mt;
         atomic_fetch_add(&g_done, 1);
@@ -768,7 +784,7 @@ int plugins_scan_child_main(int argc, char **argv)
 #else
     setvbuf(stdout, NULL, _IOLBF, 0);
 #endif
-    qplug_scan_child(argv[2], argv[3]);
+    qplug_scan_child(argv[2], argv[3], argc >= 5 ? atoi(argv[4]) : 0);
     fflush(stdout);
     _exit(0);                         /* no destructors: some plugins crash on exit */
 }

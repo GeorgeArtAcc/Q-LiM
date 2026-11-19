@@ -210,7 +210,6 @@ bool applog_get(int i, char *out, size_t n, int *level, double *t)
     return ok;
 }
 
-unsigned applog_seq(void)        { return atomic_load(&g_seq); }
 int      applog_new_warnings(void) { return atomic_load(&g_new_warn); }
 int      applog_new_errors(void)   { return atomic_load(&g_new_err); }
 void     applog_mark_seen(void)    { atomic_store(&g_new_warn, 0); atomic_store(&g_new_err, 0); }

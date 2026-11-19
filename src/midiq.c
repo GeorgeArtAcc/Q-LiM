@@ -20,6 +20,17 @@ void midiq_push_to(int src, int channel, unsigned char st, unsigned char d1, uns
     atomic_store_explicit(&q->w, w + 1, memory_order_release);
 }
 
+void midiq_push_free(int src, unsigned char st, unsigned char d1, unsigned char d2)
+{
+    if (src < 0 || src >= MIDIQ_N || st < 0x80 || st >= 0xF0) return;
+    MQ *q = &g_q[src];
+    unsigned w = atomic_load_explicit(&q->w, memory_order_relaxed);
+    if (w - atomic_load_explicit(&q->r, memory_order_acquire) >= MQ_N) return;
+    unsigned char *m = q->m[w & (MQ_N - 1)];
+    m[0] = st; m[1] = d1 & 0x7F; m[2] = d2 & 0x7F; m[3] = 0x80;
+    atomic_store_explicit(&q->w, w + 1, memory_order_release);
+}
+
 void midiq_push(int src, unsigned char st, unsigned char d1, unsigned char d2) { midiq_push_to(src, -1, st, d1, d2); }
 
 int midiq_pop(unsigned char (*out)[4], int max)
@@ -35,7 +46,3 @@ int midiq_pop(unsigned char (*out)[4], int max)
     return n;
 }
 
-void midiq_clear(void)
-{
-    for (int s = 0; s < MIDIQ_N; ++s) atomic_store(&g_q[s].r, atomic_load(&g_q[s].w));
-}

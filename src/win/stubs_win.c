@@ -42,6 +42,13 @@ int  pwb_graph_sync(int nch, const char *const *names, PwbRoute *routes, PwbRout
 }
 int  pwb_graph_hw_ports(void) { return 0; }
 const char *pwb_library_version(void) { return ""; }
+/* 1.4.21: extra outputs - on Windows they go through PortAudio */
+int  pwb_extra_open(const char *target, int rate, int channels, PwbRenderFn fn, void *user, int *out_ch, char *err, int err_size)
+{ (void)target; (void)rate; (void)channels; (void)fn; (void)user; (void)out_ch; if (err && err_size > 0) err[0] = 0; return -1; }
+void pwb_extra_close(int h) { (void)h; }
+int  pwb_extra_state(int h) { (void)h; return 0; }
+bool pwb_extra_any(void) { return false; }
+bool pwb_sink_present(const char *target) { (void)target; return false; }
 
 /* ---------------- LV2: not on Windows (almost no LV2 plugins exist for Windows) ---------------- */
 int lv2_open(const char *id, double rate, int maxb, QInst *out, char *err, int esz)

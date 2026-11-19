@@ -28,6 +28,7 @@
 #include <shlobj.h>
 #include <commdlg.h>
 #include <psapi.h>
+#include "xpshim.h"
 #include <wchar.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -74,6 +75,7 @@ static char g_exe_dir[MAX_PATH * 3];
 static char g_home[MAX_PATH * 3];
 
 const char *qw_exe_dir(void) { return g_exe_dir; }
+void qw_open_url(const char *url) { ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL); }
 
 char *qw_getenv(const char *name)
 {
@@ -195,7 +197,12 @@ int qw_remove(const char *path)
 int qw_rename(const char *from, const char *to)
 {
     wchar_t *a = w_of(from), *b = w_of(to);
-    int r = (a && b && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) ? 0 : -1;
+    int r = -1;
+    /* 2.0.0: a few tries - an antivirus or the search indexer may hold the old file for a moment */
+    for (int i = 0; a && b && i < 10 && r != 0; ++i) {
+        if (MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)) r = 0;
+        else Sleep(30);
+    }
     if (r != 0) errno = EACCES;
     free(a); free(b);
     return r;
@@ -320,7 +327,7 @@ int qw_getpid(void) { return (int)GetCurrentProcessId(); }
 
 int qw_process_alive(int pid)
 {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    HANDLE h = qw_open_process_query((DWORD)pid);
     if (!h) return 0;
     DWORD code = 0;
     int alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
@@ -330,7 +337,7 @@ int qw_process_alive(int pid)
 
 int qw_process_is_qlim(int pid)
 {
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    HANDLE h = qw_open_process_query((DWORD)pid);
     if (!h) return 0;
     wchar_t name[MAX_PATH];
     DWORD n = MAX_PATH;
@@ -465,6 +472,7 @@ char *qw_spawn_capture(const char *const *argv, double timeout_s, int *exit_code
             memcpy(out + len, buf, got);
             len += got;
             out[len] = 0;
+            t0 = GetTickCount64();                             /* 2.0.0: the time limit is per plugin (it goes on) */
             continue;
         }
         if (!alive) break;                                         /* the pipe is closed: the child is gone */
@@ -703,6 +711,7 @@ void qw_raise_other_instance(void) { AllowSetForegroundWindow(ASFW_ANY); }
 
 /* ================= crash diagnostics ================= */
 
+void (*qw_crash_hook)(const char *module_file);      /* 2.0.0: set by main.c (plughost: which plugin did it) */
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
 {
     char msg[512];
@@ -717,6 +726,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
              (unsigned long long)((char *)addr - (char *)mod));
     fputs(msg, stderr);
     fflush(stderr);
+    if (qw_crash_hook) qw_crash_hook(name);         /* 2.0.0: a plugin did it -> next time it runs in a separate process */
     /* also straight into the log file (the log thread may not get to it any more) */
     char lp[MAX_PATH * 3 + 64];
     snprintf(lp, sizeof lp, "%s/.config/qlim/qlim.log", g_home);

@@ -16,6 +16,11 @@
 typedef struct QPlug QPlug;
 
 /* 1.2: MIDI for instruments - a raw MIDI message (note on/off, CC, pitch bend...) at a frame of the block */
+/* 2.0.0: plugins with many inputs / outputs (mixers, crossovers, multi-out instruments): Q-LiM's stereo goes to the
+ * first two inputs (the others get silence) and comes from the first two outputs (the main ones).
+ * QPLUG_MAXCH is only a sanity limit (a broken plugin that reports millions of ports); buffers are made for the real count. */
+#define QPLUG_MAXCH 4096
+
 typedef struct { unsigned frame; unsigned char d[3]; } QMidiEv;
 #define QMIDI_MAX 256
 
@@ -60,7 +65,7 @@ int    qplug_set_state(QPlug *p, const void *data, size_t len);
  *   PLUG<TAB>format<TAB>name<TAB>id<TAB>fx|inst<TAB>inputs<TAB>outputs
  *   ERR<TAB>format<TAB>name/path<TAB>reason
  * Returns 0. */
-int    qplug_scan_child(const char *fmt, const char *path);
+int qplug_scan_child(const char *fmt, const char *path, int skip);
 
 /* --- internal: one plugin instance in a given format --- */
 typedef struct {
@@ -85,7 +90,36 @@ typedef struct {
     float (*param_get)(void *h, int i);
     void (*param_set)(void *h, int i, float v);
     void (*param_text)(void *h, int i, char *out, int sz);
+    bool separate;                                     /* 2.0.0: it runs in a separate process (plugbridge.c) */
 } QInst;
+
+/* ---- 2.0.0: plugins in a separate process ("sandbox") ---- */
+int  bridge_open(const char *fmt, const char *id, double rate, int maxb, QInst *out, char *err, int esz);
+int  qplug_host_child_main(int argc, char **argv);   /* qlim --plugin-host <socket fd> <memory fd> */
+int  qplug_open_inst_here(const char *fmt, const char *id, double rate, int maxb, QInst *q, char *err, int esz);
+void qplug_mark_child(void);                         /* this process IS the separate one */
+bool qplug_is_child(void);
+bool qplug_is_separate(QPlug *p);
+/* the choice: 0 = never, 1 = automatic (plugins that crashed or froze Q-LiM before, LV2 with Gtk windows), 2 = all */
+enum { QSEP_NEVER = 0, QSEP_AUTO = 1, QSEP_ALL = 2 };
+void qplug_separate_init(const char *list_path);      /* ~/.config/qlim/plugins-separate.txt (main, at the start) */
+int  qplug_separate_mode(void);
+unsigned qplug_separate_gen(void);                   /* changes when the choice or the list changes */
+void qplug_set_separate_mode(int mode);
+bool qplug_wants_separate(const char *fmt, const char *id);
+bool qplug_separate_listed(const char *fmt, const char *id);
+void qplug_separate_set(const char *fmt, const char *id, bool on, const char *why);
+int  qplug_separate_count(void);
+bool qplug_separate_get(int i, char *fmt, int fsz, char *id, int isz, char *why, int wsz);
+/* which plugin was running when Q-LiM crashed (signal handler) / froze (the watchdog thread): it goes on the list */
+void qplug_crash_note(void);
+void qplug_freeze_note(bool audio);
+void qplug_crash_note_module(const char *module_file);   /* Windows crash handler: the DLL where it happened */
+/* a message for the screen (the program sets it: ui_flash_message) */
+void qplug_set_report_hook(void (*fn)(const char *msg));
+void qplug_report(const char *msg);
+/* LV2: the plugin's window needs Gtk (no X11 / external one) - it can be opened only in a separate process */
+bool lv2_ui_needs_separate(const char *id);
 
 int vst2_open(const char *id, double rate, int maxb, QInst *out, char *err, int esz);
 int vst2_scan(const char *path);

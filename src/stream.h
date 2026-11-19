@@ -40,13 +40,17 @@ typedef struct {
 /* Called from the disk thread — must read atomics only. */
 typedef void (*StreamRegionFn)(void *ud, StreamRegion *out);
 
-/* Source abstraction: stereo float at the session's sample rate. */
+/* Source abstraction: stereo float at the session's sample rate.
+ * 1.4.24: nch > 2 = a multichannel source (nch interleaved floats per frame); 0 = stereo (as always). */
+#define STREAM_MAX_CH 16
 typedef struct {
     size_t (*frames)(void *ctx);
     size_t (*read)(void *ctx, size_t pos, float *out, size_t n);
     void   (*close)(void *ctx);
     void    *ctx;
+    int      nch;
 } StreamSource;
+static inline int stream_src_nch(const StreamSource *s) { return s && s->nch > 2 ? s->nch : 2; }
 
 /* --- global --- */
 int  streams_init(void);                    /* starts the disk thread; 0 = ok */
@@ -64,15 +68,11 @@ unsigned long streams_starved_total(void);          /* how many times the buffer
 void     streams_status_text(char *buf, size_t n);  /* e.g. "SSD: small, HDD: large" */
 
 /* --- UI thread --- */
-ClipStream *stream_open(const StreamSource *src, StreamRegionFn fn, void *ud);
 /* like stream_open, but with the file's path: the disk is recognised from it (path may be NULL) */
 ClipStream *stream_open_path(const StreamSource *src, StreamRegionFn fn, void *ud, const char *path);
-int         stream_tier(const ClipStream *s);           /* 0..2 */
-size_t      stream_ring_frames(const ClipStream *s);
 void        stream_close(ClipStream *s);    /* the audio thread must not use it */
 size_t      stream_frames(const ClipStream *s);
 bool        stream_start(ClipStream *s, size_t from);   /* STREAM_FROM_START = start_marker; false = out of memory */
-void        stream_rebind(ClipStream *s, StreamRegionFn fn, void *ud); /* after the Clip was moved in memory */
 void        stream_invalidate_preroll(ClipStream *s);   /* call when start_marker changes */
 /* changing the length (cutting the clip, step 27). ONLY while streams_lock() is held. */
 void        stream_set_total_nolock(ClipStream *s, size_t total);
@@ -85,9 +85,9 @@ void        stream_rebind_nolock(ClipStream *s, StreamRegionFn fn, void *ud);   
 /* --- audio thread (and the UI for reading the position) --- */
 void     stream_stop(ClipStream *s);
 size_t   stream_read(ClipStream *s, float *out, size_t frames); /* returns the real frames, the rest = 0 */
+int      stream_channels(const ClipStream *s);  /* 1.4.24: 2, or the channels of a multichannel stream (stream_read writes that many) */
 size_t   stream_position(const ClipStream *s);  /* the next frame to play */
 bool     stream_finished(const ClipStream *s);  /* end reached (loop off)  */
-unsigned stream_underruns(const ClipStream *s);
 
 /* --- libsndfile source (stream_sndfile.c) ---
  * native: opens the file as it is (any sample rate). Returns 0 or -1; *file_sr = the file's rate.
@@ -95,8 +95,26 @@ unsigned stream_underruns(const ClipStream *s);
  *         Nothing is written to disk. The result is stereo float at target_sr. */
 int stream_source_sndfile_native(const char *path, StreamSource *out, int *file_sr);
 /* 1 if the file (MP3) has no exact seek and must always be played through a cached WAV copy */
-int stream_file_needs_cache(const char *path);
 int stream_source_open(const char *path, int target_sr, StreamSource *out, int *file_sr);
+/* 1.4.24: every channel of the file (nch = the file's channels when > 2), resampled live to target_sr when needed */
+int stream_source_open_mc(const char *path, int target_sr, StreamSource *out, int *file_sr, int *nch);
+int stream_file_channels(const char *path);
+int stream_source_sndfile_channel(const char *path, StreamSource *out, int *file_sr, int ch);   /* L = R = channel ch */      /* the file's channels (libsndfile), 0 = cannot tell */
+
+/* 1.4.14: what a file REALLY is, from its first bytes (not from its name). An .m4a renamed to .mp3 used to go
+ * to libsndfile's MP3 decoder, which printed "Giving up searching valid MPEG header" and a wrong
+ * "File does not exist" every time anything opened it. */
+enum {
+    SNIFF_MISSING = -1,   /* cannot be opened at all */
+    SNIFF_UNKNOWN = 0,    /* no known signature: let libsndfile try (raw / rare formats) */
+    SNIFF_SNDFILE,        /* WAV, AIFF, FLAC, Ogg, CAF, W64 ...: libsndfile reads it */
+    SNIFF_MP3,            /* MPEG audio (libsndfile + mpg123 when built with it) */
+    SNIFF_FFMPEG          /* M4A/MP4/AAC, WMA, APE, WavPack, Matroska ...: only ffmpeg */
+};
+int audio_sniff(const char *path, char *what, size_t what_size);   /* `what` = a short name ("M4A/AAC"), may be NULL */
+/* 1 if libsndfile should be asked to open it (never for formats only ffmpeg reads) */
+int audio_sndfile_can_open(const char *path);
+int audio_sndfile_has_mp3(void);                 /* this libsndfile reads (and writes) MP3 */
 
 /* --- live resampler (stream_resample.c) ---
  * Takes ownership of *inner (stereo float at src_sr) and returns a source at dst_sr.

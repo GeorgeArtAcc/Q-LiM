@@ -19,7 +19,7 @@
 #include <windows.h>
 #endif
 
-static PerfSettings g_ps = { PERF_DRAW_AUTO, 0, true, true, 0, true, 1.0f, 0 };
+static PerfSettings g_ps = { PERF_DRAW_AUTO, 0, true, true, 0, true, 1.0f, 0, false };
 
 PerfSettings *perf_settings(void) { return &g_ps; }
 
@@ -46,6 +46,7 @@ void perf_load(void)
         else if (sscanf(line, "zoom=%63s", v) == 1) { g_ps.zoom = (float)atof(v); if (!(g_ps.zoom >= 0.5f && g_ps.zoom <= 2.5f)) g_ps.zoom = 1.0f; }
         else if (sscanf(line, "waveform=%63s", v) == 1)
             g_ps.wave = !strcmp(v, "light") ? 2 : !strcmp(v, "smooth") ? 1 : 0;
+        else if (sscanf(line, "gentle_uploads=%63s", v) == 1) g_ps.gentle = atoi(v) != 0;
         else if (sscanf(line, "interface=%63s", v) == 1)
             g_ps.eco = !strcmp(v, "eco") ? 2 : !strcmp(v, "normal") ? 1 : 0;
     }
@@ -70,6 +71,7 @@ void perf_save(void)
     fprintf(f, "interface=%s\n", g_ps.eco == 2 ? "eco" : g_ps.eco == 1 ? "normal" : "auto");
     fprintf(f, "meters=%d\nzoom=%.2f\n", g_ps.meters ? 1 : 0, (double)g_ps.zoom);
     fprintf(f, "waveform=%s\n", g_ps.wave == 2 ? "light" : g_ps.wave == 1 ? "smooth" : "auto");
+    fprintf(f, "gentle_uploads=%d\n", g_ps.gentle ? 1 : 0);
     fclose(f);
 }
 
@@ -188,5 +190,11 @@ void perf_frame(bool playing, bool plugin_windows_open)
     GfxSetEco(g_ps.eco == 2 || (g_ps.eco == 0 && GfxSoftwareRendering()) || getenv("QLIM_ECO") != NULL);
     { static int sm = -1; if (sm < 0) { const char *e = getenv("QLIM_SMART"); sm = !(e && e[0] == '0'); } GfxSetSmart(sm != 0); }
     GfxSetMaxFps(cap);
-    GfxSetBusyFps(plugin_windows_open || playing || !g_ps.idle_save ? 0 : 10);
+    GfxSetGentleUploads(g_ps.gentle);
+    /* 2.0: nothing moves for 5 s (no sound, no input) -> 5 frames per second instead of 10: still nothing to see,
+     * and a click / key brings full speed at once */
+    static double last_busy;
+    if (plugin_windows_open || playing) last_busy = now;
+    bool long_idle = now - last_busy > 5.0 && GfxSecondsSinceInput() > 5.0;
+    GfxSetBusyFps(plugin_windows_open || playing || !g_ps.idle_save ? 0 : long_idle ? 5 : 10);
 }

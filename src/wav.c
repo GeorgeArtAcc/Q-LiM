@@ -1,6 +1,7 @@
 /* Q-LiM - Copyright (c) 2026 Georgi Stanimirov Ivanov. SPDX-License-Identifier: GPL-3.0-or-later (see LICENSE) */
 #define _POSIX_C_SOURCE 200809L
 #include "wav.h"
+#include "stream.h"
 #include <sndfile.h>
 #include <stdint.h>
 #include <sys/stat.h>
@@ -60,6 +61,10 @@ int wav_load(const char *path, int target_sample_rate, WavFile *out)
     memset(out, 0, sizeof(*out));
     snprintf(out->path, sizeof(out->path), "%s", path);
 
+    char what[32];
+    int kind = audio_sniff(path, what, sizeof what);  /* 1.4.14: say what it really is */
+    if (kind == SNIFF_MISSING) { fprintf(stderr, "wav_load: '%s' does not exist or cannot be read\n", path); return 1; }
+    if (!audio_sndfile_can_open(path)) { fprintf(stderr, "wav_load: '%s' is %s - needs ffmpeg\n", path, what[0] ? what : "an unknown format"); return 1; }
     SF_INFO info;
     memset(&info, 0, sizeof(info));
     SNDFILE *sf = sf_open(path, SFM_READ, &info);
@@ -136,13 +141,31 @@ int wav_load(const char *path, int target_sample_rate, WavFile *out)
     return 0;
 }
 
-void wav_free(WavFile *w)
+int wav_file_info(const char *path, int *sample_rate, int *bits, int *channels)
 {
-    if (!w) return;
-    free(w->samples);
-    w->samples = NULL;
-    w->frame_count = 0;
+    if (!path || !*path) return -1;
+    if (!audio_sndfile_can_open(path)) return -1;     /* 1.4.14 */
+    SF_INFO info;
+    memset(&info, 0, sizeof(info));
+    SNDFILE *sf = sf_open(path, SFM_READ, &info);
+    if (!sf) return -1;
+    sf_close(sf);
+    int b = 0;
+    switch (info.format & SF_FORMAT_SUBMASK) {
+    case SF_FORMAT_PCM_S8: case SF_FORMAT_PCM_U8: b = 8; break;
+    case SF_FORMAT_PCM_16: b = 16; break;
+    case SF_FORMAT_PCM_24: b = 24; break;
+    case SF_FORMAT_PCM_32: b = 32; break;
+    case SF_FORMAT_FLOAT:  b = -32; break;
+    case SF_FORMAT_DOUBLE: b = -64; break;
+    default: b = 0; break;                            /* MP3, Vorbis, Opus ...: no bit depth */
+    }
+    if (sample_rate) *sample_rate = info.samplerate;
+    if (bits) *bits = b;
+    if (channels) *channels = info.channels;
+    return 0;
 }
+
 
 // ============ Cache for converted files ============
 
@@ -152,7 +175,7 @@ void wav_free(WavFile *w)
 #endif
 #include <fcntl.h>
 
-#define CACHE_QUALITY_VERSION 2   // 1 = old linear resampler; 2 = windowed-sinc. Change -> new caches.
+#define CACHE_QUALITY_VERSION 3   // 1 = old linear resampler; 2 = windowed-sinc; 3 (1.4.7) = better sinc + MP3 without holes. Change -> new caches.
 
 static uint64_t fnv1a(uint64_t h, const void *data, size_t len)
 {
@@ -188,6 +211,12 @@ static int cache_path_for(const char *path, int target_sr, const char *kind,
 
     snprintf(out_path, out_size, "%s/%016llx.wav", dir, (unsigned long long)h);
     return 0;
+}
+
+/* 1.4.24: a cache file name for something made from `path` (kind = what it is) */
+int wav_cache_path(const char *path, const char *kind, char *out_path, size_t out_size)
+{
+    return cache_path_for(path, 0, kind, out_path, out_size);
 }
 
 // File with a different sample rate -> stereo float WAV at target_sr (streaming, through the resampler; no copy in RAM).
@@ -238,18 +267,54 @@ int wav_convert_to_cache(const char *path, int target_sample_rate,
     return 0;
 }
 
+/* 2.0: see wav.h */
+int wav_write_source(StreamSource *src, int sr, int fmt, const char *out_path, volatile int *permille)
+{
+    if (!src || !out_path || sr <= 0) return 1;
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", out_path);
+    SF_INFO info;
+    memset(&info, 0, sizeof info);
+    info.samplerate = sr;
+    info.channels = 2;
+    info.format = fmt == WAV_OUT_FLAC24 ? (SF_FORMAT_FLAC | SF_FORMAT_PCM_24)
+                : fmt == WAV_OUT_PCM24  ? (SF_FORMAT_WAV | SF_FORMAT_PCM_24)
+                :                         (SF_FORMAT_WAV | SF_FORMAT_FLOAT);
+    SNDFILE *sf = sf_open(tmp, SFM_WRITE, &info);
+    if (!sf) { fprintf(stderr, "wav_write_source: cannot write '%s': %s\n", tmp, sf_strerror(NULL)); return 1; }
+    sf_command(sf, SFC_SET_CLIPPING, NULL, SF_TRUE);    /* integer formats: an over is clipped, never wrapped */
+    size_t total = src->frames(src->ctx), pos = 0;
+    enum { CH = 16384 };
+    float *buf = malloc((size_t)CH * 2 * sizeof(float));
+    int ok = buf != NULL;
+    while (ok && pos < total) {
+        size_t n = CH;
+        if (n > total - pos) n = total - pos;
+        size_t got = src->read(src->ctx, pos, buf, n);
+        if (got == 0) { ok = 0; break; }
+        if (sf_writef_float(sf, buf, (sf_count_t)got) != (sf_count_t)got) ok = 0;
+        pos += got;
+        if (permille && total) *permille = (int)((double)pos * 1000.0 / (double)total);
+    }
+    free(buf);
+    if (sf_close(sf) != 0) ok = 0;
+    if (!ok || rename(tmp, out_path) != 0) { unlink(tmp); return 1; }
+    return 0;
+}
+
 // Formats that libsndfile cannot read (m4a, aac, wma, ape ...): ffmpeg, if installed.
 // No shell (fork + execvp), so file names cannot be "injected".
-int wav_convert_with_ffmpeg(const char *path, int target_sample_rate,
-                            char *out_path, size_t out_size)
+/* 2.1: keep = 1 keeps all the file's channels (a surround M4A ...), 0 = stereo */
+static int ffmpeg_decode(const char *path, int target_sample_rate, int keep, char *out_path, size_t out_size)
 {
     if (!path || !out_path || out_size == 0) return 1;
-    if (cache_path_for(path, target_sample_rate, "ffmpeg", out_path, out_size) != 0) return 1;
+    if (cache_path_for(path, target_sample_rate, keep ? "ffmpegch" : "ffmpeg", out_path, out_size) != 0) return 1;
     if (access(out_path, R_OK) == 0) return 0;
 
-    char tmp[1100], srs[32];
+    /* 1.4.7: decoded at the file's own rate (32-bit float, nothing lost); a different rate is then converted by our
+     * resampler (better than ffmpeg's default one) */
+    char tmp[1100];
     snprintf(tmp, sizeof(tmp), "%s.tmp.wav", out_path);
-    snprintf(srs, sizeof(srs), "%d", target_sample_rate);
 
 #ifdef _WIN32
     {
@@ -257,8 +322,11 @@ int wav_convert_with_ffmpeg(const char *path, int target_sample_rate,
         char exe[2048];
         snprintf(exe, sizeof exe, "%s/ffmpeg.exe", qw_exe_dir());
         const char *prog = access(exe, F_OK) == 0 ? exe : "ffmpeg";
-        const char *const argv[] = { prog, "-v", "error", "-nostdin", "-y", "-i", path,
-                                     "-vn", "-ar", srs, "-ac", "2", "-c:a", "pcm_f32le", "-f", "wav", tmp, NULL };
+        const char *const argv2[] = { prog, "-v", "error", "-nostdin", "-y", "-i", path,
+                                      "-vn", "-ac", "2", "-c:a", "pcm_f32le", "-f", "wav", tmp, NULL };
+        const char *const argvk[] = { prog, "-v", "error", "-nostdin", "-y", "-i", path,
+                                      "-vn", "-c:a", "pcm_f32le", "-f", "wav", tmp, NULL };
+        const char *const *argv = keep ? argvk : argv2;
         int rc = qw_run_wait(argv, 1);
         if (rc != 0) {
             unlink(tmp);
@@ -272,9 +340,11 @@ int wav_convert_with_ffmpeg(const char *path, int target_sample_rate,
     if (pid == 0) {
         int dn = open("/dev/null", O_RDWR);
         if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); if (dn > 2) close(dn); }
-        char *argv[] = { "ffmpeg", "-v", "error", "-nostdin", "-y", "-i", (char *)path,
-                         "-vn", "-ar", srs, "-ac", "2", "-c:a", "pcm_f32le", "-f", "wav", tmp, NULL };
-        execvp("ffmpeg", argv);
+        char *argv2[] = { "ffmpeg", "-v", "error", "-nostdin", "-y", "-i", (char *)path,
+                          "-vn", "-ac", "2", "-c:a", "pcm_f32le", "-f", "wav", tmp, NULL };
+        char *argvk[] = { "ffmpeg", "-v", "error", "-nostdin", "-y", "-i", (char *)path,
+                          "-vn", "-c:a", "pcm_f32le", "-f", "wav", tmp, NULL };
+        execvp("ffmpeg", keep ? argvk : argv2);
         _exit(127);
     }
     int status = 0;
@@ -286,6 +356,17 @@ int wav_convert_with_ffmpeg(const char *path, int target_sample_rate,
     }
 #endif
     if (rename(tmp, out_path) != 0) { unlink(tmp); return 1; }
-    printf("wav_convert_with_ffmpeg: '%s' -> %d Hz\n", path, target_sample_rate);
+    printf("wav_convert_with_ffmpeg: '%s' decoded (for %d Hz%s)\n", path, target_sample_rate, keep ? ", all channels" : "");
     return 0;
+}
+
+int wav_convert_with_ffmpeg(const char *path, int target_sample_rate, char *out_path, size_t out_size)
+{
+    return ffmpeg_decode(path, target_sample_rate, 0, out_path, out_size);
+}
+
+const char *wav_readable_all_channels(const char *path, int target_sample_rate, char *buf, size_t n)
+{
+    if (!path || !path[0] || audio_sndfile_can_open(path) || access(path, R_OK) != 0) return path;
+    return ffmpeg_decode(path, target_sample_rate, 1, buf, n) == 0 ? buf : path;
 }

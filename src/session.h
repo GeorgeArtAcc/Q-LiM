@@ -2,6 +2,7 @@
 #ifndef SESSION_H
 #define SESSION_H
 
+#include "surround.h"
 #include "wav.h"
 #include "stream.h"
 #include "peaks.h"
@@ -54,6 +55,25 @@ typedef enum { BTN_LEARN_NONE = 0, BTN_LEARN_MUTE, BTN_LEARN_SOLO, BTN_LEARN_CLI
 
 /* Maximum length of a clip/note/channel name IN BYTES (Cyrillic is 2 bytes per letter). */
 #define NAME_LEN 256
+#define STEM_MAX 8         /* 1.4.17: separated parts per clip (6 instruments + the rest + one spare) */
+#define STEM_NAME_LEN 24
+typedef struct {
+    int  n;
+    char path[STEM_MAX][1024];
+    char name[STEM_MAX][STEM_NAME_LEN];
+} StemSet;
+typedef struct SurAuto { int n; SurPt p[]; } SurAuto;
+enum { CLIP_MC_STEREO = 0, CLIP_MC_MULTI = 1, CLIP_MC_PATH = 2 };   /* 1.4.24 */   /* 1.4.19: a clip's surround points (sorted by time) */
+/* 1.4.17: the master output recorded while a scene plays (Export Scene): audio thread -> a ring -> the export thread */
+typedef struct Capture {
+    float        *ring;                /* nch channels, interleaved */
+    size_t        cap;                 /* frames */
+    atomic_size_t w, r;                /* frames written / read (they only grow) */
+    atomic_long   left;                /* frames still to record */
+    atomic_bool   on, started, overflow;
+    int           scene;               /* it starts with the first block in which a clip of this scene plays */
+    int           nch;                 /* 1.4.23: 0 = the master, stereo (as before); > 0 = outputs 1 .. nch as they play */
+} Capture;
 
 /* 1.3: a MIDI clip = notes in beats. A published MidiSeq is never changed: an edit makes a new one and swaps the
  * pointer (the audio thread may be reading the old one; it is freed a few audio blocks later). */
@@ -91,12 +111,34 @@ typedef struct {
     _Atomic float  bpm_detected;       // 0 = not detected yet / failed
     _Atomic float  bpm_fix;            // manually corrected "real" tempo of the file (0 = none)
     _Atomic float  bpm_play;           // the tempo to play at with warp on (0 = like the original)
+    // --- 1.4.9: the clip's own gain and pan (like Bitwig's clip gain / pan); 0 / 0 = untouched (bit exact) ---
+    _Atomic float  cgain_db;           // CLIP_GAIN_MIN_DB (= silence) .. CLIP_GAIN_MAX_DB, 0 = as in the file
+    _Atomic float  cpan;               // -1 (left) .. +1 (right), 0 = centre (a balance, like the channel pan)
+    _Atomic float  norm_db;            // 1.4.11: loudness normalization of this clip (dB, 0 = none) - session_update_loudness
+    // --- 1.4.13: the clip's own pitch (semitones, fractions = cents; 0 = untouched) and "keep the formants" ---
+    _Atomic float  pitch_st;
+    atomic_bool    pitch_fmt;
+    atomic_bool    stretch_on;         // warp OR pitch: the clip plays through its Stretch (the audio thread decides by this)
+    float          cg_l, cg_r;         // audio thread: the gains in use now (smoothed)
+    bool           cg_set;
     atomic_bool    warp;               // the warp tick
     atomic_bool    bpm_busy;           // detection is still running
     atomic_uint    stretch_gen;        // +1 on every start/seek -> the audio thread resets the stretch
     BpmJob        *bpm_job;            // UI thread only
     Stretch       *stretch;            // created when warp is turned on for the first time
     struct EditSrc *edit;              // step 27: the cutting (belongs to the stream's source; NULL = no stream)
+    struct StemSrc *stems;             // 1.4.14: separated parts play instead of the file (NULL = the file)
+    Peaks         *stem_peaks[STEM_MAX]; // their sketches (the coloured waveform)
+    _Atomic(struct SurAuto *) sur_auto; // 1.4.19: surround automation (NULL = none); swapped, never changed in place
+    // --- 1.4.24: a surround (multichannel) file ---
+    int            mc_mode;            // CLIP_MC_STEREO (as always) / CLIP_MC_MULTI (every channel on its output) / CLIP_MC_PATH
+    int            mc_nch;             // the file's channels (> 2 = it is a multichannel file; 0 = not known / stereo)
+    _Atomic int    mc_out;             // MULTI: the first output (0-based); the file's channel k plays on output mc_out + k
+    char          *mc_orig;            // PATH: the multichannel original (malloc; path = the stereo mix made from it)
+    float          mc_last[STREAM_MAX_CH];   // audio thread only: the last frame (the fade-out on stop)
+    Peaks         *mc_peaks[STREAM_MAX_CH];   // MULTI: the sketch of every channel (NULL = not yet)
+    bool           mc_asked;           // UI: the user was asked how to play it (or it came from a project / undo)
+    _Atomic uint64_t mc_map[STREAM_MAX_CH];   // 2.0: the Speaker Map - file channel k: 0 = output mc_out + k, else bit o = output o+1
     atomic_bool    ended;              // audio thread: it reached the end by itself (not stopped by hand) — for the queue
     unsigned       start_offset;       // audio thread only: the queue starts it in the middle of a block (silence before)
     // --- no clicks on start/stop/seek (step 23), audio thread only ---
@@ -112,6 +154,11 @@ typedef struct {
     unsigned       xf_gen;             // stretch_gen at the start (a manual start/seek cancels it)
     _Atomic float  xf_vis;             // 1.0.5: the crossfade gain right now (for the "ghost" fader), valid when xf_vis_on
     atomic_bool    xf_vis_on;          // 1.0.5: true only while the crossfade is really moving
+    // --- 1.4.17: scene transition: UI -> audio a ramp request (len frames; -1 = reset to full), audio: the ramp ---
+    atomic_long    tr_req_len;
+    _Atomic float  tr_req_from, tr_req_to;   // from < 0 = from where it is now; 0..1 (equal power)
+    float          tr_g, tr_to, tr_step;     // audio thread only
+    bool           tr_on;                    // audio thread only
     // --- 1.1: quantized launch ---
     atomic_int     ql_state;           // 0 = nothing, 1 = launch, 2 = stop, 3 = restart - at the beat ql_beat
     _Atomic double ql_beat;
@@ -123,6 +170,7 @@ typedef struct {
     // --- warp switched on/off while playing (1.0.5): fade the old sound out, the new one in (no click) ---
     bool           wsw_init;           // audio thread only: wsw_warp is valid
     bool           wsw_warp;           // audio thread only: which path was heard in the previous block
+    double         st_speed;           // audio thread only (1.4.13): the speed the Stretch played at last (for the fade-out of the old path)
     bool           wsw_wait;           // audio thread only: waiting for the stretch's first sound, then fade it in
     unsigned       wsw_fadein;         // audio thread only: remaining frames of that fade-in
     unsigned       wsw_blocks;         // audio thread only: blocks waited for the first sound (safety limit)
@@ -148,12 +196,16 @@ typedef struct {
 /* Plugin on the channel (step 33; since step 34 it processes the audio - see fxchain.h) */
 #define MAX_CH_FX 8
 struct FxChain;
+#define FX_MIDI_MAX 64     /* 1.4.14: MIDI-learned parameters per plugin */
 typedef struct {
     char fmt[8];          /* "LV2", "VST3", "VST", "CLAP" */
     char name[96];
     char path[512];
     bool bypass;
     int  state_ref;       /* step 35: the settings saved from the project (fxchain.h: fxstate_*), 0 = none */
+    /* 1.4.14: MIDI Learn - controller CCs bound to the plugin's parameters (they move/die with the plugin) */
+    int  midi_n;
+    struct { short param, cc; } midi[FX_MIDI_MAX];
 } ChFx;
 
 typedef struct {
@@ -195,6 +247,12 @@ typedef struct {
     int            fx_count;           // the channel's plugins (main thread only)
     ChFx           fx[MAX_CH_FX];
     _Atomic(struct FxChain *) fxchain; // the loaded plugins (step 34): written by fxchain_sync, read by the mixer
+    _Atomic(SurSetup *) sur;           // 1.4.19: surround (NULL = the stereo routing); swapped, never changed in place
+    float          sur_g[2][SUR_MAX_SPK];  // audio thread: the gains of the last block (left / right source)
+    bool           sur_init;           // audio thread: sur_g is valid
+    _Atomic float  sur_vis_az, sur_vis_spread;   // audio -> UI: where the sound is now
+    _Atomic float  sur_vis_x, sur_vis_y, sur_vis_w;   // 1.4.22: ... in the room mode
+    atomic_bool    sur_vis_on;
 } Channel;
 
 /* 1.4: one recording into a cell (audio from the sound card's input, or the MIDI notes played on an instrument channel).
@@ -268,6 +326,10 @@ typedef struct {
     _Atomic float  tempo;              // 1.1: the master BPM (top bar); clips with WARP on play at this tempo
     // --- 1.1: launch quantization (like "Global Quantization" in Ableton/Bitwig) ---
     _Atomic float  quant_beats;        // a clip launched while something plays waits for the next multiple of this many beats (0 = at once)
+    atomic_int     sig_num, sig_den;   // 1.4.8: the time signature (4/4, 7/8, 5/4 ...); a "beat" of the tempo is always a quarter note
+    int            quant_mode;         // 1.4.8: QUANT_* (follows the time signature), -1 = a number of beats from an old project
+    int            loud_target;        // 1.4.11: loudness normalization: target in LUFS (-14, -16, -23 ...), 0 = off
+    bool           loud_down_only;     //         true = only loud clips are turned down (like YouTube), never up
     _Atomic double tp_beats;           // transport position in beats (from the first launched clip); written by the audio thread
     atomic_bool    tp_running;         // the transport runs (from the first launched clip until everything stops)
     atomic_bool    metronome;          // 1.3.1: clicks on every beat while the transport runs (accent on the 1st beat of the bar)
@@ -284,6 +346,15 @@ typedef struct {
     atomic_int     q_next;             // the prepared next one (the audio thread may start it), -1 = none
     atomic_int     q_launched;         // the audio thread started it: index + 1 (0 = no)
     atomic_long    xfade_frames;       // crossfade between the clips in the queue (0 = none, then it is seamless)
+    // --- 1.4.17: scene transitions (one button: what plays fades out, the next scene fades in) ---
+    _Atomic float  tr_sec;             // the fade time (seconds)
+    atomic_bool    auto_hold;          // "Stop automations": the transitions stand still where they are, no timed launch
+    int            tr_cur;             // the scene launched / faded to last (-1 = none) - main thread
+    int            tr_hist[64], tr_hist_n;   // the scenes before it (for "back")
+    double         tr_t0, tr_len_s;    // the last transition: when (monotonic s) and how long
+    double         tr_hold_t;          // when the automations were stopped
+    bool           play_now;           // main thread: the next launch is not quantized
+    _Atomic(struct Capture *) capture; // 1.4.17: "Export Scene" records the master here (NULL = nothing)
 
     // true = files with a different sample rate are converted into the cache; false (default) = they play as they are
     atomic_bool    convert_files;
@@ -291,6 +362,8 @@ typedef struct {
     // --- 1.2: playing instruments (see midiq.h) ---
     atomic_int     midi_target;        // the channel the MIDI keyboard plays (the selected instrument channel), -1 = none
     atomic_uint    midi_bound[4];      // notes 0..127 bound to buttons/clips (they do not play the instrument)
+    unsigned       extra_bound[4];     // 1.4.8: + the notes of the controller buttons / pad box (main thread, midimap.c)
+    bool           extra_block;        // 1.4.8: + a controller button / the pads are being learned
     atomic_bool    midi_block;         // a "learn" is waiting: notes are not played
     atomic_bool    midi_panic;         // UI -> audio: all notes off on every instrument
 
@@ -322,11 +395,9 @@ void session_channel_init(Channel *c, int idx, const char *name);
 // side: 0 = L port, 1 = R port. dest: 0 = Master L, 1 = Master R, 2+k = output k+1 of the card.
 RouteMask session_route_get(Session *s, int ch, int side);
 void     session_route_set(Session *s, int ch, int side, RouteMask mask);
-void     session_route_toggle(Session *s, int ch, int side, int dest);
 // Master port -> card outputs. dest: k = output k+1.
 RouteMask session_master_route_get(Session *s, int side);
 void     session_master_route_set(Session *s, int side, RouteMask mask);
-void     session_master_route_toggle(Session *s, int side, int dest);
 // Everything default: channels -> Master, Master -> outputs 1/2.
 void     session_routing_reset(Session *s);
 
@@ -397,6 +468,9 @@ int  session_rec_cell(Session *s, int ch, int scene, bool midi, const char *wav_
 int  session_rec_state(Session *s, int ch, int scene, double *beats);   /* REC_* of that cell (REC_IDLE = none) */
 void session_rec_tick(Session *s);                       /* every frame: writes the file / the notes, finishes */
 void session_rec_stop_all(Session *s);                   /* stop every recording at once (e.g. Stop all) */
+/* 2.0: the live view - an audio recording's sketch so far (UI thread; 4 floats per block: min L, max L, min R, max R) */
+int  session_rec_sketch(Session *s, int ch, int sc, const float **pk, size_t *nblocks, unsigned *block, unsigned long long *frames);
+bool session_rec_is_midi(Session *s, int ch, int sc);
 
 // --- Delete ---
 void session_delete_channel(Session *s, int ch);
@@ -410,7 +484,46 @@ int  session_insert_scene(Session *s, int idx);
 // Step 36: moves channel from to position to (playback continues). false = nothing was done.
 bool session_move_channel(Session *s, int from, int to);
 void session_play_scene(Session *s, int scene);
+void session_play_scene_now(Session *s, int scene);        /* 1.4.17: at once (not quantized) */
+/* 1.4.17: how long the scene plays: the longest clip without loop (the looping ones go on until then); if all of
+ * them loop: one pass of the longest. nclips / longest (its name) / all_loop may be NULL. */
+double session_scene_length(Session *s, int scene, int *nclips, char *longest, size_t ln, bool *all_loop);
+
+/* 1.4.19: surround (surround.h). The channel: NULL / n = 0 = off (back to its stereo routing). Not in the PipeWire
+ * graph mode (there a channel has two ports). A clip: its points (copied, sorted); n = 0 = none. Main thread. */
+int    session_set_surround(Session *s, int ch, const SurSetup *setup);
+bool   session_get_surround(Session *s, int ch, SurSetup *out);       /* false = off */
+void   session_clip_set_sur_points(Session *s, int ch, int scene, const SurPt *p, int n);
+int    session_clip_get_sur_points(Session *s, int ch, int scene, SurPt *out, int max);
+bool   session_surround_now(Session *s, int ch, float *az, float *spread);   /* where the channel's sound is now */
+bool   session_surround_now_room(Session *s, int ch, float *x, float *y, float *w);   /* 1.4.22: the room mode */
+/* 1.4.17: scene transitions - the audio clips that play fade out (equal power), the clips of `scene` start and fade in,
+ * over session_get_transition_sec seconds, at once (not quantized). MIDI clips switch at once. Main thread. */
+#define TR_SEC_MIN 0.1f
+#define TR_SEC_MAX 120.0f
+void   session_set_transition_sec(Session *s, float sec);
+float  session_get_transition_sec(Session *s);
+int    session_transition_to(Session *s, int scene);       /* 0 = ok */
+int    session_transition_next(Session *s);                /* the next scene with clips (after the current one) */
+int    session_transition_back(Session *s);                /* back to the scene before (the history) */
+int    session_current_scene(Session *s);                  /* -1 = none */
+float  session_transition_progress(Session *s);            /* 0..1 while one runs, -1 = none */
+void   session_automation_hold(Session *s, bool hold);     /* "Stop automations" / resume */
+bool   session_automation_held(Session *s);
 void session_stop_scene(Session *s, int scene);
+void session_stop_clip(Session *s, int ch, int scene);     /* 1.4.2 */
+/* 1.4.24: surround (multichannel) files */
+void   session_load_mc_next(int mode, int first_out, const char *orig);   /* how the next session_set_clip opens its file */
+int    session_clip_mc_mode(Session *s, int ch, int sc);                   /* CLIP_MC_* */
+int    session_clip_mc_channels(Session *s, int ch, int sc);               /* > 2 = a multichannel file (or PATH: its original) */
+int    session_clip_mc_out(Session *s, int ch, int sc);                    /* MULTI: the first output (0-based) */
+void   session_clip_set_mc_out(Session *s, int ch, int sc, int out);
+const char *session_clip_mc_orig(Session *s, int ch, int sc);              /* PATH: the multichannel original */
+int    session_clip_set_mc(Session *s, int ch, int sc, int mode, const char *path, const char *orig);
+bool   session_mc_find_new(Session *s, int *ch, int *sc);
+uint64_t session_clip_mc_map(Session *s, int ch, int sc, int k);         /* 2.0: the Speaker Map of file channel k */
+void   session_clip_set_mc_map(Session *s, int ch, int sc, int k, uint64_t mask);                 /* a surround file just added (not asked yet) */
+void   session_clip_mc_set_asked(Session *s, int ch, int sc);
 
 // --- Global ---
 void session_play_all(Session *s);
@@ -469,6 +582,11 @@ void session_fx_remove(Session *s, int ch, int idx);
 int  session_fx_insert(Session *s, int ch, int pos, const char *fmt, const char *name, const char *path);   /* 1.2 */
 void session_fx_move(Session *s, int ch, int from, int to);                                                 /* 1.2 */
 void session_fx_toggle_bypass(Session *s, int ch, int idx);
+/* 1.4.14: MIDI Learn of plugin parameters (main thread). cc 0..127; get: -1 = not bound */
+int  session_fx_midi_get(Session *s, int ch, int k, int param);
+bool session_fx_midi_set(Session *s, int ch, int k, int param, int cc);   /* cc < 0 = forget; false = no room */
+int  session_fx_midi_count(Session *s, int ch, int k);
+void session_fx_midi_clear(Session *s, int ch, int k);
 void session_set_clip_bind(Session *s, int ch, int scene, int bind);
 // A new MIDI signal (kind = MIDI_BIND_NOTE / MIDI_BIND_CC; value = velocity / CC value).
 // If there is an armed button -> binds it; otherwise triggers everything bound to this signal.
@@ -480,6 +598,104 @@ void session_bind_to_text(int bind, char *out, size_t size);
 // --- Tempo ---
 void   session_set_tempo(Session *s, float bpm);           // clamps to BPM_MIN..BPM_MAX, rounds to 0.01
 // 1.1: launch quantization in beats (0 = launch at once, 1 = next beat, 4 = next bar, 8 = 2 bars ...)
+// 1.4.8: the time signature. num 1..32, den 1, 2, 4, 8, 16 or 32. A bar = num * 4 / den quarter beats (7/8 -> 3.5).
+#define SIG_NUM_MAX 32
+enum { QUANT_NOW = 0, QUANT_BEAT, QUANT_HALF_BAR, QUANT_BAR, QUANT_2BARS, QUANT_4BARS, QUANT_N_MODES };
+int    session_set_time_sig(Session *s, int num, int den);   // 0 = ok, -1 = not a valid one (nothing changes)
+void   session_get_time_sig(const Session *s, int *num, int *den);
+double session_bar_beats(const Session *s);                 // quarter beats in a bar (4/4 -> 4, 6/8 -> 3, 7/8 -> 3.5)
+double session_sig_unit(const Session *s);                  // quarter beats in one counted beat (4/den: /8 -> 0.5)
+void   session_set_quant_mode(Session *s, int mode);         // QUANT_*: the launch quantization in bars/beats of the signature
+int    session_get_quant_mode(const Session *s);             // -1 = a plain number of beats (session_get_quantize)
+// 1.4.9: the clip's own gain (dB) and pan (-1..1)
+#define CLIP_GAIN_MIN_DB (-60.0f)
+#define CLIP_GAIN_MAX_DB 24.0f
+void   session_set_clip_gain(Session *s, int ch, int scene, float db);
+float  session_get_clip_gain(Session *s, int ch, int scene);
+void   session_set_clip_pan(Session *s, int ch, int scene, float pan);
+float  session_get_clip_pan(Session *s, int ch, int scene);
+// 1.4.13: pitch without changing the speed (-24..+24 semitones, 0.01 = 1 cent) and keeping the formants (voices)
+#define CLIP_PITCH_MAX 24.0f
+void   session_set_clip_pitch(Session *s, int ch, int scene, float semitones);
+float  session_get_clip_pitch(Session *s, int ch, int scene);
+void   session_set_clip_formants(Session *s, int ch, int scene, bool on);
+bool   session_get_clip_formants(Session *s, int ch, int scene);
+// 1.4.11: loudness normalization (like the streaming services): every audio clip is brought to the target loudness
+// (LUFS, measured in the background together with the waveform). Turned up only as far as its highest sample stays
+// at or below -1 dBFS (so never distorted); down_only = never up. target 0 = off (nothing is touched).
+void   session_set_loudness(Session *s, int target_lufs, bool down_only);
+// main thread, a few times a second: puts the measured values into effect (cheap)
+void   session_update_loudness(Session *s);
+// what one clip gets: false = not measured (yet) / not audio
+bool   session_clip_loudness(Session *s, int ch, int scene, float *lufs, float *peak_db, float *norm_db);
+
+/* 1.4.14: everything an offline render of an audio clip needs (audio export), taken on the UI thread.
+ * The render itself reads a FRESH copy of the source, so the clip can keep playing meanwhile. */
+typedef struct {
+    char      path[1024];
+    char      name[NAME_LEN];
+    EditList *edits;          /* a copy of the cuts (the caller frees it: edit_free) */
+    size_t    start, end;     /* the start and stop markers (clip frames at the session rate) */
+    bool      stretch;        /* warp or pitch: through the Stretch */
+    double    speed;          /* 1 = as recorded */
+    float     pitch_st;
+    bool      formants;
+    float     gain_db;        /* the clip gain + loudness normalization; <= CLIP_GAIN_MIN_DB = silence */
+    float     pan;
+    int       sample_rate;    /* the session rate (= the rate of the source and of the cut positions) */
+    bool      stems;          /* 1.4.14: plays the separated stems with these gains (0 = muted / not soloed) */
+    int       stem_n;
+    char      stem_path[STEM_MAX][1024];
+    char      stem_name[STEM_MAX][STEM_NAME_LEN];
+    float     stem_gain[STEM_MAX];
+    int       mc_nch;         /* 1.4.24: > 2 = a multichannel clip (its file's channels) */
+} ClipSnapshot;
+int    session_clip_snapshot(Session *s, int ch, int scene, ClipSnapshot *out);   /* 0 = ok (an audio clip) */
+int    session_open_clip_source(Session *s, const char *path, StreamSource *out);  /* stereo float at the session rate */
+int    session_open_snapshot_source(Session *s, const ClipSnapshot *c, StreamSource *out);   /* the file or its stems */
+
+/* 1.4.14 / 1.4.17: separated parts (src/separate.c makes them: vocals + instrumental, or up to 6 instruments + the rest).
+ * They replace the clip's file under its cuts, markers, warp and pitch; each has a level (dB, CLIP_GAIN_MIN_DB = -inf),
+ * mute and solo. The parts always add up to the original. */
+#define STEM_VOCALS 0
+#define STEM_INST   1
+int    session_clip_set_stem_set(Session *s, int ch, int scene, const StemSet *set);   /* NULL = the file again */
+int    session_clip_set_stems(Session *s, int ch, int scene, const char *vocals, const char *inst);   /* the 2-part form */
+bool   session_clip_has_stems(Session *s, int ch, int scene);
+int    session_clip_stem_count(Session *s, int ch, int scene);
+const char *session_clip_stem_path(Session *s, int ch, int scene, int k);
+const char *session_clip_stem_name(Session *s, int ch, int scene, int k);
+void   session_clip_set_stem_level(Session *s, int ch, int scene, int k, float db);
+float  session_clip_get_stem_level(Session *s, int ch, int scene, int k);
+void   session_clip_set_stem_mute(Session *s, int ch, int scene, int k, bool mute);
+bool   session_clip_get_stem_mute(Session *s, int ch, int scene, int k);
+void   session_clip_set_stem_solo(Session *s, int ch, int scene, int k, bool solo);
+bool   session_clip_get_stem_solo(Session *s, int ch, int scene, int k);
+bool   session_clip_stem_audible(Session *s, int ch, int scene, int k);   /* not muted, not silenced by a solo */
+float  session_clip_stem_gain(Session *s, int ch, int scene, int k);      /* the linear gain it plays with now */
+/* 1.4.17: MIDI Learn of a part's level (main thread): -1 = none. A CC value 100 = 0 dB, 0 = -inf. */
+void   session_clip_set_stem_cc(Session *s, int ch, int scene, int k, int cc);
+int    session_clip_get_stem_cc(Session *s, int ch, int scene, int k);
+void   session_stem_learn_arm(int ch, int scene, int k);         /* ch -1 = cancel */
+bool   session_stem_learn_armed(int *ch, int *scene, int *k);
+float  session_stem_cc_db(int value);
+int    session_stems_midi_cc(Session *s, int cc, int value);     /* the parts bound to it: how many moved */
+void   session_stems_poll(Session *s, double now);               /* each frame: re-mixes the parts MIDI moved */
+/* a level / mute change is heard at once: the clip continues from where it is with the new mix (a short cross-fade) */
+void   session_clip_stems_apply(Session *s, int ch, int scene);
+
+/* 1.4.17: "Split to clips" - each part becomes a clip of its own, placed where the user drops it */
+typedef struct {
+    char   path[1024], name[NAME_LEN + 32];
+    char  *edits;                              /* the cuts as text (malloc) */
+    size_t start, end, loop_start, loop_end;
+    bool   loop, warp, fmt;
+    float  bpm_d, bpm_f, bpm_p, gain, pan, pitch;
+} ClipPart;
+int    session_clip_capture_part(Session *s, int ch, int scene, int k, ClipPart *p);
+int    session_place_part(Session *s, int ch, int scene, const ClipPart *p);   /* 0 ok, 2 = the cell is not empty */
+void   clip_part_free(ClipPart *p);
+void   session_set_extra_bound(Session *s, const unsigned mask[4], bool block);   // 1.4.8: notes of the controller buttons / pads
 void   session_set_quantize(Session *s, float beats);
 float  session_get_quantize(Session *s);
 // the transport position in beats (bar = 4 beats); false = not running
@@ -502,6 +718,7 @@ bool   session_clip_bpm_busy(Session *s, int ch, int scene);
 bool   session_get_clip_warp(Session *s, int ch, int scene);
 void   session_set_clip_warp(Session *s, int ch, int scene, bool on);
 // Manual value in the field: with warp on = the tempo to play at; with warp off = a correction of the original.
+void   session_clip_bpm_reset(Session *s, int ch, int scene);   /* 2.0: back to the detected tempo */
 void   session_set_clip_bpm_value(Session *s, int ch, int scene, float bpm);
 // Directly (for loading a project/undo): 0 = no value.
 void   session_set_clip_bpm_fields(Session *s, int ch, int scene, float detected, float fix, float play);
@@ -524,6 +741,7 @@ int    session_clip_set_edits_text(Session *s, int ch, int scene, const char *te
 bool   session_clip_peaks(const Clip *cl, size_t f0, size_t f1, PeakVal *out);
 // The same, but with a given list of parts (UI: preview while dragging)
 bool   session_clip_peaks_list(const Clip *cl, const EditList *e, int64_t f0, int64_t f1, PeakVal *out);   /* f0 may be < 0 (step 36j) */
+bool session_peaks_list(const Clip *cl, Peaks *pk, const EditList *e, int64_t f0, int64_t f1, PeakVal *out);   /* 1.4.14 */
 // Called every frame: collects the finished BPM detections from the background thread.
 void   session_poll_bpm(Session *s);
 
@@ -545,9 +763,6 @@ float  session_get_crossfade(Session *s);
 
 // --- Waveform zoom (visual) ---
 void   session_set_wave_zoom(Session *s, int ch, int scene, float zoom);
-float  session_get_wave_zoom(Session *s, int ch, int scene);
 void   session_set_wave_scroll(Session *s, int ch, int scene, size_t frame);
-size_t session_get_wave_scroll(Session *s, int ch, int scene);
-void   session_reset_wave_zoom(Session *s, int ch, int scene);
 
 #endif

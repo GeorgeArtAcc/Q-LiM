@@ -11,6 +11,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #define READ_FRAMES 16384u
 #define L2_BLOCKS   16u                 /* second level: 1 entry per 16 blocks (for fast drawing of the whole clip) */
 
@@ -24,7 +27,10 @@ static inline int16_t q16(float v)
     return (int16_t)lrintf(v * 32767.0f);
 }
 struct Peaks {
+    atomic_bool    loud_ok;             /* 1.4.11 */
+    float          lufs, peak_db;
     char          *path;
+    int            ch;                  /* 1.4.24: >= 0 = only this channel of the file */
     int            sr;
     size_t         frames;
     size_t         nblocks;
@@ -44,6 +50,105 @@ struct Peaks {
     float         *dbuf;
     size_t         dcap;
 };
+
+/* ===== 1.4.11: loudness, ITU-R BS.1770-4 (= EBU R128): K-weighting (a high shelf + a high pass, the coefficients
+ * for any sample rate as in libebur128), mean square of 100 ms pieces, 400 ms blocks with 75 % overlap, gates at
+ * -70 LUFS and -10 LU below the ungated mean. Both channels weight 1 (a mono file plays as dual mono = as heard). */
+typedef struct { double b0, b1, b2, a1, a2, z1, z2; } Biq;
+struct LoudMeter {
+    Biq     f[2][2];                    /* [channel][stage] */
+    size_t  step, in_step;              /* frames in 100 ms, done of the current one */
+    double  acc;                        /* sum of squares of the current 100 ms (L + R) */
+    double *sub;                        /* the 100 ms mean squares */
+    size_t  nsub, cap;
+    float   peak;
+};
+
+static inline double biq(Biq *q, double x)
+{
+    double y = q->b0 * x + q->z1;
+    q->z1 = q->b1 * x - q->a1 * y + q->z2;
+    q->z2 = q->b2 * x - q->a2 * y;
+    return y;
+}
+
+LoudMeter *loud_new(int rate)
+{
+    if (rate < 8000) return NULL;
+    LoudMeter *m = calloc(1, sizeof *m);
+    if (!m) return NULL;
+    double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
+    double K = tan(M_PI * f0 / rate), Vh = pow(10.0, G / 20.0), Vb = pow(Vh, 0.4996667741545416);
+    double a0 = 1.0 + K / Q + K * K;
+    Biq shelf = { (Vh + Vb * K / Q + K * K) / a0, 2.0 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
+                  2.0 * (K * K - 1.0) / a0, (1.0 - K / Q + K * K) / a0, 0, 0 };
+    f0 = 38.13547087602444; Q = 0.5003270373238773;
+    K = tan(M_PI * f0 / rate);
+    double d = 1.0 + K / Q + K * K;
+    Biq hp = { 1.0, -2.0, 1.0, 2.0 * (K * K - 1.0) / d, (1.0 - K / Q + K * K) / d, 0, 0 };
+    for (int c = 0; c < 2; ++c) { m->f[c][0] = shelf; m->f[c][1] = hp; }
+    m->step = (size_t)(rate / 10);
+    return m;
+}
+
+void loud_feed(LoudMeter *m, const float *lr, size_t n)
+{
+    if (!m) return;
+    for (size_t i = 0; i < n; ++i) {
+        float L = lr[2 * i], R = lr[2 * i + 1];
+        float aL = fabsf(L), aR = fabsf(R);
+        if (aL > m->peak) m->peak = aL;
+        if (aR > m->peak) m->peak = aR;
+        double yl = biq(&m->f[0][1], biq(&m->f[0][0], L));
+        double yr = biq(&m->f[1][1], biq(&m->f[1][0], R));
+        m->acc += yl * yl + yr * yr;
+        if (++m->in_step == m->step) {
+            if (m->nsub == m->cap) {
+                size_t nc = m->cap ? m->cap * 2 : 1024;
+                double *ns = realloc(m->sub, nc * sizeof(double));
+                if (!ns) { m->in_step = 0; m->acc = 0; continue; }
+                m->sub = ns; m->cap = nc;
+            }
+            m->sub[m->nsub++] = m->acc / (double)m->step;
+            m->in_step = 0;
+            m->acc = 0.0;
+        }
+    }
+}
+
+void loud_result(const LoudMeter *m, float *lufs, float *peak_db)
+{
+    float pk = m && m->peak > 0 ? 20.0f * log10f(m->peak) : -INFINITY;
+    if (peak_db) *peak_db = pk;
+    if (!lufs) return;
+    *lufs = -INFINITY;
+    if (!m || m->nsub < 4) return;
+    size_t nb = m->nsub - 3;                            /* 400 ms blocks every 100 ms */
+    double sum = 0; size_t cnt = 0;
+    const double abs_z = pow(10.0, (-70.0 + 0.691) / 10.0);
+    for (size_t b = 0; b < nb; ++b) {
+        double z = (m->sub[b] + m->sub[b + 1] + m->sub[b + 2] + m->sub[b + 3]) * 0.25;
+        if (z > abs_z) { sum += z; ++cnt; }
+    }
+    if (!cnt) return;
+    double rel = -0.691 + 10.0 * log10(sum / cnt) - 10.0, rel_z = pow(10.0, (rel + 0.691) / 10.0);
+    sum = 0; cnt = 0;
+    for (size_t b = 0; b < nb; ++b) {
+        double z = (m->sub[b] + m->sub[b + 1] + m->sub[b + 2] + m->sub[b + 3]) * 0.25;
+        if (z > abs_z && z > rel_z) { sum += z; ++cnt; }
+    }
+    if (cnt) *lufs = (float)(-0.691 + 10.0 * log10(sum / cnt));
+}
+
+void loud_free(LoudMeter *m) { if (m) { free(m->sub); free(m); } }
+
+bool peaks_loudness(const Peaks *p, float *lufs, float *peak_db)
+{
+    if (!p || !atomic_load_explicit(&((Peaks *)p)->loud_ok, memory_order_acquire)) return false;
+    if (lufs) *lufs = p->lufs;
+    if (peak_db) *peak_db = p->peak_db;
+    return true;
+}
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cv = PTHREAD_COND_INITIALIZER;
@@ -85,13 +190,19 @@ static void l2_close(Peaks *p, size_t g)
     p->l2[g] = o;
 }
 
+static int peaks_src(Peaks *p, StreamSource *src, int *sr)
+{
+    if (p->ch >= 0) return stream_source_sndfile_channel(p->path, src, sr, p->ch);
+    return stream_source_sndfile_native(p->path, src, sr);
+}
+
 static void compute(Peaks *p)
 {
     /* The sketch is computed from the ORIGINAL file (no resampling -> cheap) and mapped onto
      * blocks of OUTPUT frames (the session rate), so it matches the waveform on screen. */
     StreamSource src;
     int file_sr = 0;
-    if (stream_source_sndfile_native(p->path, &src, &file_sr) != 0 || file_sr <= 0) {
+    if (peaks_src(p, &src, &file_sr) != 0 || file_sr <= 0) {
         atomic_store(&p->failed, true);
         return;
     }
@@ -100,6 +211,7 @@ static void compute(Peaks *p)
 
     float *buf = malloc((size_t)READ_FRAMES * 2 * sizeof(float));
     if (!buf) { atomic_store(&p->failed, true); src.close(src.ctx); return; }
+    LoudMeter *lm = loud_new(file_sr);                  /* 1.4.11 */
 
     size_t pos = 0, cur_b = 0;
     float cur = 0.0f;
@@ -122,6 +234,7 @@ static void compute(Peaks *p)
         if (n > in_frames - pos) n = in_frames - pos;
         size_t got = src.read(src.ctx, pos, buf, n);
         if (got == 0) break;
+        loud_feed(lm, buf, got);
         for (size_t i = 0; i < got; ++i) {
             size_t b = (size_t)((double)(pos + i) * ratio) / PEAKS_BLOCK;
             if (b >= p->nblocks) b = p->nblocks - 1;
@@ -139,9 +252,14 @@ static void compute(Peaks *p)
         pos += got;
     }
     if (!atomic_load(&p->cancel)) {                      /* the last (and possibly skipped) blocks */
+        if (lm && pos >= in_frames) {                    /* 1.4.11: the whole file was read */
+            loud_result(lm, &p->lufs, &p->peak_db);
+            atomic_store_explicit(&p->loud_ok, true, memory_order_release);
+        }
         while (cur_b < p->nblocks) CLOSE_BLOCK();
     #undef CLOSE_BLOCK
     }
+    loud_free(lm);
     free(buf);
     src.close(src.ctx);
 }
@@ -170,9 +288,15 @@ static void *worker(void *arg)
 
 Peaks *peaks_start(const char *path, int sr, size_t frames)
 {
+    return peaks_start_ch(path, sr, frames, -1);
+}
+
+Peaks *peaks_start_ch(const char *path, int sr, size_t frames, int ch)
+{
     if (!path || frames == 0) return NULL;
     Peaks *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
+    p->ch = ch;
     p->nblocks = (frames + PEAKS_BLOCK - 1) / PEAKS_BLOCK;
     p->data = calloc(p->nblocks, sizeof(float));
     p->nl2 = (p->nblocks + L2_BLOCKS - 1) / L2_BLOCKS;
@@ -246,42 +370,6 @@ float peaks_max(const Peaks *p, size_t b0, size_t b1)
     return m;
 }
 
-bool peaks_detail(Peaks *p, size_t start, double fpb, int n_bars, float *out)
-{
-    if (!p || !out || n_bars <= 0 || fpb <= 0.0) return false;
-    if (!p->dopen) {
-        if (stream_source_sndfile_native(p->path, &p->dsrc, &p->dfile_sr) != 0 || p->dfile_sr <= 0) return false;
-        p->dopen = true;
-    }
-    double ratio = (double)p->sr / (double)p->dfile_sr;       /* output frames per input frame */
-    size_t in_total = p->dsrc.frames(p->dsrc.ctx);
-    size_t in_start = (size_t)((double)start / ratio);
-    size_t in_len   = (size_t)(fpb * (double)n_bars / ratio) + 2;
-    if (in_start >= in_total) { for (int i = 0; i < n_bars; ++i) out[i] = 0.0f; return true; }
-    if (in_len > in_total - in_start) in_len = in_total - in_start;
-    if (in_len > (size_t)8 * 1024 * 1024) return false;       /* protection: do not read gigantic windows */
-
-    if (p->dcap < in_len) {
-        float *nb = realloc(p->dbuf, in_len * 2 * sizeof(float));
-        if (!nb) return false;
-        p->dbuf = nb; p->dcap = in_len;
-    }
-    size_t got = p->dsrc.read(p->dsrc.ctx, in_start, p->dbuf, in_len);
-
-    for (int b = 0; b < n_bars; ++b) {
-        size_t f0 = (size_t)((double)b * fpb / ratio);
-        size_t f1 = (size_t)((double)(b + 1) * fpb / ratio);
-        if (f1 <= f0) f1 = f0 + 1;
-        float m = 0.0f;
-        for (size_t f = f0; f < f1 && f < got; ++f) {
-            float v = (p->dbuf[f * 2] + p->dbuf[f * 2 + 1]) * 0.5f;
-            if (v < 0) v = -v;
-            if (v > m) m = v;
-        }
-        out[b] = m;
-    }
-    return true;
-}
 
 static void acc_blk(const Blk *k, PeakVal *o, double *ls, double *rs)
 {
@@ -330,7 +418,7 @@ bool peaks_detail_val(Peaks *p, size_t start, double fpb, int n_bars, PeakVal *o
 {
     if (!p || !out || n_bars <= 0 || fpb <= 0.0) return false;
     if (!p->dopen) {
-        if (stream_source_sndfile_native(p->path, &p->dsrc, &p->dfile_sr) != 0 || p->dfile_sr <= 0) return false;
+        if (peaks_src(p, &p->dsrc, &p->dfile_sr) != 0 || p->dfile_sr <= 0) return false;
         p->dopen = true;
     }
     double ratio = (double)p->sr / (double)p->dfile_sr;

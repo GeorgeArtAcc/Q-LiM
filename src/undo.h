@@ -35,6 +35,5 @@ void undo_shutdown(void);
 
 // For tests: returns whether the pointers point to things on the stack
 int  undo_depth(void);
-int  undo_redo_depth(void);
 
 #endif

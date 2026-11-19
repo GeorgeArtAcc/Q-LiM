@@ -28,6 +28,5 @@ DiskClass diskinfo_classify_dev(unsigned major_num, unsigned minor_num);
 DiskClass diskinfo_classify_path(const char *path, unsigned long long *dev_key);
 
 /* For tests: replace /sys and /proc/self/mountinfo (NULL = the standard ones) and clear the cache. */
-void diskinfo_set_roots(const char *sysfs_root, const char *mountinfo_path);
 
 #endif

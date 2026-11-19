@@ -20,12 +20,6 @@ static char g_mi[PATH_MAX]  = "/proc/self/mountinfo";
 static struct { unsigned long long key; DiskClass c; } g_cache[CACHE_N];
 static int g_cache_n = 0;
 
-void diskinfo_set_roots(const char *sysfs_root, const char *mountinfo_path)
-{
-    snprintf(g_sys, sizeof g_sys, "%s", sysfs_root ? sysfs_root : "/sys");
-    snprintf(g_mi,  sizeof g_mi,  "%s", mountinfo_path ? mountinfo_path : "/proc/self/mountinfo");
-    g_cache_n = 0;
-}
 
 const char *diskinfo_class_name(DiskClass c)
 {

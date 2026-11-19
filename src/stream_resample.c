@@ -12,19 +12,39 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* Quality: 32 zero crossings on each side with cutoff = Nyquist of the lower rate,
- * Kaiser beta 9 (~ -90 dB side lobes), 256 phases with linear interpolation between them. */
-#define RS_HW   32
-#define RS_NPH  256
-#define RS_BETA 9.0
+/* Quality (1.4.7, "as clean as it gets"): 64 zero crossings on each side, Kaiser beta 13, 1024 phases with linear
+ * interpolation between them, cutoff 95.5 % of the Nyquist of the lower rate (44.1 kHz -> passes 0..20 kHz flat
+ * within 0.01 dB, stops what would fold back). Measured (tests/test_resample.c): noise + distortion + aliasing
+ * >= 128 dB below the signal from 0 to 20 kHz, 44.1 <-> 48 kHz (1.4.6: 92..123 dB, an image at 21 kHz only 25 dB down).
+ * Cost: ~0.3 % of one core per playing clip (x86-64), ~1 % on a 32-bit x87 build (2.0: about 3x less, see Kernel). */
+#define RS_HW   64
+#define RS_NPH  1024
+#define RS_BETA 13.0
+#define RS_CUT  0.955
+
+/* 2.0: the usual rates are in a small whole-number ratio (44100 -> 48000 = 147 : 160). Then only L different
+ * fractional positions ever occur (160 here), so the filter is stored exactly for each of them (no interpolation
+ * between 1024 phases = fewer operations and an even more exact result), the stereo taps side by side (L L R R ...
+ * -> 4 multiplications at once on every CPU with SSE). About 3x cheaper per playing clip. */
+#define RS_MAXL     4096
+#define RS_MAXPTAB  (1u << 20)         /* floats: at most 4 MB of exact tables, otherwise the general way */
 
 typedef struct {
     int    src, dst;
     int    W;          /* half width in input frames */
     int    taps;       /* 2*W */
-    float *tab;        /* (RS_NPH + 1) * taps */
+    float *tab;        /* (RS_NPH + 1) * taps  (the general way, only when L == 0) */
+    int    L, M;       /* 2.0: dst/g and src/g when the exact tables exist, else 0 */
+    float *ptab2;      /* L * taps * 2: per phase, every tap twice (stereo) */
+    float *ptab1;      /* L * taps: per phase (multichannel sources) */
     bool   owned;      /* not in the global cache -> ctx frees it */
 } Kernel;
+
+static void kernel_free(Kernel *k)
+{
+    if (!k) return;
+    free(k->tab); free(k->ptab2); free(k->ptab1); free(k);
+}
 
 static pthread_mutex_t g_kmu = PTHREAD_MUTEX_INITIALIZER;
 #define KCACHE 16
@@ -42,40 +62,63 @@ static double bessel_i0(double x)
     return sum;
 }
 
+/* one row of the filter for the fractional position frac (0..1), normalised to DC = exactly 1 */
+static void kernel_row(double *row, int W, int taps, double c, double i0b, double frac)
+{
+    double sum = 0.0;
+    for (int m = 0; m < taps; ++m) {
+        double x = frac - (double)(m - (W - 1));          /* t - i */
+        double u = x / (double)W;
+        double h = 0.0;
+        if (u > -1.0 && u < 1.0) {
+            double a = M_PI * c * x;
+            double sinc = fabs(a) < 1e-12 ? 1.0 : sin(a) / a;
+            double win = bessel_i0(RS_BETA * sqrt(1.0 - u * u)) / i0b;
+            h = c * sinc * win;
+        }
+        row[m] = h;
+        sum += h;
+    }
+    for (int m = 0; m < taps; ++m) row[m] /= sum;
+}
+
+static int gcd_i(int a, int b) { while (b) { int t = a % b; a = b; b = t; } return a; }
+
 static Kernel *kernel_build(int src, int dst)
 {
-    double c = dst < src ? (double)dst / (double)src : 1.0;   /* cutoff relative to the input Nyquist */
+    double c = (dst < src ? (double)dst / (double)src : 1.0) * RS_CUT;   /* cutoff relative to the input Nyquist */
     int W = (int)ceil((double)RS_HW / c);
     int taps = 2 * W;
 
     Kernel *k = calloc(1, sizeof(*k));
     if (!k) return NULL;
-    k->tab = malloc((size_t)(RS_NPH + 1) * (size_t)taps * sizeof(float));
-    if (!k->tab) { free(k); return NULL; }
     k->src = src; k->dst = dst; k->W = W; k->taps = taps;
-
     double i0b = bessel_i0(RS_BETA);
     double *row = malloc((size_t)taps * sizeof(double));
-    if (!row) { free(k->tab); free(k); return NULL; }
+    if (!row) { free(k); return NULL; }
 
-    for (int p = 0; p <= RS_NPH; ++p) {
-        double frac = (double)p / (double)RS_NPH;
-        double sum = 0.0;
-        for (int m = 0; m < taps; ++m) {
-            double x = frac - (double)(m - (W - 1));          /* t - i */
-            double u = x / (double)W;
-            double h = 0.0;
-            if (u > -1.0 && u < 1.0) {
-                double a = M_PI * c * x;
-                double sinc = fabs(a) < 1e-12 ? 1.0 : sin(a) / a;
-                double win = bessel_i0(RS_BETA * sqrt(1.0 - u * u)) / i0b;
-                h = c * sinc * win;
+    int g = gcd_i(src, dst), L = dst / g, M = src / g;
+    if (L <= RS_MAXL && (size_t)L * (size_t)taps * 2 <= RS_MAXPTAB) {
+        k->ptab2 = malloc((size_t)L * (size_t)taps * 2 * sizeof(float));
+        k->ptab1 = malloc((size_t)L * (size_t)taps * sizeof(float));
+        if (k->ptab2 && k->ptab1) {
+            for (int p = 0; p < L; ++p) {
+                kernel_row(row, W, taps, c, i0b, (double)p / (double)L);
+                float *r2 = k->ptab2 + (size_t)p * (size_t)taps * 2, *r1 = k->ptab1 + (size_t)p * (size_t)taps;
+                for (int m = 0; m < taps; ++m) { r1[m] = (float)row[m]; r2[2 * m] = r2[2 * m + 1] = (float)row[m]; }
             }
-            row[m] = h;
-            sum += h;
+            k->L = L; k->M = M;
+            free(row);
+            return k;
         }
-        for (int m = 0; m < taps; ++m)
-            k->tab[(size_t)p * (size_t)taps + (size_t)m] = (float)(row[m] / sum);   /* DC = exactly 1 */
+        free(k->ptab2); free(k->ptab1); k->ptab2 = k->ptab1 = NULL;
+    }
+
+    k->tab = malloc((size_t)(RS_NPH + 1) * (size_t)taps * sizeof(float));
+    if (!k->tab) { free(row); free(k); return NULL; }
+    for (int p = 0; p <= RS_NPH; ++p) {
+        kernel_row(row, W, taps, c, i0b, (double)p / (double)RS_NPH);
+        for (int m = 0; m < taps; ++m) k->tab[(size_t)p * (size_t)taps + (size_t)m] = (float)row[m];
     }
     free(row);
     return k;
@@ -100,7 +143,7 @@ static Kernel *kernel_get(int src, int dst)
 void stream_resample_shutdown(void)
 {
     pthread_mutex_lock(&g_kmu);
-    for (int i = 0; i < g_kn; ++i) { free(g_kc[i]->tab); free(g_kc[i]); g_kc[i] = NULL; }
+    for (int i = 0; i < g_kn; ++i) { kernel_free(g_kc[i]); g_kc[i] = NULL; }
     g_kn = 0;
     pthread_mutex_unlock(&g_kmu);
 }
@@ -113,6 +156,7 @@ typedef struct {
 
     float       *buf;          /* window of input frames [buf_lo, buf_lo + buf_n) */
     size_t       buf_cap;
+    int          nch;          /* 1.4.24: 2 or the multichannel source's channels */
     int64_t      buf_lo;
     size_t       buf_n;
 
@@ -127,28 +171,88 @@ static size_t rs_frames(void *c) { return ((Rs *)c)->out_frames; }
 /* Fills buf[off .. off+n) with the input frames [from, from+n); outside the file = silence. */
 static bool rs_fill(Rs *r, float *dst, int64_t from, size_t n)
 {
+    const size_t C = (size_t)r->nch;
     size_t i = 0;
     while (i < n) {
         int64_t f = from + (int64_t)i;
         if (f < 0) {
             size_t z = (size_t)(-f);
             if (z > n - i) z = n - i;
-            memset(dst + i * 2, 0, z * 2 * sizeof(float));
+            memset(dst + i * C, 0, z * C * sizeof(float));
             i += z;
         } else if ((size_t)f >= r->in_frames) {
-            memset(dst + i * 2, 0, (n - i) * 2 * sizeof(float));
+            memset(dst + i * C, 0, (n - i) * C * sizeof(float));
             i = n;
         } else {
             size_t want = n - i;
             if (want > r->in_frames - (size_t)f) want = r->in_frames - (size_t)f;
-            size_t got = r->inner.read(r->inner.ctx, (size_t)f, dst + i * 2, want);
+            size_t got = r->inner.read(r->inner.ctx, (size_t)f, dst + i * C, want);
             if (got < want) {                       /* short file / error -> silence to the end */
-                memset(dst + (i + got) * 2, 0, (want - got) * 2 * sizeof(float));
+                memset(dst + (i + got) * C, 0, (want - got) * C * sizeof(float));
             }
             i += want;
         }
     }
     return true;
+}
+
+/* 2.0: the exact tables (see Kernel). Output frame o sits at input position o*M/L: whole part = o*M / L,
+ * phase = o*M % L - counted up step by step, no division per frame. The summation order is fixed -> every read
+ * and seek gives exactly the same result. */
+typedef float rs_v4 __attribute__((vector_size(16)));
+static size_t rs_exact(Rs *r, size_t pos, float *out, size_t n, int64_t lo)
+{
+    const Kernel *k = r->k;
+    const int W = k->W, taps = k->taps, L = k->L, M = k->M;
+    uint64_t idx = (uint64_t)pos * (uint64_t)M;
+    int64_t fl = (int64_t)(idx / (uint64_t)L);
+    int ph = (int)(idx % (uint64_t)L);
+    if (r->nch == 2) {
+        const int nf = taps * 2;                          /* floats per row (a multiple of 4: taps is even) */
+        for (size_t j = 0; j < n; ++j) {
+            const float *h = k->ptab2 + (size_t)ph * (size_t)nf;
+            const float *in = r->buf + (size_t)(fl - (W - 1) - lo) * 2;
+            rs_v4 a0 = { 0, 0, 0, 0 }, a1 = { 0, 0, 0, 0 }, a2 = { 0, 0, 0, 0 }, a3 = { 0, 0, 0, 0 };
+            int m = 0;
+            for (; m + 16 <= nf; m += 16) {
+                rs_v4 x0, x1, x2, x3, h0, h1, h2, h3;
+                memcpy(&x0, in + m, 16); memcpy(&x1, in + m + 4, 16); memcpy(&x2, in + m + 8, 16); memcpy(&x3, in + m + 12, 16);
+                memcpy(&h0, h + m, 16);  memcpy(&h1, h + m + 4, 16);  memcpy(&h2, h + m + 8, 16);  memcpy(&h3, h + m + 12, 16);
+                a0 += x0 * h0; a1 += x1 * h1; a2 += x2 * h2; a3 += x3 * h3;
+            }
+            for (; m + 8 <= nf; m += 8) {
+                rs_v4 x0, x1, h0, h1;
+                memcpy(&x0, in + m, 16); memcpy(&x1, in + m + 4, 16);
+                memcpy(&h0, h + m, 16);  memcpy(&h1, h + m + 4, 16);
+                a0 += x0 * h0; a1 += x1 * h1;
+            }
+            for (; m + 4 <= nf; m += 4) {
+                rs_v4 x0, h0;
+                memcpy(&x0, in + m, 16); memcpy(&h0, h + m, 16);
+                a0 += x0 * h0;
+            }
+            rs_v4 a = (a0 + a1) + (a2 + a3);
+            out[j * 2]     = a[0] + a[2];
+            out[j * 2 + 1] = a[1] + a[3];
+            ph += M;
+            while (ph >= L) { ph -= L; ++fl; }
+        }
+        return n;
+    }
+    const int C = r->nch;
+    for (size_t j = 0; j < n; ++j) {
+        const float *h = k->ptab1 + (size_t)ph * (size_t)taps;
+        const float *in = r->buf + (size_t)(fl - (W - 1) - lo) * (size_t)C;
+        float acc[STREAM_MAX_CH] = { 0 };
+        for (int m = 0; m < taps; ++m) {
+            const float *q = in + (size_t)m * (size_t)C;
+            for (int c = 0; c < C; ++c) acc[c] += h[m] * q[c];
+        }
+        for (int c = 0; c < C; ++c) out[j * (size_t)C + (size_t)c] = acc[c];
+        ph += M;
+        while (ph >= L) { ph -= L; ++fl; }
+    }
+    return n;
 }
 
 static size_t rs_read(void *c, size_t pos, float *out, size_t n)
@@ -160,17 +264,23 @@ static size_t rs_read(void *c, size_t pos, float *out, size_t n)
 
     const int W = r->k->W, taps = r->k->taps;
 
-    double t_first = (double)pos * r->ratio;
-    double t_last  = (double)(pos + n - 1) * r->ratio;
-    int64_t lo = (int64_t)floor(t_first) - (W - 1);
-    int64_t hi = (int64_t)floor(t_last) + W + 1;          /* exclusive */
+    int64_t f_first, f_last;
+    if (r->k->L) {                                         /* 2.0: exact (the same arithmetic as rs_exact) */
+        f_first = (int64_t)((uint64_t)pos * (uint64_t)r->k->M / (uint64_t)r->k->L);
+        f_last  = (int64_t)((uint64_t)(pos + n - 1) * (uint64_t)r->k->M / (uint64_t)r->k->L);
+    } else {
+        f_first = (int64_t)floor((double)pos * r->ratio);
+        f_last  = (int64_t)floor((double)(pos + n - 1) * r->ratio);
+    }
+    int64_t lo = f_first - (W - 1);
+    int64_t hi = f_last + W + 1;                           /* exclusive */
     size_t need = (size_t)(hi - lo);
 
     if (need > r->buf_cap) {
         size_t cap = need + 1024;
-        float *nb = malloc(cap * 2 * sizeof(float));
+        float *nb = malloc(cap * (size_t)r->nch * sizeof(float));
         if (!nb) return 0;
-        if (r->buf_n) memcpy(nb, r->buf, r->buf_n * 2 * sizeof(float));
+        if (r->buf_n) memcpy(nb, r->buf, r->buf_n * (size_t)r->nch * sizeof(float));
         free(r->buf);
         r->buf = nb;
         r->buf_cap = cap;
@@ -181,16 +291,38 @@ static size_t rs_read(void *c, size_t pos, float *out, size_t n)
     if (r->buf_n && lo >= r->buf_lo && lo <= old_hi) {
         size_t drop = (size_t)(lo - r->buf_lo);
         size_t keep = r->buf_n - drop;
-        if (drop) memmove(r->buf, r->buf + drop * 2, keep * 2 * sizeof(float));
+        if (drop) memmove(r->buf, r->buf + drop * (size_t)r->nch, keep * (size_t)r->nch * sizeof(float));
         if (keep > need) keep = need;
-        rs_fill(r, r->buf + keep * 2, lo + (int64_t)keep, need - keep);
+        rs_fill(r, r->buf + keep * (size_t)r->nch, lo + (int64_t)keep, need - keep);
     } else {
         rs_fill(r, r->buf, lo, need);
     }
     r->buf_lo = lo;
     r->buf_n = need;
 
+    if (r->k->L) return rs_exact(r, pos, out, n, lo);
     const float *tab = r->k->tab;
+    if (r->nch != 2) {                                     /* 1.4.24: a multichannel source (the same filter) */
+        const int C = r->nch;
+        for (size_t j = 0; j < n; ++j) {
+            double t = (double)(pos + j) * r->ratio;
+            double fl = floor(t);
+            double ph = (t - fl) * (double)RS_NPH;
+            int p0 = (int)ph;
+            float a = (float)(ph - (double)p0);
+            const float *r0 = tab + (size_t)p0 * (size_t)taps;
+            const float *r1 = r0 + taps;
+            const float *in = r->buf + (size_t)((int64_t)fl - (W - 1) - lo) * (size_t)C;
+            float acc[STREAM_MAX_CH] = { 0 };
+            for (int m = 0; m < taps; ++m) {
+                float h = r0[m] + a * (r1[m] - r0[m]);
+                const float *q = in + (size_t)m * (size_t)C;
+                for (int k = 0; k < C; ++k) acc[k] += h * q[k];
+            }
+            for (int k = 0; k < C; ++k) out[j * (size_t)C + (size_t)k] = acc[k];
+        }
+        return n;
+    }
     for (size_t j = 0; j < n; ++j) {
         double t = (double)(pos + j) * r->ratio;
         double fl = floor(t);
@@ -234,7 +366,7 @@ static void rs_close(void *c)
     Rs *r = c;
     if (!r) return;
     if (r->inner.close) r->inner.close(r->inner.ctx);
-    if (r->k && r->k->owned) { free(r->k->tab); free(r->k); }
+    if (r->k && r->k->owned) kernel_free(r->k);
     free(r->buf);
     free(r->tmp);
     free(r);
@@ -246,6 +378,7 @@ int stream_source_resample(const StreamSource *inner, int src_sr, int dst_sr, St
     Rs *r = calloc(1, sizeof(*r));
     if (!r) return -1;
     r->inner = *inner;
+    r->nch = stream_src_nch(inner);
     r->k = kernel_get(src_sr, dst_sr);
     if (!r->k) { free(r); return -1; }
     r->ratio = (double)src_sr / (double)dst_sr;
@@ -257,5 +390,6 @@ int stream_source_resample(const StreamSource *inner, int src_sr, int dst_sr, St
     out->read   = rs_read;
     out->close  = rs_close;
     out->ctx    = r;
+    out->nch    = inner->nch;
     return 0;
 }

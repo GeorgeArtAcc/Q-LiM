@@ -12,10 +12,11 @@
 enum { MIDIQ_HW = 0, MIDIQ_UI = 1, MIDIQ_N };
 
 void midiq_push(int src, unsigned char st, unsigned char d1, unsigned char d2);   /* any thread, one per src */
+/* 1.4.6: from an input only for playing: the notes are never held back by pad bindings / a waiting learn */
+void midiq_push_free(int src, unsigned char st, unsigned char d1, unsigned char d2);
 /* 1.3: to one channel directly (the MIDI editor's preview), not to the armed one */
 void midiq_push_to(int src, int channel, unsigned char st, unsigned char d1, unsigned char d2);
-/* the audio thread: out[i] = status, data1, data2, channel+1 (0 = the armed channel) */
+/* the audio thread: out[i] = status, data1, data2, channel+1 (0 = the armed channel), | 0x80 = "free" (midiq_push_free) */
 int  midiq_pop(unsigned char (*out)[4], int max);
-void midiq_clear(void);                                                           /* only while no audio runs */
 
 #endif

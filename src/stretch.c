@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stretch.h"
 #include "thread_prio.h"
+#include "pitchshift.h"
 
 typedef struct Wsola Wsola;
 static void ws_reset(Wsola *st);
@@ -316,6 +317,9 @@ struct Stretch {
     atomic_bool busy;                   /* the background thread is inside work with the stream */
     atomic_uint gen_req, gen_done;      /* reset request / reset done */
     _Atomic float speed;
+    _Atomic float pitch_st;             /* 1.4.13: semitones (0 = untouched) */
+    atomic_bool   formant;              /* 1.4.13: keep the formants */
+    atomic_bool   ps_active;            /* 1.4.13: the background thread plays through the pitch engine now */
     _Atomic(StretchPull) pull;
     _Atomic(void *) ud;
     float     *ring;                    /* stereo, RING_CAP */
@@ -329,10 +333,15 @@ struct Stretch {
     /* background thread only */
     float  *inL, *inR, *outL, *outR, *tmp;
     double  ratio, pulled, produced_src;
+    PitchShift *ps;                     /* 1.4.13: the pitch engine (NULL = could not be created) */
+    bool    use_ps;                     /* since the last reset this clip plays through ps (pitch != 0) */
+    double  out_acc;                    /* ps: the fraction of an output frame carried to the next chunk */
+    float  *poL, *poR;                  /* ps: output (input chunk / slowest speed) */
     unsigned drop;
     unsigned fade_in;                   /* after a reset: the first output frames ramp in smoothly (no "tick" on start) */
     size_t  tail_left;                  /* after the end of the file: how many more zeros to feed so the tail comes out */
     bool    input_ended;
+    bool    offline;                    /* 1.4.14: export: the source never "is late", a short read is the end */
 #endif
 };
 
@@ -347,8 +356,45 @@ static void sleep_us(long us)
     nanosleep(&ts, NULL);
 }
 
+/* 1.4.13: the pitch engine (Signalsmith Stretch) gets the wanted pitch / formants (background thread only) */
+static void ps_apply(Stretch *st)
+{
+    double semi = atomic_load(&st->pitch_st);
+    if (semi < -STRETCH_PITCH_MAX) semi = -STRETCH_PITCH_MAX;
+    if (semi > STRETCH_PITCH_MAX) semi = STRETCH_PITCH_MAX;
+    ps_set(st->ps, semi, atomic_load(&st->formant));
+}
+
+/* the latency of the pitch engine in OUTPUT frames at speed sp (what is dropped after a reset) */
+static unsigned ps_drop_frames(const Stretch *st, double sp)
+{
+    return (unsigned)(ps_latency_out(st->ps) + ps_latency_in(st->ps) / sp + 0.5);
+}
+
 static void rb_do_reset(Stretch *st)
 {
+    /* 1.4.13: which engine plays from this start on: a pitch shift -> Signalsmith, only tempo -> Rubber Band */
+    st->use_ps = st->ps && atomic_load(&st->pitch_st) != 0.0f;
+    atomic_store(&st->ps_active, st->use_ps);
+    if (st->use_ps) {
+        float sp = atomic_load(&st->speed);
+        if (sp < (float)STRETCH_SPEED_MIN) sp = (float)STRETCH_SPEED_MIN;
+        if (sp > (float)STRETCH_SPEED_MAX) sp = (float)STRETCH_SPEED_MAX;
+        ps_apply(st);                   /* first: the reset depends on the resampler's kernel for this pitch */
+        ps_reset(st->ps);
+        st->drop = ps_drop_frames(st, sp);
+        st->out_acc = 0.0;
+        st->fade_in = RB_FADE_IN;
+        st->pulled = st->produced_src = 0.0;
+        st->input_ended = false;
+        st->tail_left = 0;
+        atomic_store(&st->inner_pending, 0);
+        atomic_store(&st->eof_done, false);
+        atomic_store(&st->primed, false);
+        atomic_store(&st->end_known, false);
+        atomic_store(&st->wr, atomic_load(&st->rd));
+        return;
+    }
     rubberband_reset(st->rb);
     /* zeros in front, so it starts exactly at the beginning (no fade-in) */
     unsigned pad = rubberband_get_preferred_start_pad(st->rb);
@@ -423,7 +469,7 @@ static void rb_fill(Stretch *st)
         size_t got = 0;
         if (!st->input_ended) {
             got = pull ? pull(ud, st->tmp, req) : 0;
-            if (got < req && g_eof_fn && ud && !g_eof_fn(ud)) {
+            if (got < req && !st->offline && g_eof_fn && ud && !g_eof_fn(ud)) {
                 /* the disk has not delivered the audio yet (it is not the end): feed what there is and try again shortly */
                 if (got > 0) {
                     st->pulled += (double)got;
@@ -458,6 +504,77 @@ static void rb_fill(Stretch *st)
     }
 }
 
+/* 1.4.13: like rb_fill, but through the pitch engine (Signalsmith Stretch): it shifts the pitch and changes the
+ * tempo at once (nout = nin / speed). Background thread only, with busy=1. */
+#define PS_CHUNK 512u
+static void ps_fill(Stretch *st)
+{
+    StretchPull pull = atomic_load(&st->pull);
+    void *ud = atomic_load(&st->ud);
+    float sp = atomic_load(&st->speed);
+    if (sp < (float)STRETCH_SPEED_MIN) sp = (float)STRETCH_SPEED_MIN;
+    if (sp > (float)STRETCH_SPEED_MAX) sp = (float)STRETCH_SPEED_MAX;
+    ps_apply(st);
+
+    for (int guard = 0; guard < 64; ++guard) {
+        size_t wr = atomic_load(&st->wr), rd = atomic_load(&st->rd);
+        size_t fill = wr - rd;
+        if (fill >= RING_AHEAD || atomic_load(&st->eof_done)) { atomic_store(&st->primed, true); break; }
+        if (atomic_load(&st->gen_done) != atomic_load(&st->gen_req)) break;   /* new reset request */
+        if (st->input_ended && st->tail_left == 0) { atomic_store(&st->eof_done, true); break; }
+
+        unsigned req = PS_CHUNK, n = req;
+        size_t got = 0;
+        bool wait_disk = false;
+        if (!st->input_ended) {
+            got = pull ? pull(ud, st->tmp, req) : 0;
+            if (got < req && !st->offline && g_eof_fn && ud && !g_eof_fn(ud)) {
+                n = (unsigned)got;                      /* the disk is late (not the end): what there is, then wait */
+                wait_disk = true;
+            } else if (got < req) {                     /* the end of the file: the tail still has to come out */
+                st->input_ended = true;
+                double lat_out = (st->pulled + (double)got - st->produced_src) / sp;
+                if (lat_out < 0.0) lat_out = 0.0;
+                atomic_store(&st->end_wr, atomic_load(&st->wr) + (size_t)(lat_out + 0.5));
+                atomic_store(&st->end_known, true);
+                st->tail_left = (size_t)(ps_latency_in(st->ps) + ps_latency_out(st->ps) * (double)sp) + PS_CHUNK;
+            }
+            st->pulled += (double)got;
+        } else {
+            n = (unsigned)(st->tail_left < req ? st->tail_left : req);
+            st->tail_left -= n;
+        }
+        if (n == 0) break;
+        for (unsigned i = 0; i < n; ++i) {
+            if (i < got) { st->inL[i] = st->tmp[i * 2]; st->inR[i] = st->tmp[i * 2 + 1]; }
+            else         { st->inL[i] = 0.0f; st->inR[i] = 0.0f; }
+        }
+        st->out_acc += (double)n / sp;
+        unsigned nout = (unsigned)st->out_acc;
+        st->out_acc -= (double)nout;
+        if (nout > RING_CAP - fill) nout = (unsigned)(RING_CAP - fill);   /* never (fill < RING_AHEAD) */
+        ps_process(st->ps, st->inL, st->inR, (int)n, st->poL, st->poR, (int)nout);
+        unsigned skip = 0;
+        if (st->drop) { skip = nout < st->drop ? nout : st->drop; st->drop -= skip; }
+        for (unsigned i = skip; i < nout; ++i) {
+            size_t w = (wr++) & (RING_CAP - 1);
+            float g = 1.0f;
+            if (st->fade_in) {
+                float t = (float)(RB_FADE_IN - st->fade_in) / (float)RB_FADE_IN;
+                g = 0.5f - 0.5f * cosf(t * 3.14159265f);
+                st->fade_in--;
+            }
+            st->ring[w * 2 + 0] = st->poL[i] * g;
+            st->ring[w * 2 + 1] = st->poR[i] * g;
+        }
+        st->produced_src += (double)(nout - skip) * sp;
+        atomic_store(&st->wr, wr);
+        double ip = st->pulled - st->produced_src;
+        atomic_store(&st->inner_pending, ip > 0.0 ? (size_t)ip : 0);
+        if (wait_disk) break;
+    }
+}
+
 static void *rb_thread(void *arg)
 {
     Stretch *st = arg;
@@ -474,7 +591,7 @@ static void *rb_thread(void *arg)
             rb_do_reset(st);
             atomic_store(&st->gen_done, g);
         }
-        rb_fill(st);
+        if (st->use_ps) ps_fill(st); else rb_fill(st);
         atomic_store(&st->busy, false);
         sleep_us(1500);
     }
@@ -489,6 +606,9 @@ static void rb_destroy(Stretch *st)
     }
     if (st->rb) rubberband_delete(st->rb);
     free(st->ring); free(st->inL); free(st->inR); free(st->outL); free(st->outR); free(st->tmp);
+    free(st->poL); free(st->poR);
+    ps_free(st->ps);
+    st->ps = NULL;
     st->rb = NULL;
 }
 #endif
@@ -505,6 +625,11 @@ Stretch *stretch_create(int sample_rate)
     st->inL = malloc(RB_CHUNK * sizeof(float));  st->inR = malloc(RB_CHUNK * sizeof(float));
     st->outL = malloc(RB_CHUNK * sizeof(float)); st->outR = malloc(RB_CHUNK * sizeof(float));
     st->tmp = malloc(RB_CHUNK * 2 * sizeof(float));
+    /* 1.4.13: the pitch engine (one per clip, used only while the clip has a pitch shift) */
+    st->ps = ps_new(sample_rate > 0 ? sample_rate : 48000);
+    st->poL = malloc((size_t)(PS_CHUNK / STRETCH_SPEED_MIN + 4) * sizeof(float));
+    st->poR = malloc((size_t)(PS_CHUNK / STRETCH_SPEED_MIN + 4) * sizeof(float));
+    if (!st->poL || !st->poR) { ps_free(st->ps); st->ps = NULL; }
     if (st->rb && st->ring && st->inL && st->inR && st->outL && st->outR && st->tmp) {
         rubberband_set_max_process_size(st->rb, RB_CHUNK);
         st->ratio = 1.0;
@@ -626,6 +751,28 @@ unsigned stretch_underruns(const Stretch *st)
     return 0;
 }
 
+void stretch_set_pitch(Stretch *st, double semitones, bool formants)
+{
+    if (!st) return;
+#ifdef HAVE_RUBBERBAND
+    if (semitones < -STRETCH_PITCH_MAX) semitones = -STRETCH_PITCH_MAX;
+    if (semitones > STRETCH_PITCH_MAX) semitones = STRETCH_PITCH_MAX;
+    atomic_store(&st->pitch_st, (float)semitones);
+    atomic_store(&st->formant, formants);
+#else
+    (void)semitones; (void)formants;
+#endif
+}
+
+bool stretch_has_pitch(void)
+{
+#ifdef HAVE_RUBBERBAND
+    return true;
+#else
+    return false;
+#endif
+}
+
 const char *stretch_engine_name(void)
 {
 #ifdef HAVE_RUBBERBAND
@@ -633,6 +780,51 @@ const char *stretch_engine_name(void)
 #else
     return "WSOLA";
 #endif
+}
+
+/* 1.4.14: offline rendering (audio export) - waits for the background thread instead of giving silence */
+void stretch_set_offline(Stretch *st)
+{
+#ifdef HAVE_RUBBERBAND
+    if (st) st->offline = true;
+#else
+    (void)st;
+#endif
+}
+
+size_t stretch_read_offline(Stretch *st, double speed, float *out, size_t n, StretchPull pull, void *ud,
+                            const volatile int *cancel)
+{
+    if (!st || n == 0) return 0;
+#ifdef HAVE_RUBBERBAND
+    if (st->rb) {
+        atomic_store(&st->speed, (float)speed);
+        atomic_store(&st->pull, pull);
+        atomic_store(&st->ud, ud);
+        atomic_store(&st->active, true);
+        for (;;) {
+            if (cancel && *cancel) return 0;
+            if (atomic_load(&st->gen_done) == atomic_load(&st->gen_req)) {
+                size_t rd = atomic_load(&st->rd), wr = atomic_load(&st->wr);
+                size_t k = wr - rd;
+                bool eof = atomic_load(&st->eof_done);
+                if (k >= n || eof) {
+                    if (k > n) k = n;
+                    for (size_t i = 0; i < k; ++i) {
+                        size_t r = (rd + i) & (RING_CAP - 1);
+                        out[i * 2 + 0] = st->ring[r * 2 + 0];
+                        out[i * 2 + 1] = st->ring[r * 2 + 1];
+                    }
+                    atomic_store(&st->rd, rd + k);
+                    return k;                         /* < n only at the very end */
+                }
+            }
+            sleep_us(500);
+        }
+    }
+#endif
+    ws_process(st->ws, speed, out, n, pull, ud);
+    return n;
 }
 
 size_t stretch_process(Stretch *st, double speed, float *out, size_t n,
@@ -650,6 +842,9 @@ size_t stretch_process(Stretch *st, double speed, float *out, size_t n,
             size_t rd = atomic_load(&st->rd), wr = atomic_load(&st->wr);
             size_t k = wr - rd;
             if (k > n) k = n;
+            /* 1.4.13: a whole block or nothing (except the very end): a few frames, a hole, then the rest would be a
+             * chopped start (seen after a restart: Rubber Band's first frames, zeros, then the music) */
+            if (k < n && !atomic_load(&st->eof_done)) k = 0;
             for (size_t i = 0; i < k; ++i) {
                 size_t r = (rd + i) & (RING_CAP - 1);
                 out[i * 2 + 0] = st->ring[r * 2 + 0];

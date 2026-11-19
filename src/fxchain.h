@@ -33,7 +33,6 @@ typedef struct FxChain FxChain;
 
 void fxchain_sync(Session *s);                    /* main thread, every frame */
 bool fxchain_slot_failed(Session *s, int ch, int k);
-bool fxchain_slot_loaded(Session *s, int ch, int k);
 bool fxchain_slot_loading(Session *s, int ch, int k);   /* step 35d: still starting up (Windows plugin) */
 void fxchain_shutdown(Session *s);
 bool fxchain_has_instrument(Session *s, int ch);
@@ -43,11 +42,20 @@ bool fxchain_slot_is_instrument(Session *s, int ch, int k);   /* 1.2: row k of t
 QPlug *fxchain_find(Session *s, int ch, int k);   /* the loaded plugin on row k of the channel (or NULL) */
 /* the settings of row k for saving into the project: from the live plugin, otherwise the ones saved from the project. malloc; 0 = present */
 int   fxchain_state_for_save(Session *s, int ch, int k, void **data, size_t *len);
+void  fxchain_keep_states(Session *s);   /* 2.0.0: before plugins move into / out of a separate process */
+
+/* 1.4.14: MIDI Learn of plugin parameters (main thread; the bindings themselves are in ChFx, see session.h).
+ * learn: param -1 = the next parameter that is moved (in the plugin's window or on the panel) becomes the target. */
+void fxchain_learn(Session *s, int ch, int k, int param);
+void fxchain_learn_cancel(void);
+bool fxchain_learning(int *ch, int *k, int *param);
+void fxchain_learn_poll(Session *s);                       /* every frame (fxchain_sync does it) */
+bool fxchain_learn_cc(Session *s, int cc, char *msg, int msz);   /* a CC while learning: bound (true = taken) */
+void fxchain_midi_cc(Session *s, int cc, int value);        /* a CC: moves every parameter bound to it */
 
 /* store for settings from the project (the number is kept in ChFx.state_ref) */
 int         fxstate_new(void);
 void        fxstate_append(int ref, const void *data, size_t len);
 const void *fxstate_get(int ref, size_t *len);
-void        fxstate_set(int ref, const void *data, size_t len);
 
 #endif

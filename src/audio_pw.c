@@ -895,11 +895,13 @@ int pwb_open(const char *target, int rate, int quantum, int channels,
     return 0;
 }
 
+static void x_teardown_all(void);
 static void disconnect_all(void)
 {
     if (!C.loop) { g_connected = false; return; }
     P.tl_stop(C.loop);                    /* the thread stops -> no more events, no lock needed */
     in_close_locked();                    /* 1.4 */
+    x_teardown_all();                     /* 1.4.21 */
     if (S.stream) { spa_hook_remove(&S.hook); P.stream_destroy(S.stream); S.stream = NULL; }
     graph_teardown_filters();
     for (int i = 0; i < PWB_MAX_SINKS; ++i) {
@@ -944,6 +946,160 @@ void pwb_get_status(PwbStatus *st)
     else if (atomic_load(&g_target_gone)) { st->lost = true; snprintf(st->why, sizeof st->why, "output disappeared"); }
     else if (st->state < 0) { st->lost = true; snprintf(st->why, sizeof st->why, "%s", g_stream_err); }
     else if (st->state == 0) { st->lost = true; snprintf(st->why, sizeof st->why, "stream disconnected"); }
+}
+
+/* ================= 1.4.21: extra outputs (other cards / Bluetooth, next to the main stream) =================
+ * Each one is an ordinary playback stream connected to its own output. It runs on that output's clock (its own
+ * driver in the graph); the clock difference to the main stream is handled by outx.c (the ring + the resampler). */
+#define PWB_XMAX 8
+static struct {
+    struct pw_stream *stream;
+    struct spa_hook   hook;
+    PwbRenderFn       fn;
+    void             *user;
+    int               ch;
+    atomic_int        state;
+    char              err[128];
+} X[PWB_XMAX];
+
+static void x_process(void *data)
+{
+    int i = (int)(intptr_t)data;
+    struct pw_stream *st = X[i].stream;
+    if (!st) return;
+    struct pw_buffer *b = P.stream_dequeue_buffer(st);
+    if (!b) return;
+    struct spa_data *d = &b->buffer->datas[0];
+    if (!d->data || !d->chunk) { P.stream_queue_buffer(st, b); return; }
+    const uint32_t stride = (uint32_t)sizeof(float) * (uint32_t)X[i].ch;
+    uint32_t n = d->maxsize / stride;
+    if (g_has_requested && b->requested > 0 && b->requested < n) n = (uint32_t)b->requested;
+    X[i].fn((float *)d->data, n, X[i].ch, X[i].user);
+    d->chunk->offset = 0;
+    d->chunk->stride = (int32_t)stride;
+    d->chunk->size = n * stride;
+    P.stream_queue_buffer(st, b);
+}
+
+static void x_state(void *data, enum pw_stream_state old, enum pw_stream_state state, const char *error)
+{
+    (void)old;
+    int i = (int)(intptr_t)data;
+    int s = state == PW_STREAM_STATE_ERROR ? -1 : state == PW_STREAM_STATE_UNCONNECTED ? 0
+          : state == PW_STREAM_STATE_CONNECTING ? 1 : state == PW_STREAM_STATE_PAUSED ? 2 : 3;
+    if (state == PW_STREAM_STATE_ERROR) snprintf(X[i].err, sizeof X[i].err, "%s", error ? error : "stream error");
+    printf(">>> PipeWire extra output %d: %s%s%s\n", i + 1, P.stream_state_as_string(state), error ? " - " : "", error ? error : "");
+    atomic_store(&X[i].state, s);
+    P.tl_signal(C.loop, false);
+}
+
+static const struct pw_stream_events x_events = {
+    PW_VERSION_STREAM_EVENTS,
+    .state_changed = x_state,
+    .process = x_process,
+};
+
+static void x_teardown_all(void)
+{
+    for (int i = 0; i < PWB_XMAX; ++i)
+        if (X[i].stream) { spa_hook_remove(&X[i].hook); P.stream_destroy(X[i].stream); X[i].stream = NULL; }
+}
+
+int pwb_extra_open(const char *target, int rate, int channels, PwbRenderFn fn, void *user, int *out_ch,
+                   char *err, int err_size)
+{
+    char dummy[8];
+    if (!err || err_size <= 0) { err = dummy; err_size = sizeof dummy; }
+    err[0] = 0;
+    if (!fn || !target || !*target) { snprintf(err, (size_t)err_size, "no output given"); return -1; }
+    if (connect_all(err, err_size) != 0) return -1;
+    P.tl_lock(C.loop);
+    roundtrip_locked(1.0);                                 /* a freshly connected (Bluetooth) speaker */
+    SinkSlot *sl = find_sink_locked(target);
+    if (!sl) { P.tl_unlock(C.loop); snprintf(err, (size_t)err_size, "not connected now"); return -1; }
+    int h = -1;
+    for (int i = 0; i < PWB_XMAX; ++i) if (!X[i].stream) { h = i; break; }
+    if (h < 0) { P.tl_unlock(C.loop); snprintf(err, (size_t)err_size, "too many outputs"); return -1; }
+    int ch = channels > 0 ? channels : (sl->s.channels > 0 ? sl->s.channels : 2);
+    if (ch > PWB_MAX_CH) ch = PWB_MAX_CH;
+    uint32_t pos[PWB_MAX_CH];
+    if (sl->s.channels == ch) memcpy(pos, sl->s.pos, sizeof(uint32_t) * (size_t)ch);
+    else if (ch == 2) { pos[0] = SPA_AUDIO_CHANNEL_FL; pos[1] = SPA_AUDIO_CHANNEL_FR; }
+    else if (ch == 1) pos[0] = SPA_AUDIO_CHANNEL_MONO;
+    else for (int i = 0; i < ch; ++i) pos[i] = SPA_AUDIO_CHANNEL_AUX0 + (uint32_t)i;
+    char nd[220];
+    snprintf(nd, sizeof nd, "Q-LiM -> %s", sl->s.desc);
+    struct pw_properties *props = P.properties_new(
+        PW_KEY_MEDIA_TYPE, "Audio",
+        PW_KEY_MEDIA_CATEGORY, "Playback",
+        PW_KEY_MEDIA_ROLE, "Production",
+        PW_KEY_APP_NAME, "Q-LiM",
+        PW_KEY_NODE_NAME, h == 0 ? "Q-LiM Extra 1" : h == 1 ? "Q-LiM Extra 2" : h == 2 ? "Q-LiM Extra 3" : h == 3 ? "Q-LiM Extra 4"
+                        : h == 4 ? "Q-LiM Extra 5" : h == 5 ? "Q-LiM Extra 6" : h == 6 ? "Q-LiM Extra 7" : "Q-LiM Extra 8",
+        PW_KEY_NODE_DESCRIPTION, nd,
+        PW_KEY_NODE_ALWAYS_PROCESS, "true",
+        PW_KEY_NODE_DONT_RECONNECT, "true",
+        NULL);
+    P.properties_set(props, PW_KEY_TARGET_OBJECT, sl->s.name);
+    if (!g_has_target_object) P.properties_setf(props, "node.target", "%u", sl->s.id);
+    if (sl->s.channels == ch) P.properties_set(props, PW_KEY_STREAM_DONT_REMIX, "true");
+    memset(&X[h].hook, 0, sizeof X[h].hook);
+    X[h].fn = fn; X[h].user = user; X[h].ch = ch; X[h].err[0] = 0;
+    atomic_store(&X[h].state, 1);
+    X[h].stream = P.stream_new(C.core, "Q-LiM extra output", props);
+    if (!X[h].stream) { P.tl_unlock(C.loop); snprintf(err, (size_t)err_size, "cannot create a stream"); return -1; }
+    P.stream_add_listener(X[h].stream, &X[h].hook, &x_events, (void *)(intptr_t)h);
+    uint8_t pod_buf[1024];
+    struct spa_pod_builder bld = SPA_POD_BUILDER_INIT(pod_buf, sizeof pod_buf);
+    struct spa_audio_info_raw info;
+    memset(&info, 0, sizeof info);
+    info.format = SPA_AUDIO_FORMAT_F32;
+    info.rate = (uint32_t)(rate > 0 ? rate : 48000);
+    info.channels = (uint32_t)ch;
+    memcpy(info.position, pos, sizeof(uint32_t) * (size_t)ch);
+    const struct spa_pod *params[1];
+    params[0] = spa_format_audio_raw_build(&bld, SPA_PARAM_EnumFormat, &info);
+    int r = P.stream_connect(X[h].stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
+                             PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_RT_PROCESS, params, 1);
+    if (r >= 0) {
+        uint64_t end = now_ns() + 2000000000ull;
+        while (atomic_load(&X[h].state) == 1 && !atomic_load(&C.core_dead) && now_ns() < end) P.tl_timed_wait(C.loop, 1);
+    }
+    if (r < 0 || atomic_load(&X[h].state) < 2) {
+        snprintf(err, (size_t)err_size, "%s", r < 0 ? spa_strerror(r) : X[h].err[0] ? X[h].err : "PipeWire did not accept it");
+        spa_hook_remove(&X[h].hook);
+        P.stream_destroy(X[h].stream);
+        X[h].stream = NULL;
+        P.tl_unlock(C.loop);
+        return -1;
+    }
+    printf(">>> PipeWire extra output %d -> %s (%d channels)\n", h + 1, sl->s.desc, ch);
+    P.tl_unlock(C.loop);
+    if (out_ch) *out_ch = ch;
+    return h;
+}
+
+void pwb_extra_close(int h)
+{
+    if (h < 0 || h >= PWB_XMAX || !X[h].stream || !C.loop) return;
+    P.tl_lock(C.loop);
+    spa_hook_remove(&X[h].hook);
+    P.stream_destroy(X[h].stream);
+    X[h].stream = NULL;
+    P.tl_unlock(C.loop);
+}
+
+int pwb_extra_state(int h) { return h >= 0 && h < PWB_XMAX && X[h].stream ? atomic_load(&X[h].state) : 0; }
+
+
+/* is this output there (e.g. the Bluetooth speaker is connected)? */
+bool pwb_sink_present(const char *target)
+{
+    if (!g_connected || !C.loop || !target || !*target) return false;
+    P.tl_lock(C.loop);
+    bool ok = find_sink_locked(target) != NULL;
+    P.tl_unlock(C.loop);
+    return ok;
 }
 
 int pwb_list_sinks(PwbSink *out, int max)

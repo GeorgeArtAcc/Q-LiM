@@ -96,7 +96,7 @@ int settings_load_audio(AudioConfig *config)
             else if (strncmp(v, "large", 5) == 0) config->disk_mode = 3;
             else config->disk_mode = 0;
         } else if (sscanf(line, "convert_files=%d", &val) == 1) {
-            config->convert_files = val ? 1 : 0;
+            config->convert_files = 0;      /* 2.0: the option is gone (Collect All & Save converts) - old files say 1 */
         } else if (strncmp(line, "backend=", 8) == 0) {
             config->backend = strncmp(line + 8, "pipewire", 8) == 0 ? AUDIO_BACKEND_PIPEWIRE : AUDIO_BACKEND_PORTAUDIO;
         } else if (sscanf(line, "pipewire_graph=%d", &val) == 1) {
@@ -164,4 +164,85 @@ int settings_save_audio(const AudioConfig *config)
 
     printf("settings_save_audio: OK '%s'\n", path);
     return 0;
+}
+
+// ============ 1.4.11: loudness normalization ============
+
+static void loud_path(char *out, size_t n)
+{
+    char p[1024];
+    settings_get_config_path(p, sizeof p);
+    char *sl = strrchr(p, '/');
+    if (sl) sl[1] = 0;
+    snprintf(out, n, "%sloudness.conf", p);
+}
+
+void settings_load_loudness(int *target, bool *down_only)
+{
+    if (target) *target = 0;
+    if (down_only) *down_only = false;
+    char p[1100], line[128];
+    loud_path(p, sizeof p);
+    FILE *f = fopen(p, "r");
+    if (!f) return;
+    int v;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "target_lufs=%d", &v) == 1 && target) *target = (v <= -5 && v >= -40) ? v : 0;
+        else if (sscanf(line, "down_only=%d", &v) == 1 && down_only) *down_only = v != 0;
+    }
+    fclose(f);
+}
+
+void settings_save_loudness(int target, bool down_only)
+{
+    char p[1100], tmp[1200], dir[1100];
+    loud_path(p, sizeof p);
+    snprintf(dir, sizeof dir, "%s", p);
+    char *sl = strrchr(dir, '/');
+    if (sl) { *sl = 0; settings_ensure_dir(dir); }
+    FILE *f = safe_open(p, tmp, sizeof tmp);
+    if (!f) return;
+    fprintf(f, "# Q-LiM loudness normalization (Edit -> Loudness...). target_lufs=0 = off\n");
+    fprintf(f, "target_lufs=%d\ndown_only=%d\n", target, down_only ? 1 : 0);
+    safe_commit(f, tmp, p, 0);
+}
+
+// ============ 1.4.12: the library's start folder ============
+
+static void lib_path(char *out, size_t n)
+{
+    char p[1024];
+    settings_get_config_path(p, sizeof p);
+    char *sl = strrchr(p, '/');
+    if (sl) sl[1] = 0;
+    snprintf(out, n, "%slibrary.conf", p);
+}
+
+bool settings_load_library_dir(char *out, size_t n)
+{
+    char p[1100], line[1200];
+    lib_path(p, sizeof p);
+    FILE *f = fopen(p, "r");
+    if (!f) return false;
+    bool ok = false;
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, "start_dir=", 10) != 0) continue;
+        line[strcspn(line, "\r\n")] = 0;
+        if (line[10]) { snprintf(out, n, "%s", line + 10); ok = true; }
+    }
+    fclose(f);
+    return ok;
+}
+
+void settings_save_library_dir(const char *dir)
+{
+    char p[1100], tmp[1200], d[1100];
+    lib_path(p, sizeof p);
+    snprintf(d, sizeof d, "%s", p);
+    char *sl = strrchr(d, '/');
+    if (sl) { *sl = 0; settings_ensure_dir(d); }
+    FILE *f = safe_open(p, tmp, sizeof tmp);
+    if (!f) return;
+    fprintf(f, "# Q-LiM: the folder the library opens in (the star button in the library)\nstart_dir=%s\n", dir ? dir : "");
+    safe_commit(f, tmp, p, 0);
 }

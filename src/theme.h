@@ -49,6 +49,9 @@ typedef struct {
     // Waveform
     Color wave_bg;
     Color wave_fg;
+
+    // 2.0.0: outlines of cells, headers and panels (light themes); alpha 0 = none (dark themes)
+    Color outline;
 } Theme;
 
 // ============ Global ============
@@ -64,6 +67,12 @@ extern char  g_theme_name[32];
 // Name of the accent
 extern char  g_accent_name[32];
 
+// 2.0.0: the look of the cells and headers: 0 = Classic, 1 = Modern (rounder, coloured strip headers, tinted clips,
+// a progress line under playing clips)
+extern int   g_ui_style;
+// 2.0.0: how a playing clip shows its time: 0 = the counter (0:12 / 0:30), 1 = a progress line, 2 = both
+extern int   g_clip_time;
+
 // ============ Presets ============
 
 typedef enum {
@@ -74,6 +83,11 @@ typedef enum {
     THEME_OLED,         /* step 18: true black (for OLED screens) */
     THEME_NORD,         /* step 18: cool grey-blue (the Nord palette) */
     THEME_GRUVBOX,      /* step 18: warm retro (the Gruvbox palette) */
+    THEME_GRAPHITE,     /* 2.0.0: neutral modern grey (like today's big DAWs) */
+    THEME_SLATE,        /* 2.0.0: cool blue-grey */
+    THEME_AURORA,       /* 2.0.0: deep violet with teal */
+    THEME_PAPER,        /* 2.0.0: clean light grey-white */
+    THEME_EMBER,        /* 2.0.0: warm dark brown with orange */
     THEME_CUSTOM,
     THEME_COUNT
 } ThemePreset;
@@ -108,10 +122,8 @@ void theme_save(void);
 // ============ Helpers ============
 
 // Returns the preset's name
-const char *theme_preset_name(ThemePreset preset);
 
 // Returns the accent's name
-const char *theme_accent_name(AccentPreset accent);
 
 // Returns the preset's index by name
 ThemePreset theme_preset_from_name(const char *name);

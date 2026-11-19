@@ -2,6 +2,7 @@
 /* Cutting a clip without changing the file — see edit.h */
 #define _POSIX_C_SOURCE 200809L
 #include "edit.h"
+#include "stream.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -541,14 +542,15 @@ float edit_gain(const EditList *e, int idx, int64_t p)
     return gain_at(s, p, cont_start(e, idx), cont_end(e, idx), micro);
 }
 
-size_t edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, float *out, size_t n)
+size_t edit_read_n(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, float *out, size_t n, int nch)
 {
+    const size_t C = nch > 2 ? (size_t)nch : 2;
     if (!e || n == 0) return 0;
     if (pos < 0) pos = 0;
-    if (pos >= e->len) { memset(out, 0, n * 2 * sizeof(float)); return 0; }
+    if (pos >= e->len) { memset(out, 0, n * C * sizeof(float)); return 0; }
     size_t avail = (size_t)(e->len - pos);
     size_t want = n < avail ? n : avail;
-    if (want < n) memset(out + want * 2, 0, (n - want) * 2 * sizeof(float));
+    if (want < n) memset(out + want * C, 0, (n - want) * C * sizeof(float));
     size_t done = 0;
     int i = first_after(e, pos);
     while (done < want) {
@@ -558,7 +560,7 @@ size_t edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, f
             int64_t gap_end = i < e->n ? e->seg[i].t : e->len;
             size_t cnt = (size_t)(gap_end - p);
             if (cnt > want - done) cnt = want - done;
-            memset(out + done * 2, 0, cnt * 2 * sizeof(float));
+            memset(out + done * C, 0, cnt * C * sizeof(float));
             done += cnt;
             continue;
         }
@@ -566,9 +568,9 @@ size_t edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, f
         int64_t lp = p - s->t;
         size_t cnt = (size_t)(s->len - lp);
         if (cnt > want - done) cnt = want - done;
-        float *o = out + done * 2;
+        float *o = out + done * C;
         size_t got = readfn(ctx, (size_t)(s->src + lp), o, cnt);
-        if (got < cnt) memset(o + got * 2, 0, (cnt - got) * 2 * sizeof(float));
+        if (got < cnt) memset(o + got * C, 0, (cnt - got) * C * sizeof(float));
         bool cs = cont_start(e, i), ce = cont_end(e, i);
         int64_t micro = s->len / 2 < EDIT_MICRO_FADE ? s->len / 2 : EDIT_MICRO_FADE;
         if (has_fades(s) || !cs || !ce) {
@@ -577,8 +579,7 @@ size_t edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, f
                 /* fast: the middle of a part without fades is 1.0 */
                 if (!has_fades(s) && q >= micro && q < s->len - micro) continue;
                 float g = gain_at(s, q, cs, ce, micro);
-                o[k * 2] *= g;
-                o[k * 2 + 1] *= g;
+                for (size_t c = 0; c < C; ++c) o[k * C + c] *= g;
             }
         }
         done += cnt;
@@ -594,7 +595,7 @@ size_t edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, f
         const EditSeg *pr = &e->seg[k - 1];
         int64_t z0 = s->t - s->xl, zl = s->xl + s->xr;
         int64_t a = pos > z0 ? pos : z0, b = end < s->t + s->xr ? end : s->t + s->xr;
-        float tmp[512 * 2];
+        float tmp[512 * STREAM_MAX_CH];
         while (a < b) {
             bool pre = a < s->t;                          /* before the seam: additionally the right one's earlier audio */
             int64_t lim = pre ? (b < s->t ? b : s->t) : b;
@@ -602,19 +603,23 @@ size_t edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, f
             if (cnt > 512) cnt = 512;
             int64_t src = pre ? s->src - (s->t - a) : pr->src + pr->len + (a - s->t);
             size_t got = src >= 0 ? readfn(ctx, (size_t)src, tmp, cnt) : 0;
-            if (got < cnt) memset(tmp + got * 2, 0, (cnt - got) * 2 * sizeof(float));
-            float *o = out + (size_t)(a - pos) * 2;
+            if (got < cnt) memset(tmp + got * C, 0, (cnt - got) * C * sizeof(float));
+            float *o = out + (size_t)(a - pos) * C;
             for (size_t q = 0; q < cnt; ++q) {
                 int64_t t = a + (int64_t)q;
                 float gi = xf_in(t, z0, zl), go = xf_out(t, z0, zl);
                 float gb = pre ? go : gi, gx = pre ? gi : go;
-                o[q * 2]     = o[q * 2] * gb + tmp[q * 2] * gx;
-                o[q * 2 + 1] = o[q * 2 + 1] * gb + tmp[q * 2 + 1] * gx;
+                for (size_t c = 0; c < C; ++c) o[q * C + c] = o[q * C + c] * gb + tmp[q * C + c] * gx;
             }
             a += (int64_t)cnt;
         }
     }
     return want;
+}
+
+size_t edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, float *out, size_t n)
+{
+    return edit_read_n(e, readfn, ctx, pos, out, n, 2);
 }
 
 /* --- text --- */
@@ -643,12 +648,15 @@ char *edit_to_text(const EditList *e)
 
 bool edit_valid(const EditList *e)
 {
-    if (!e || e->n < 0 || e->n > EDIT_MAX_SEGS || e->len < 0) return false;
+    if (!e || e->n < 0 || e->n > EDIT_MAX_SEGS || e->len < 0 || e->len > EDIT_MAX_LEN ||
+        (e->src_len > EDIT_MAX_LEN && e->src_len != INT64_MAX)) return false;          /* (INT64_MAX = "not known yet") */
     int64_t prev_end = INT64_MIN;
     int64_t m = out_margin(e);
     for (int i = 0; i < e->n; ++i) {
         const EditSeg *s = &e->seg[i];
         if (s->len <= 0 || s->t < prev_end || s->src < 0 || s->xl < 0 || s->xr < 0) return false;
+        if (s->len > EDIT_MAX_LEN || s->src > EDIT_MAX_LEN || s->t > EDIT_MAX_LEN || s->t < -EDIT_MAX_LEN ||
+            s->xl > EDIT_MAX_LEN || s->xr > EDIT_MAX_LEN) return false;              /* 2.1 */
         if (s->t + s->len <= -m || s->t >= e->len + m) return false;   /* step 36j: outwards - up to one length */
         if (e->src_len > 0 && s->src + s->len > e->src_len) return false;
         prev_end = s->t + s->len;

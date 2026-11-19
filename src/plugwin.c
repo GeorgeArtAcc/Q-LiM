@@ -7,8 +7,11 @@
 void *GfxSdlWindow(void);   /* sdlgfx.c (sdlgfx.h is not included: its Font clashes with X11) */
 
 /* X11 id of the Q-LiM main window (0 = not X11) */
+static unsigned long g_main_xid_set;
+void plugwin_set_main_xid(unsigned long xid) { g_main_xid_set = xid; }
 static unsigned long main_xwindow(void)
 {
+    if (g_main_xid_set) return g_main_xid_set;
     SDL_Window *w = GfxSdlWindow();
     if (!w) return 0;
     SDL_SysWMinfo wi;
@@ -30,6 +33,9 @@ struct PlugWin {
     int    w, h;
     bool   close_req;
     bool   mapped;
+    void (*ext_raise)(void *ud);    /* 2.0.0: external window - shown by the plugin, not by us */
+    void  *ext_ud;
+    char   title[200];
 };
 
 static Display *g_dpy;
@@ -87,6 +93,7 @@ PlugWin *plugwin_create(const char *title, int w, int h)
     PlugWin *p = calloc(1, sizeof *p);
     if (!p) return NULL;
     p->w = w; p->h = h;
+    snprintf(p->title, sizeof p->title, "%s", title ? title : "");
     int scr = DefaultScreen(g_dpy);
     XSetWindowAttributes at;
     memset(&at, 0, sizeof at);
@@ -110,13 +117,22 @@ PlugWin *plugwin_create(const char *title, int w, int h)
 
 void plugwin_show(PlugWin *w)
 {
-    if (!w) return;
+    if (!w || w->ext_raise) return;
     XMapRaised(g_dpy, w->win);
     w->mapped = true;
     XFlush(g_dpy);
 }
 
-void plugwin_raise(PlugWin *w) { if (w) { XMapRaised(g_dpy, w->win); XFlush(g_dpy); } }
+void plugwin_raise(PlugWin *w)
+{
+    if (!w) return;
+    if (w->ext_raise) { w->ext_raise(w->ext_ud); return; }
+    XMapRaised(g_dpy, w->win); XFlush(g_dpy);
+}
+void plugwin_set_external(PlugWin *w, void (*raise)(void *ud), void *ud) { if (w) { w->ext_raise = raise; w->ext_ud = ud; } }
+void plugwin_request_close(PlugWin *w) { if (w) w->close_req = true; }
+const char *plugwin_title(PlugWin *w) { return w ? w->title : ""; }
+unsigned long plugwin_main_xid(void) { return main_xwindow(); }
 unsigned long plugwin_xid(PlugWin *w) { return w ? (unsigned long)w->win : 0; }
 
 void plugwin_resize(PlugWin *w, int width, int height)
@@ -128,7 +144,6 @@ void plugwin_resize(PlugWin *w, int width, int height)
     XFlush(g_dpy);
 }
 
-void plugwin_get_size(PlugWin *w, int *width, int *height) { if (w) { *width = w->w; *height = w->h; } }
 bool plugwin_close_requested(PlugWin *w) { return w && w->close_req; }
 
 bool plugwin_child_size(PlugWin *w, int *width, int *height)

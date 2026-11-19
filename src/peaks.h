@@ -19,12 +19,25 @@
 typedef struct Peaks Peaks;
 
 Peaks *peaks_start(const char *path, int sample_rate, size_t frames);
+Peaks *peaks_start_ch(const char *path, int sample_rate, size_t frames, int ch);   /* 1.4.24: one channel of the file */
 void   peaks_release(Peaks *p);
 void   peaks_shutdown(void);
 
 size_t peaks_ready(const Peaks *p);   /* how many blocks are ready */
 size_t peaks_total(const Peaks *p);
 bool   peaks_done(const Peaks *p);
+
+/* 1.4.11: the loudness of the whole file (ITU-R BS.1770 / EBU R128 integrated, LUFS - what Spotify / YouTube use)
+ * and its highest sample (dBFS), measured in the same background pass. false = not known (yet). */
+bool   peaks_loudness(const Peaks *p, float *lufs, float *peak_db);
+
+/* the measurement itself (also for the tests): interleaved stereo, any rate. Feed blocks, then get the result. */
+typedef struct LoudMeter LoudMeter;
+LoudMeter *loud_new(int sample_rate);
+void       loud_feed(LoudMeter *m, const float *lr, size_t frames);
+/* integrated loudness in LUFS (-INFINITY = silence), the highest sample in dBFS */
+void       loud_result(const LoudMeter *m, float *lufs, float *peak_db);
+void       loud_free(LoudMeter *m);
 
 /* Maximum over blocks b0..b1 (inclusive). Invalid/unready ones are skipped. */
 float  peaks_max(const Peaks *p, size_t b0, size_t b1);
@@ -45,6 +58,5 @@ bool   peaks_detail_val(Peaks *p, size_t start, double frames_per_bar, int n_bar
  * reads the samples themselves from the file (own handle, UI thread only).
  * Fills out[0..n_bars-1] with the maximum of |average(L,R)| over frames_per_bar output frames per bar,
  * starting from output frame `start`. Returns true on success. */
-bool   peaks_detail(Peaks *p, size_t start, double frames_per_bar, int n_bars, float *out);
 
 #endif

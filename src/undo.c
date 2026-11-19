@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define MAX_UNDO        100
 #define MAX_UNDO_BYTES  (96u * 1024u * 1024u)
@@ -127,7 +128,6 @@ bool undo_can_redo(void) { return s_redo.n > 0; }
 bool undo_is_dirty(void) { return s_dirty || s_plug_dirty; }
 void undo_mark_plugin_changed(void) { s_plug_dirty = true; }
 int  undo_depth(void) { return s_undo.n; }
-int  undo_redo_depth(void) { return s_redo.n; }
 
 void undo_shutdown(void)
 {
@@ -145,15 +145,23 @@ typedef struct {
     size_t ls, le, sm, em;
     int   bind, color;
     float bpm_fix, bpm_play;
+    float cgain, cpan;      /* 1.4.9 */
+    float pitch; bool fmt;  /* 1.4.13 */
     bool  warp;
     char *edits;            /* step 27: the edit_* lines (malloc; NULL = not cut) */
     size_t edits_len;
+    char *sur;              /* 1.4.19: the surround points ("t:az:spread ..."; malloc; NULL = none) */
+    size_t sur_len;
+    int   mc, mc_out;       /* 1.4.24: how a surround file plays */
+    char *mc_orig;          /* (malloc; NULL = none) */
+    uint64_t mc_map[16];    /* 2.0 */
 } SClip;
 
 typedef struct {
     char  name[NAME_LEN];
     int   color, cc, pan_cc, mbind, sbind;
     RouteMask rl, rr;
+    char  sur[1600];        /* 1.4.19: the surround setup ("" = off) */
     int   nfx;
     ChFx  fx[MAX_CH_FX];
 } SCh;
@@ -247,7 +255,25 @@ static bool parse_model(const char *snap, Model *m)
             else if (kv(line, "color", &v)) k->color = atoi(v);
             else if (kv(line, "bpm_fix", &v)) k->bpm_fix = (float)atof(v);
             else if (kv(line, "bpm_play", &v)) k->bpm_play = (float)atof(v);
+            else if (kv(line, "clip_gain", &v)) k->cgain = (float)atof(v);
+            else if (kv(line, "clip_pan", &v)) k->cpan = (float)atof(v);
+            else if (kv(line, "clip_pitch", &v)) k->pitch = (float)atof(v);
+            else if (kv(line, "mc", &v)) sscanf(v, "%d,%d", &k->mc, &k->mc_out);
+            else if (kv(line, "mc_map", &v)) { const char *q = v; for (int i = 0; i < 16 && *q; ++i) { k->mc_map[i] = (uint64_t)strtoull(q, (char **)&q, 16); if (*q != ',') break; ++q; } }
+            else if (kv(line, "mc_orig", &v)) { free(k->mc_orig); k->mc_orig = strdup(v); }
+            else if (kv(line, "clip_formants", &v)) k->fmt = atoi(v) != 0;
             else if (kv(line, "warp", &v)) k->warp = atoi(v) != 0;
+            else if (kv(line, "sur", &v)) {                           /* 1.4.19 (several lines add up) */
+                size_t ll = strlen(v);
+                char *ne = realloc(k->sur, k->sur_len + ll + 2);
+                if (ne) {
+                    k->sur = ne;
+                    if (k->sur_len) k->sur[k->sur_len++] = ' ';
+                    memcpy(k->sur + k->sur_len, v, ll);
+                    k->sur_len += ll;
+                    k->sur[k->sur_len] = 0;
+                }
+            }
             else if (strncmp(line, "edit_len=", 9) == 0 || strncmp(line, "edit_seg=", 9) == 0 ||
                      strncmp(line, "midi_len=", 9) == 0 || strncmp(line, "mn=", 3) == 0) {
                 size_t ll = strlen(line);
@@ -269,6 +295,7 @@ static bool parse_model(const char *snap, Model *m)
             else if (kv(line, "pan_midi_cc", &v)) h->pan_cc = atoi(v);
             else if (kv(line, "route_l", &v)) h->rl = (RouteMask)strtoull(v, NULL, 10);
             else if (kv(line, "route_r", &v)) h->rr = (RouteMask)strtoull(v, NULL, 10);
+            else if (kv(line, "surround", &v)) copy_str(h->sur, sizeof h->sur, v);   /* 1.4.19 */
             else if (kv(line, "mute_bind", &v)) h->mbind = atoi(v);
             else if (kv(line, "solo_bind", &v)) h->sbind = atoi(v);
             else if (kv(line, "fx", &v) && h->nfx < MAX_CH_FX) {
@@ -366,7 +393,7 @@ static void apply_cell(Session *s, int c, int sc, const SClip *k)
         }
     } else {
         bool same_file = atomic_load(&cl->has_clip) && !atomic_load(&cl->is_note) && !k->note
-                         && strcmp(cl->path, k->path) == 0;
+                         && strcmp(cl->path, k->path) == 0 && cl->mc_mode == k->mc;
         if (same_file) {                       /* only name/markers — the file stays loaded */
             if (strcmp(cl->name, k->name) != 0 && k->name[0]) session_rename_clip(s, c, sc, k->name);
             session_clip_set_edits_text(s, c, sc, k->edits);
@@ -379,13 +406,31 @@ static void apply_cell(Session *s, int c, int sc, const SClip *k)
             if (em != k->em) session_set_end_marker(s, c, sc, k->em);
         } else {
             if (atomic_load(&cl->has_clip)) session_clear_clip(s, c, sc);
+            if (!k->note) session_load_mc_next(k->mc, k->mc_out, k->mc_orig ? k->mc_orig : "");
             project_load_clip_cell(s, c, sc, k->note, k->path, k->name, k->loop, k->ls, k->le, k->sm, k->em, k->edits);
+            session_load_mc_next(0, 0, NULL);
             if (k->note) session_set_note_color(s, c, sc, k->color);
         }
     }
     if (!k->note) {                            /* the clip tempo (the detected one is not in the snapshot -> it stays) */
         session_set_clip_bpm_fields(s, c, sc, 0.0f, k->bpm_fix, k->bpm_play);
         if (session_get_clip_warp(s, c, sc) != k->warp) session_set_clip_warp(s, c, sc, k->warp);
+        session_set_clip_gain(s, c, sc, k->cgain);
+        session_set_clip_pan(s, c, sc, k->cpan);
+        session_set_clip_formants(s, c, sc, k->fmt);
+        session_set_clip_pitch(s, c, sc, k->pitch);
+        if (session_clip_mc_out(s, c, sc) != k->mc_out) session_clip_set_mc_out(s, c, sc, k->mc_out);
+        for (int i = 0; i < 16; ++i) if (session_clip_mc_map(s, c, sc, i) != k->mc_map[i]) session_clip_set_mc_map(s, c, sc, i, k->mc_map[i]);
+        {   /* 1.4.19: the surround points */
+            static SurPt want[SUR_MAX_PTS], cur[SUR_MAX_PTS];
+            int nw = k->sur ? sur_points_parse(k->sur, want, SUR_MAX_PTS) : 0;
+            int nc = session_clip_get_sur_points(s, c, sc, cur, SUR_MAX_PTS);
+            bool same = nw == nc;
+            for (int i = 0; same && i < nw; ++i)
+                if (fabsf(want[i].t - cur[i].t) > 1e-3f || fabsf(want[i].az - cur[i].az) > 0.05f || fabsf(want[i].spread - cur[i].spread) > 1e-3f ||
+                    fabsf(want[i].x - cur[i].x) > 0.005f || fabsf(want[i].y - cur[i].y) > 0.005f || fabsf(want[i].w - cur[i].w) > 0.005f) same = false;
+            if (!same) session_clip_set_sur_points(s, c, sc, want, nw);
+        }
     }
     session_set_clip_bind(s, c, sc, k->bind);
 }
@@ -441,6 +486,15 @@ static void apply_model(Session *s, const Model *m)
         atomic_store(&ch->pan_midi_cc, h->pan_cc);
         session_route_set(s, c, 0, h->rl);
         session_route_set(s, c, 1, h->rr);
+        {   /* 1.4.19: surround - only when it differs (the audio keeps its gains otherwise) */
+            SurSetup want, cur;
+            bool won = h->sur[0] && sur_setup_parse(h->sur, &want) && want.n > 0;
+            bool con = session_get_surround(s, c, &cur);
+            char a[1600] = "", b[1600] = "";
+            if (won) sur_setup_text(&want, a, sizeof a);
+            if (con) sur_setup_text(&cur, b, sizeof b);
+            if (won != con || strcmp(a, b) != 0) session_set_surround(s, c, won ? &want : NULL);
+        }
         session_set_mute_bind(s, c, h->mbind);
         session_set_solo_bind(s, c, h->sbind);
         ch->fx_count = h->nfx;
@@ -457,7 +511,7 @@ static bool apply_snapshot(Session *s, const char *snap)
     bool ok = parse_model(snap, &m);
     if (ok) apply_model(s, &m);
     if (m.clip)
-        for (size_t i = 0; i < (size_t)m.nch * (size_t)m.nsc; ++i) free(m.clip[i].edits);
+        for (size_t i = 0; i < (size_t)m.nch * (size_t)m.nsc; ++i) { free(m.clip[i].edits); free(m.clip[i].sur); free(m.clip[i].mc_orig); }
     free(m.clip);
     return ok;
 }

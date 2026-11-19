@@ -8,6 +8,7 @@
 #undef stat
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "xpshim.h"
 #include "../plugwin.h"
 #include <SDL.h>
 #include <SDL_syswm.h>
@@ -21,6 +22,9 @@ struct PlugWin {
     HWND hwnd;
     int  w, h;
     bool close_req;
+    void (*ext_raise)(void *ud);    /* 2.0.0: external window - shown by the plugin, not by us */
+    void  *ext_ud;
+    char   title[200];
 };
 
 #define WCLASS L"QLiMPluginWindow"
@@ -90,6 +94,7 @@ PlugWin *plugwin_create(const char *title, int w, int h)
     PlugWin *pw = calloc(1, sizeof *pw);
     if (!pw) return NULL;
     pw->w = w > 0 ? w : 640;
+    snprintf(pw->title, sizeof pw->title, "%s", title ? title : "");
     pw->h = h > 0 ? h : 400;
     wchar_t wt[512];
     if (!MultiByteToWideChar(CP_UTF8, 0, title ? title : "Plugin", -1, wt, 512)) wcscpy(wt, L"Plugin");
@@ -104,7 +109,7 @@ PlugWin *plugwin_create(const char *title, int w, int h)
 
 void plugwin_show(PlugWin *w)
 {
-    if (!w) return;
+    if (!w || w->ext_raise) return;
     ShowWindow(w->hwnd, SW_SHOWNORMAL);
     SetForegroundWindow(w->hwnd);
     HWND c = GetWindow(w->hwnd, GW_CHILD);                 /* for the log: did the plugin put its interface in? */
@@ -118,6 +123,7 @@ void plugwin_show(PlugWin *w)
 void plugwin_raise(PlugWin *w)
 {
     if (!w) return;
+    if (w->ext_raise) { w->ext_raise(w->ext_ud); return; }
     if (IsIconic(w->hwnd)) ShowWindow(w->hwnd, SW_RESTORE);
     SetForegroundWindow(w->hwnd);
 }
@@ -141,6 +147,11 @@ void plugwin_get_size(PlugWin *w, int *width, int *height)
 }
 
 bool plugwin_close_requested(PlugWin *w) { return w && w->close_req; }
+void plugwin_set_external(PlugWin *w, void (*raise)(void *ud), void *ud) { if (w) { w->ext_raise = raise; w->ext_ud = ud; } }
+void plugwin_request_close(PlugWin *w) { if (w) w->close_req = true; }
+const char *plugwin_title(PlugWin *w) { return w ? w->title : ""; }
+void plugwin_set_main_xid(unsigned long xid) { (void)xid; }
+unsigned long plugwin_main_xid(void) { return 0; }
 
 void plugwin_destroy(PlugWin *w)
 {

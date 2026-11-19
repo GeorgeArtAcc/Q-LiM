@@ -81,6 +81,13 @@ int  pwb_graph_sync(int nch, const char *const *names, PwbRoute *routes, PwbRout
 /* how many inputs the card has right now (may change if the card switches profile); 0 = unknown */
 int  pwb_graph_hw_ports(void);
 
+/* 1.4.21: extra outputs - a playback stream to another output (node.name), at `rate`, `channels` (<= 0: all of it).
+ * Returns a handle (0..7) or -1 (err: why). fn is called on PipeWire's RT thread with that output's own clock. */
+int  pwb_extra_open(const char *target, int rate, int channels, PwbRenderFn fn, void *user, int *out_ch,
+                    char *err, int err_size);
+void pwb_extra_close(int h);
+int  pwb_extra_state(int h);          /* as PwbStatus.state: 2 = paused (not linked yet), 3 = playing, <= 0 = gone */
+bool pwb_sink_present(const char *target);
 /* version of the loaded library ("" if not loaded) */
 const char *pwb_library_version(void);
 

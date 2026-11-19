@@ -45,6 +45,7 @@ extern "C" {
 /* ---- start-up: HOME, working folder, UTF-8 arguments ---- */
 void qw_init(int *argc, char ***argv);
 const char *qw_exe_dir(void);                 /* folder of qlim.exe, with '/' */
+void qw_open_url(const char *url);            /* 2.0.0: the default web browser */
 void qw_slashes(char *path);                  /* '\' -> '/' in place */
 
 /* ---- files with UTF-8 names ---- */

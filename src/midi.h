@@ -33,24 +33,42 @@ int midi_get_port_count(void);
 const char *midi_get_port_name(int index);
 
 // === Connection ===
+// 1.4.6: several MIDI inputs at the same time (a keyboard, a controller, the sound card's MIDI in ...), up to
+// MIDI_MAX_OPEN. Every open input has its uses: PLAY = its notes / CCs go to the instruments, CONTROL = they drive
+// the program (MIDI learn, faders, pads, controller buttons). Default: both.
+#define MIDI_MAX_OPEN    32
+#define MIDI_USE_PLAY    1
+#define MIDI_USE_CONTROL 2
 
-// Opens a MIDI input by index. Returns 0 on success.
+// Opens (adds) a MIDI input by index; the ones already open stay open. Returns 0 on success (also if it was open).
 int midi_open_port(int index);
 
-// Opens a MIDI input by name (substring search). Returns 0 on success.
+// Opens a MIDI input by name (the same device, without the ALSA client numbers; or a part of the name).
 int midi_open_port_by_name(const char *name);
 
-// Closes the current port (without stopping the midi system).
+// Closes one input / every input.
+void midi_close_port_index(int index);
 void midi_close_port(void);
 
-// Returns the name of the currently open port (or "" if none).
+bool midi_port_is_open(int index);
+int  midi_port_uses(int index);                  // MIDI_USE_* of an open input (0 = not open)
+void midi_set_port_uses(int index, int uses);    // saved at once
+
+int  midi_open_count(void);
+
+// Inputs remembered in midi.conf that are not plugged in now (shown in the dialog; they connect by themselves).
+int         midi_missing_count(void);
+const char *midi_missing_name(int i);
+void        midi_forget_missing(int i);
+
+// Looks at the ports again: connects remembered devices that were plugged in, reconnects the ones that came back.
+// Called by midi_poll() every 2 seconds too.
+void midi_refresh(void);
+
+// Old (one input) API - the first open input.
 const char *midi_get_current_port_name(void);
-
-// Returns the index of the currently open port (-1 if none).
 int midi_get_current_port_index(void);
-
-// Checks whether a port is open.
-bool midi_is_open(void);
+bool midi_is_open(void);                         // at least one input is open
 
 // === Callback ===
 
@@ -67,11 +85,11 @@ bool midi_get_learn_mode(void);
 // Path: ~/.config/qlim/midi.conf
 void midi_get_config_path(char *out, size_t size);
 
-// Saves the name of the currently open port (or nothing if none).
+// Saves the open inputs (and their uses) + the remembered ones that are not plugged in.
 void midi_save_config(void);
 
-// Loads the last saved port and tries to open it.
-// Returns 0 on success, != 0 if there is no saved port or it was not found.
+// Loads the saved inputs and opens the ones that are there.
+// Returns 0 if at least one was opened, != 0 if none was saved or found.
 int midi_load_config(void);
 
 // === Poll ===

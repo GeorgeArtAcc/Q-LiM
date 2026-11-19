@@ -97,12 +97,27 @@ double GetTime(void)
 
 float GfxScale(void) { return g_scale; }
 
+/* 2.0: round to the nearest whole number, halves away from zero (= lroundf) - inline, without the library call
+ * (lroundf was one of the biggest single costs of drawing without a graphics card) */
+static inline int iround(float v) { return v >= 0.0f ? (int)(v + 0.5f) : -(int)(0.5f - v); }
+
 /* UI units -> physical pixels (rounded to a whole pixel) */
-static inline int D(float v) { return (int)lroundf(v * g_scale); }
+static inline int D(float v) { return iround(v * g_scale); }
 
 static inline void set_color(Color c)
 {
     SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
+}
+
+/* 2.0: without a graphics card SDL blends every pixel of a filled rectangle even when it is fully opaque (the slow
+ * per-pixel loop was the biggest cost of drawing); an opaque fill is the same picture with blending off -> SDL's
+ * fast fill. The blend mode is set back at once (lines and shapes still blend). */
+static void fill_rects_now(const SDL_Rect *r, int n, Uint8 alpha)
+{
+    bool opaque = alpha == 255 && g_soft_render;
+    if (opaque) SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
+    if (n == 1) SDL_RenderFillRect(g_ren, r); else SDL_RenderFillRects(g_ren, r, n);
+    if (opaque) SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
 }
 
 /* 1.3.8: the Eco layer (see below) */
@@ -169,6 +184,24 @@ static SDL_GLContext g_saved_ctx;
 static int g_gl_depth;
 bool GfxSoftwareRendering(void) { return g_soft_render; }
 void GfxSetBusyFps(int fps) { g_busy_fps = fps; }
+/* 2.0: seconds since the last mouse / key / window event */
+double GfxSecondsSinceInput(void)
+{
+    return (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency() - g_last_input;
+}
+/* 1.4.2: MIDI from a controller wakes the main loop at once (a user event from the MIDI thread; any event counts as
+ * "touched" = full frame rate). Without it the knobs and faders moved at the idle rate (10 frames/s) = laggy. */
+static SDL_atomic_t g_wake_pending;
+void GfxWakeFromThread(void)
+{
+    if (SDL_AtomicCAS(&g_wake_pending, 0, 1)) {
+        SDL_Event ev;
+        SDL_zero(ev);
+        ev.type = SDL_USEREVENT;
+        if (SDL_PushEvent(&ev) != 1) SDL_AtomicSet(&g_wake_pending, 0);
+    }
+}
+void GfxWakeDone(void) { SDL_AtomicSet(&g_wake_pending, 0); }
 void GfxSetMaxFps(int fps) { g_max_fps = fps; }
 void GfxSetRendererPref(int pref) { g_render_pref = pref; }
 const char *GfxRendererDesc(void) { return g_render_desc; }
@@ -241,20 +274,27 @@ void InitWindow(int width, int height, const char *title)
 
     const char *rn = getenv("QLIM_RENDERER");
     bool force_sw = rn ? strcmp(rn, "software") == 0 : g_render_pref == 2;
-    bool force_gpu = rn ? strcmp(rn, "gpu") == 0 : g_render_pref == 1;
     char glname[120] = "";
     if (!force_sw)
         g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (g_ren && !force_gpu) {
+    /* 2.0: also when "Graphics card" is chosen in Edit > Performance: an OpenGL that is only the CPU emulation is no
+     * graphics card (seen on the T60 with the X server's acceleration off: llvmpipe took 2 x 57 % of the CPU).
+     * Only QLIM_RENDERER=gpu keeps it (for tests). */
+    bool env_gpu = rn && strcmp(rn, "gpu") == 0;
+    if (g_ren && !env_gpu) {
         /* 1.3.4: an "OpenGL" that is really Mesa's CPU emulation (llvmpipe/softpipe - old or unsupported graphics
          * chips, e.g. the Intel GMA 950 of a ThinkPad T60) uses ALL the CPU cores for every frame and leaves too
          * little time for the sound. SDL's own software renderer draws the same picture on one core, much cheaper. */
         SDL_RendererInfo ri0;
         if (SDL_GetRendererInfo(g_ren, &ri0) == 0 && ri0.name && strncmp(ri0.name, "opengl", 6) == 0) {
             typedef const unsigned char *(*GetStr)(unsigned);
+            /* 1.4.13: SDL makes its OpenGL context current only when it first draws - before that glGetString gives
+             * NULL and the check below never ran (seen on a ThinkPad T60: llvmpipe, but the GPU renderer stayed) */
+            SDL_RenderClear(g_ren);
             GetStr gs = (GetStr)SDL_GL_GetProcAddress("glGetString");
             const char *glr = gs ? (const char *)gs(0x1F01 /* GL_RENDERER */) : NULL;
             if (glr) { fprintf(stderr, "Q-LiM graphics: OpenGL = %s\n", glr); snprintf(glname, sizeof glname, "%s", glr); }
+            else fprintf(stderr, "Q-LiM graphics: OpenGL renderer unknown (glGetString gave nothing)\n");
             if (glr && (strstr(glr, "llvmpipe") || strstr(glr, "softpipe") || strstr(glr, "Software Rasterizer") ||
                         strstr(glr, "swrast"))) {
                 fprintf(stderr, "Q-LiM graphics: no graphics acceleration -> the light software renderer "
@@ -292,7 +332,10 @@ void InitWindow(int width, int height, const char *title)
     }
     if (g_soft_render)
         snprintf(g_render_desc, sizeof g_render_desc, "light drawing on the CPU (%s)",
-                 force_sw ? "chosen" : glname[0] ? "no graphics acceleration" : "no graphics card driver");
+                 force_sw ? "chosen"
+                 : glname[0] ? (g_render_pref == 1 ? "Graphics card chosen, but the system has no graphics acceleration"
+                                                   : "no graphics acceleration")
+                 : "no graphics card driver");
     else {
         SDL_RendererInfo ri1;
         const char *nm = SDL_GetRendererInfo(g_ren, &ri1) == 0 && ri1.name ? ri1.name : "?";
@@ -377,8 +420,10 @@ static bool file_exists(const char *p)
     return true;
 }
 
+static void drop_measure_cache(void);
 static void drop_text_cache(void)
 {
+    drop_measure_cache();                               /* 2.0: the widths go with the pictures (font / size change) */
     for (int i = 0; i < TBUCKETS; ++i) {
         TextEntry *e = g_tbucket[i];
         while (e) {
@@ -495,7 +540,16 @@ static TextEntry *text_lookup(const char *text, int px)
     for (TextEntry *e = g_tbucket[b]; e; e = e->next)
         if (e->px == px && strcmp(e->text, text) == 0) return e;
 
-    if (g_tcache_px > (g_eco ? 6u : 24u) * 1000u * 1000u) {   /* ~96 MB (Eco: ~24 MB): clear everything */
+    /* 2.1: ~32 MB (Eco: ~12 MB), was 96 / 24: the numbers that change all the time (DSP %, times, counters) fill it
+     * slowly and the memory crept up for hours before it was cleared (seen in the soak test). QLIM_TEXT_CACHE_MP =
+     * megapixels, for tests. */
+    static size_t cap_px;
+    if (!cap_px) {
+        const char *e = getenv("QLIM_TEXT_CACHE_MP");
+        double mp = e ? atof(e) : 0.0;
+        cap_px = mp > 0.05 ? (size_t)(mp * 1e6) : 0;
+    }
+    if (g_tcache_px > (cap_px ? cap_px : (g_eco ? 3u : 8u) * 1000u * 1000u)) {   /* clear everything */
         drop_text_cache();
         b = hash_text(text, px) % TBUCKETS;
     }
@@ -552,16 +606,46 @@ Font LoadFontEx(const char *path, int size, int *codepoints, int count)
 
 void SetTextureFilter(Texture2D t, int filter) { (void)t; (void)filter; }
 
+/* 2.0: measured widths are kept (the interface measures the same labels every frame; shaping a text with the font
+ * library each time was a big part of the drawing time on old computers). Cleared with the font or when it is full. */
+typedef struct MeasEntry { struct MeasEntry *next; int px, w; unsigned h; char text[]; } MeasEntry;
+#define MBUCKETS 4096
+#define MEAS_MAX 20000
+static MeasEntry *g_mbucket[MBUCKETS];
+static int g_nmeas;
+static void drop_measure_cache(void)
+{
+    for (int i = 0; i < MBUCKETS; ++i) {
+        MeasEntry *e = g_mbucket[i];
+        while (e) { MeasEntry *n = e->next; free(e); e = n; }
+        g_mbucket[i] = NULL;
+    }
+    g_nmeas = 0;
+}
+
 Vector2 MeasureTextEx(Font f, const char *text, float size, float spacing)
 {
     (void)f; (void)spacing;
     Vector2 v = { 0, size };
     if (!text || !ensure_font()) return v;
+    if (!text[0]) return v;
     int px = D(size);
+    unsigned h = hash_text(text, px);
+    MeasEntry **slot = &g_mbucket[h % MBUCKETS];
+    for (MeasEntry *e = *slot; e; e = e->next)
+        if (e->h == h && e->px == px && strcmp(e->text, text) == 0) { v.x = (float)e->w / g_scale; return v; }
     TTF_Font *font = font_for_px(px);
     if (!font) return v;
-    int w = 0, h = 0;
-    if (text[0]) TTF_SizeUTF8(font, text, &w, &h);
+    int w = 0, hh = 0;
+    TTF_SizeUTF8(font, text, &w, &hh);
+    if (g_nmeas >= MEAS_MAX) { drop_measure_cache(); slot = &g_mbucket[h % MBUCKETS]; }
+    size_t len = strlen(text);
+    MeasEntry *e = (MeasEntry *)malloc(sizeof *e + len + 1);
+    if (e) {
+        e->px = px; e->w = w; e->h = h;
+        memcpy(e->text, text, len + 1);
+        e->next = *slot; *slot = e; ++g_nmeas;
+    }
     v.x = (float)w / g_scale;
     return v;
 }
@@ -587,6 +671,70 @@ void DrawText(const char *text, int x, int y, int size, Color c)
 }
 
 /* ====================================================================== */
+/*  2.0.0: the name at the top (wordmark) in its own font (src/logo_font.c) */
+/* ====================================================================== */
+extern const unsigned char g_logo_font_semibold[];
+extern const size_t g_logo_font_semibold_len;
+typedef struct { int w, px; char text[24]; SDL_Texture *tex; unsigned serial; int tw, th; } LogoEntry;
+static LogoEntry g_logo_cache[16];
+static TTF_Font *g_logo_ttf[3][4];
+static int g_logo_ttf_px[3][4];
+static TTF_Font *logo_font(int weight, int px)
+{
+    if (weight < 0 || weight > 2) weight = 1;
+    for (int i = 0; i < 4; ++i) if (g_logo_ttf[weight][i] && g_logo_ttf_px[weight][i] == px) return g_logo_ttf[weight][i];
+    const unsigned char *d = g_logo_font_semibold;      /* (only SemiBold is kept; the weight is ignored) */
+    size_t n = g_logo_font_semibold_len;
+    SDL_RWops *rw = SDL_RWFromConstMem(d, (int)n);
+    TTF_Font *f = rw ? TTF_OpenFontRW(rw, 1, px) : NULL;
+    if (!f) return NULL;
+    static int rr;
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) if (!g_logo_ttf[weight][i]) { slot = i; break; }
+    if (slot < 0) { slot = rr++ & 3; TTF_CloseFont(g_logo_ttf[weight][slot]); }
+    g_logo_ttf[weight][slot] = f; g_logo_ttf_px[weight][slot] = px;
+    return f;
+}
+/* text in the logo font: em size `size` (UI units), top-left at x,y; returns its width (UI units).
+ * weight 0 = Medium, 1 = SemiBold, 2 = Bold. tracking = extra space between letters (UI units). */
+float GfxLogoText(int weight, const char *text, float x, float y, float size, float tracking, Color c, bool draw)
+{
+    (void)tracking;                                  /* (whole words: the font's own spacing and kerning) */
+    if (!text || !text[0] || !g_ren) return 0.0f;
+    int px = iround(size * g_scale);
+    if (px < 4) px = 4;
+    TTF_Font *f = logo_font(weight, px);
+    if (!f) return 0.0f;
+    LogoEntry *e = NULL;
+    for (int i = 0; i < 16; ++i)
+        if (g_logo_cache[i].tex && g_logo_cache[i].w == weight && g_logo_cache[i].px == px && !strcmp(g_logo_cache[i].text, text)) { e = &g_logo_cache[i]; break; }
+    if (!e) {
+        static int next;
+        e = &g_logo_cache[next++ & 15];
+        if (e->tex) SDL_DestroyTexture(e->tex);
+        memset(e, 0, sizeof *e);
+        SDL_Color white = { 255, 255, 255, 255 };
+        SDL_Surface *sf = TTF_RenderUTF8_Blended(f, text, white);
+        if (!sf) return 0.0f;
+        e->tex = SDL_CreateTextureFromSurface(g_ren, sf);
+        if (e->tex) SDL_SetTextureBlendMode(e->tex, SDL_BLENDMODE_BLEND);
+        e->tw = sf->w; e->th = sf->h;
+        SDL_FreeSurface(sf);
+        e->serial = ++g_tex_serial;
+        e->w = weight; e->px = px;
+        snprintf(e->text, sizeof e->text, "%s", text);
+    }
+    if (draw && e->tex) gfx_copy(e->tex, e->serial, c, (SDL_Rect){ D(x), D(y), e->tw, e->th });
+    return (float)e->tw / g_scale;
+}
+float GfxLogoAscent(int weight, float size)    /* where the capitals sit: top of the line to the baseline (UI units) */
+{
+    int px = iround(size * g_scale);
+    TTF_Font *f = logo_font(weight, px < 4 ? 4 : px);
+    return f ? (float)TTF_FontAscent(f) / g_scale : size;
+}
+
+/* ====================================================================== */
 /*  Shapes                                                                 */
 /* ====================================================================== */
 
@@ -606,7 +754,7 @@ static int  g_tgt_w, g_tgt_h;
 static bool g_frame_active;              /* Eco: a button, the wheel or a key in this frame (the mouse "counts") */
 static float g_hov_area;                 /* (1.3.11, see GfxHoverCheck) */
 static bool g_eco_full = true;           /* draw everything at the next eco frame */
-enum { RC_CLEAR, RC_RECTS, RC_GEOM, RC_COPY };
+enum { RC_CLEAR, RC_RECTS, RC_GEOM, RC_COPY, RC_SHAPE };
 typedef struct {
     unsigned char type, has_clip;
     SDL_Rect clip, bb, dst;
@@ -624,11 +772,25 @@ static bool    g_clip_on;
 static SDL_Rect g_clip_cur;
 static unsigned g_tex_serial;            /* every text picture gets its own number (the pointer may be reused) */
 
+/* the fingerprint of a drawing command. 2.0: 8 bytes per step instead of 1 (it runs over every command of every
+ * frame) - a 64-bit multiply-xorshift mix, folded to 32 bits; the same spread of values as before. */
 static unsigned fnv(unsigned h, const void *p, size_t n)
 {
     const unsigned char *b = (const unsigned char *)p;
-    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 16777619u;
-    return h;
+    uint64_t x = (uint64_t)h * 0x9E3779B97F4A7C15ull ^ (uint64_t)n;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w; memcpy(&w, b + i, 8);
+        x = (x ^ w) * 0xFF51AFD7ED558CCDull;
+        x ^= x >> 32;
+    }
+    if (i < n) {
+        uint64_t w = 0; memcpy(&w, b + i, n - i);
+        x = (x ^ w) * 0xC4CEB9FE1A85EC53ull;
+        x ^= x >> 29;
+    }
+    x ^= x >> 33;
+    return (unsigned)(x ^ (x >> 32));
 }
 static void *ar_put(const void *p, size_t n, size_t *off)
 {
@@ -686,7 +848,7 @@ static void gfx_clip(const SDL_Rect *r)
 static void gfx_rects(const SDL_Rect *r, int n, Color col)
 {
     if (n <= 0) return;
-    if (!g_rec) { set_color(col); if (n == 1) SDL_RenderFillRect(g_ren, r); else SDL_RenderFillRects(g_ren, r, n); return; }
+    if (!g_rec) { set_color(col); fill_rects_now(r, n, col.a); return; }
     RCmd *c = rc_new(RC_RECTS);
     if (!c || !ar_put(r, sizeof(SDL_Rect) * (size_t)n, &c->off)) return;
     c->n = n; c->c = col;
@@ -750,12 +912,26 @@ static void gfx_copy(SDL_Texture *t, unsigned serial, Color mod, SDL_Rect dst)
     rc_finish(c, dst.x, dst.y, dst.x + dst.w, dst.y + dst.h, h);
 }
 
+static void shape_play(int kind, const float *prm, int nprm, Color c);
+/* 2.0: while a recorded shape is drawn again: the part being drawn (rows outside it are not computed at all) */
+static SDL_Rect g_pclip;
+static bool     g_pclip_on;
+static inline void pclip_rows(int *ya, int *yb)
+{
+    if (!g_pclip_on) return;
+    if (*ya < g_pclip.y) *ya = g_pclip.y;
+    if (*yb > g_pclip.y + g_pclip.h) *yb = g_pclip.y + g_pclip.h;
+}
+
+static SDL_Rect g_rc_clip;                       /* the clip rc_play set last (g_rc_clip_ok = still valid) */
+static bool     g_rc_clip_ok;
 /* draws one recorded command, cut to the rectangle r */
 static void rc_play(const RCmd *c, const SDL_Rect *r)
 {
     SDL_Rect cl = *r;
     if (c->has_clip && !SDL_IntersectRect(&c->clip, r, &cl)) return;
-    SDL_RenderSetClipRect(g_ren, &cl);
+    /* 2.0: only when it changes (most commands of one part share it; every call is queued work in SDL) */
+    if (!g_rc_clip_ok || memcmp(&cl, &g_rc_clip, sizeof cl) != 0) { SDL_RenderSetClipRect(g_ren, &cl); g_rc_clip = cl; g_rc_clip_ok = true; }
     switch (c->type) {
     case RC_CLEAR:                                     /* (RenderClear ignores the clip: a plain fill) */
         SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_NONE);
@@ -765,7 +941,7 @@ static void rc_play(const RCmd *c, const SDL_Rect *r)
         break;
     case RC_RECTS:
         set_color(c->c);
-        SDL_RenderFillRects(g_ren, (const SDL_Rect *)(g_ar + c->off), c->n);
+        fill_rects_now((const SDL_Rect *)(g_ar + c->off), c->n, c->c.a);
         break;
     case RC_GEOM:
         SDL_RenderGeometry(g_ren, NULL, (const SDL_Vertex *)(g_ar + c->off), c->n,
@@ -775,6 +951,11 @@ static void rc_play(const RCmd *c, const SDL_Rect *r)
         SDL_SetTextureColorMod(c->tex, c->c.r, c->c.g, c->c.b);
         SDL_SetTextureAlphaMod(c->tex, c->c.a);
         SDL_RenderCopy(g_ren, c->tex, NULL, &c->dst);
+        break;
+    case RC_SHAPE:
+        g_pclip = cl; g_pclip_on = true;
+        shape_play(c->n, (const float *)(g_ar + c->off), c->ni, c->c);
+        g_pclip_on = false;
         break;
     }
 }
@@ -801,6 +982,34 @@ static void sp_add(int x0, int x1, int y, Color c)
     if (g_nsp == SP_MAX) sp_flush(c);
     g_sp[g_nsp++] = (SDL_Rect){ x0, y, x1 - x0, 1 };
 }
+/* 2.0.0: soft edges for the span shapes (Eco / light drawing): the pixels on a curve or a slanted edge get the part
+ * of the colour they are covered by, in 16 steps (one batch per step) - smooth like the graphics card, still cheap:
+ * only the few edge pixels are extra. */
+#define SPA_LV 16
+#define SPA_MAX 512
+static SDL_Rect g_spa[SPA_LV][SPA_MAX];
+static int      g_nspa[SPA_LV];
+static void spa_flush(Color c)
+{
+    for (int l = 1; l < SPA_LV; ++l) {
+        if (!g_nspa[l]) continue;
+        Color cc = c;
+        cc.a = (unsigned char)((c.a * l + SPA_LV / 2) / SPA_LV);
+        if (cc.a) gfx_rects(g_spa[l], g_nspa[l], cc);
+        g_nspa[l] = 0;
+    }
+}
+static void spa_px(int x, int y, float cov, Color c)          /* one pixel, covered `cov` (0..1) */
+{
+    if (cov <= 0.0f) return;
+    int l = (int)(cov * SPA_LV + 0.5f);
+    if (l <= 0) return;
+    if (l >= SPA_LV) { sp_add(x, x + 1, y, c); return; }
+    if (g_nspa[l] == SPA_MAX) spa_flush(c);
+    g_spa[l][g_nspa[l]++] = (SDL_Rect){ x, y, 1, 1 };
+}
+static inline float clamp01(float v) { return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v; }
+
 /* the horizontal extent of a rounded rectangle on the row whose middle is yc; false = outside */
 static bool rr_row(float x0, float y0, float x1, float y1, float rad, float yc, float *l, float *r)
 {
@@ -808,48 +1017,97 @@ static bool rr_row(float x0, float y0, float x1, float y1, float rad, float yc, 
     float dy = 0.0f;
     if (yc < y0 + rad) dy = y0 + rad - yc;
     else if (yc > y1 - rad) dy = yc - (y1 - rad);
-    float d = rad * rad - dy * dy;
-    float dx = rad - (d > 0.0f ? sqrtf(d) : 0.0f);
+    float dx = 0.0f;
+    if (dy > 0.0f) { float d = rad * rad - dy * dy; dx = rad - (d > 0.0f ? sqrtf(d) : 0.0f); }   /* 2.0: straight part: no sqrt */
     *l = x0 + dx; *r = x1 - dx;
     return *r > *l;
 }
 static void sw_rrect(float x0, float y0, float x1, float y1, float rad, float t, Color c)
 {
     float ix0 = x0 + t, iy0 = y0 + t, ix1 = x1 - t, iy1 = y1 - t, irad = rad - t > 0.0f ? rad - t : 0.0f;
-    for (int y = (int)floorf(y0); y < (int)ceilf(y1); ++y) {
+    int ya = (int)floorf(y0), yb = (int)ceilf(y1);
+    pclip_rows(&ya, &yb);
+    bool soft = rad >= 1.5f && (t <= 0.0f || rad >= t);     /* the corners get soft edges (2.0.0) */
+    float cxl = x0 + rad, cxr = x1 - rad;                   /* the corner centres (x) */
+    for (int y = ya; y < yb; ++y) {
         float yc = (float)y + 0.5f, lo, ro, li, ri;
+        bool corner = soft && (yc < y0 + rad || yc > y1 - rad);
+        if (corner) {
+            float cy = yc < y0 + rad ? y0 + rad : y1 - rad, dy = yc - cy;
+            int ka = (int)floorf(x0), kb = (int)ceilf(cxl);          /* left corner columns */
+            int kc = (int)floorf(cxr), kd = (int)ceilf(x1);          /* right corner columns */
+            if (kb > kc) kb = kc = (ka + kd) / 2;
+            for (int pass = 0; pass < 2; ++pass) {
+                int p0 = pass ? kc : ka, p1 = pass ? kd : kb;
+                float cx = pass ? cxr : cxl;
+                for (int px = p0; px < p1; ++px) {
+                    float dx = (float)px + 0.5f - cx;
+                    if (pass ? dx < 0.0f : dx > 0.0f) dx = 0.0f;     /* (the straight part of the row) */
+                    float d = sqrtf(dx * dx + dy * dy);
+                    float cov = clamp01(rad + 0.5f - d);
+                    if (t > 0.0f) cov -= clamp01(irad + 0.5f - d);
+                    spa_px(px, y, cov, c);
+                }
+            }
+            bool mid = t <= 0.0f || yc < y0 + t || yc > y1 - t;      /* the straight middle of the row */
+            if (mid) sp_add(kb, kc, y, c);
+            continue;
+        }
         if (!rr_row(x0, y0, x1, y1, rad, yc, &lo, &ro)) continue;
-        int a = (int)lroundf(lo), b = (int)lroundf(ro);
+        int a = iround(lo), b = iround(ro);
         if (t > 0.0f && rr_row(ix0, iy0, ix1, iy1, irad, yc, &li, &ri)) {
-            int c0 = (int)lroundf(li), c1 = (int)lroundf(ri);
+            int c0 = iround(li), c1 = iround(ri);
             if (c0 <= a) c0 = a + 1;
             if (c1 >= b) c1 = b - 1;
             sp_add(a, c0, y, c); sp_add(c1, b, y, c);
         } else sp_add(a, b, y, c);
     }
     sp_flush(c);
+    spa_flush(c);
 }
 static void sw_ring(float cx, float cy, float r0, float r1, Color c)     /* r0 = 0: a filled circle */
 {
-    for (int y = (int)floorf(cy - r1); y < (int)ceilf(cy + r1); ++y) {
-        float dy = (float)y + 0.5f - cy, o = r1 * r1 - dy * dy;
-        if (o <= 0.0f) continue;
-        float ox = sqrtf(o), i = r0 * r0 - dy * dy;
-        if (r0 > 0.0f && i > 0.0f) {
-            float ix = sqrtf(i);
-            int a = (int)lroundf(cx - ox), b = (int)lroundf(cx - ix), cc = (int)lroundf(cx + ix), d = (int)lroundf(cx + ox);
-            if (b <= a) b = a + 1;
-            if (cc >= d) cc = d - 1;
-            sp_add(a, b, y, c); sp_add(cc, d, y, c);
-        } else sp_add((int)lroundf(cx - ox), (int)lroundf(cx + ox), y, c);
+    int ya = (int)floorf(cy - r1 - 0.5f), yb = (int)ceilf(cy + r1 + 0.5f);
+    pclip_rows(&ya, &yb);
+    for (int y = ya; y < yb; ++y) {
+        float dy = (float)y + 0.5f - cy;
+        float ro = r1 + 0.5f;
+        if (dy * dy >= ro * ro) continue;
+        float ox = sqrtf(ro * ro - dy * dy);
+        int a = (int)floorf(cx - ox), b = (int)ceilf(cx + ox);
+        /* the solid part of the row: covered fully by the outer circle (and outside the hole) */
+        float fo = r1 - 0.5f, fx = fo > 0.0f && dy * dy < fo * fo ? sqrtf(fo * fo - dy * dy) : -1.0f;
+        int sa = fx >= 0.0f ? (int)ceilf(cx - fx) : b, sb = fx >= 0.0f ? (int)floorf(cx + fx) : b;
+        float hi = r0 > 0.0f ? r0 + 0.5f : 0.0f;                 /* the hole and its soft edge */
+        int ha = sb, hb = sb;
+        if (r0 > 0.0f && dy * dy < hi * hi) {
+            float hx = sqrtf(hi * hi - dy * dy);
+            ha = (int)floorf(cx - hx); hb = (int)ceilf(cx + hx);
+            if (ha < sa) ha = sa;
+            if (hb > sb) hb = sb;
+        }
+        for (int px = a; px < b; ++px) {
+            if (px >= sa && px < sb && (px < ha || px >= hb)) continue;   /* solid: in the spans below */
+            float dx = (float)px + 0.5f - cx, d = sqrtf(dx * dx + dy * dy);
+            float cov = clamp01(r1 + 0.5f - d);
+            if (r0 > 0.0f) cov -= clamp01(r0 + 0.5f - d);
+            spa_px(px, y, cov, c);
+        }
+        if (sa < sb) {
+            if (ha < hb) { sp_add(sa, ha, y, c); sp_add(hb, sb, y, c); }
+            else sp_add(sa, sb, y, c);
+        }
     }
     sp_flush(c);
+    spa_flush(c);
 }
 static void sw_poly(const float *p, int n, Color c)                     /* convex polygon */
 {
     float ymin = p[1], ymax = p[1];
     for (int i = 1; i < n; ++i) { if (p[2 * i + 1] < ymin) ymin = p[2 * i + 1]; if (p[2 * i + 1] > ymax) ymax = p[2 * i + 1]; }
-    for (int y = (int)floorf(ymin); y < (int)ceilf(ymax); ++y) {
+    int ya = (int)floorf(ymin), yb = (int)ceilf(ymax);
+    pclip_rows(&ya, &yb);
+    for (int y = ya; y < yb; ++y) {
         float yc = (float)y + 0.5f, l = 1e9f, r = -1e9f;
         for (int i = 0; i < n; ++i) {
             int j = (i + 1) % n;
@@ -860,11 +1118,73 @@ static void sw_poly(const float *p, int n, Color c)                     /* conve
             if (x > r) r = x;
         }
         if (r < l) continue;
-        int a = (int)lroundf(l), b = (int)lroundf(r);
-        if (b <= a) b = a + 1;                                  /* thin lines stay visible */
-        sp_add(a, b, y, c);
+        if (r - l < 2.0f) {                                     /* thin (lines): as before, always visible */
+            int a = iround(l), b = iround(r);
+            if (b <= a) b = a + 1;
+            sp_add(a, b, y, c);
+            continue;
+        }
+        /* 2.0.0: soft left and right edges (the part of the edge pixel that is inside) */
+        int fa = (int)floorf(l), fb = (int)floorf(r);
+        spa_px(fa, y, (float)(fa + 1) - l, c);
+        sp_add(fa + 1, fb, y, c);
+        spa_px(fb, y, r - (float)fb, c);
     }
     sp_flush(c);
+    spa_flush(c);
+}
+
+/* 2.0: a shape drawn as spans (rounded rectangle, ring, polygon) is RECORDED as its few numbers, not as its spans:
+ * recording and fingerprinting cost almost nothing, and the spans are computed only if the shape lies in a part
+ * of the window that really has to be drawn again (while music plays: the meters - not the 40 clip cells). */
+enum { SH_RRECT, SH_RING, SH_POLY, SH_GRAD };
+static void fill_dev_rect(int x0, int y0, int x1, int y1, Color c);
+/* a vertical gradient in bands of 2 pixels (p: x0 y0 x1 y1, then top r g b a, bottom r g b a) */
+static void sw_grad(const float *p)
+{
+    int x0 = (int)p[0], y0 = (int)p[1], x1 = (int)p[2], y1 = (int)p[3];
+    Color top = { (unsigned char)p[4], (unsigned char)p[5], (unsigned char)p[6], (unsigned char)p[7] };
+    Color bottom = { (unsigned char)p[8], (unsigned char)p[9], (unsigned char)p[10], (unsigned char)p[11] };
+    int ya = y0, yb = y1;
+    pclip_rows(&ya, &yb);
+    int start = y0 + ((ya - y0) / 2) * 2;               /* the same bands as when drawn whole */
+    for (int yy = start; yy < yb; yy += 2) {
+        float f = (float)(yy - y0) / (float)(y1 - y0);
+        Color c = { (unsigned char)(top.r + (bottom.r - top.r) * f), (unsigned char)(top.g + (bottom.g - top.g) * f),
+                    (unsigned char)(top.b + (bottom.b - top.b) * f), (unsigned char)(top.a + (bottom.a - top.a) * f) };
+        fill_dev_rect(x0, yy, x1, yy + 2 < y1 ? yy + 2 : y1, c);
+    }
+}
+static void shape_play(int kind, const float *p, int np, Color c)
+{
+    bool rec = g_rec;
+    g_rec = false;                                     /* the spans go straight to the renderer */
+    if (kind == SH_RRECT) sw_rrect(p[0], p[1], p[2], p[3], p[4], p[5], c);
+    else if (kind == SH_RING) sw_ring(p[0], p[1], p[2], p[3], c);
+    else if (kind == SH_GRAD) sw_grad(p);
+    else sw_poly(p, np / 2, c);
+    g_rec = rec;
+}
+static void shape_draw(int kind, const float *p, int np, Color c)
+{
+    if (!g_rec) { shape_play(kind, p, np, c); return; }
+    float x0, y0, x1, y1;
+    if (kind == SH_RRECT || kind == SH_GRAD) { x0 = p[0]; y0 = p[1]; x1 = p[2]; y1 = p[3]; }
+    else if (kind == SH_RING) { x0 = p[0] - p[3]; x1 = p[0] + p[3]; y0 = p[1] - p[3]; y1 = p[1] + p[3]; }
+    else {
+        x0 = x1 = p[0]; y0 = y1 = p[1];
+        for (int i = 1; i < np / 2; ++i) {
+            if (p[2 * i] < x0) x0 = p[2 * i];
+            if (p[2 * i] > x1) x1 = p[2 * i];
+            if (p[2 * i + 1] < y0) y0 = p[2 * i + 1];
+            if (p[2 * i + 1] > y1) y1 = p[2 * i + 1];
+        }
+    }
+    RCmd *rc = rc_new(RC_SHAPE);
+    if (!rc || !ar_put(p, sizeof(float) * (size_t)np, &rc->off)) return;
+    rc->n = kind; rc->ni = np; rc->c = c;
+    unsigned h = fnv(2166136261u ^ (unsigned)kind, p, sizeof(float) * (size_t)np);
+    rc_finish(rc, (int)floorf(x0) - 1, (int)floorf(y0) - 1, (int)ceilf(x1) + 1, (int)ceilf(y1) + 1, h);
 }
 
 static void fill_dev_rect(int x0, int y0, int x1, int y1, Color c)
@@ -887,26 +1207,80 @@ static void fill_ui_rect(float x, float y, float w, float h, Color c)
 
 /* 1.3.14: a picture made by the program itself (e.g. the waveform): pixels -> one texture -> one command.
  * A still picture costs nothing (the same number = the same tiles); a changed one is one upload + one copy. */
-struct GfxImage { SDL_Texture *t; int w, h; unsigned serial; };
+/* 2.0: the picture is kept in strips 128 pixels wide, each its own texture. A new picture uploads only the strips
+ * that really changed and only those parts of the window are drawn again. With "gentle uploads" (Edit > Performance,
+ * for old laptops whose USB sound breaks when the graphics card copies a lot at once) at most GFX_GENTLE_BYTES go to
+ * the graphics card per frame - the rest follows in the next frames. */
+#define GI_SW 128
+#define GI_MAXS 64
+#define GFX_GENTLE_BYTES (192 * 1024)
+struct GfxImage {
+    int w, h, ns;
+    uint32_t *cur;                     /* the newest picture (what the strips must show) */
+    SDL_Texture *t[GI_MAXS];
+    unsigned serial[GI_MAXS];
+    bool pend[GI_MAXS];                /* changed, not uploaded yet */
+    bool valid[GI_MAXS];               /* the texture holds a picture (else it is not drawn) */
+};
+static bool g_gentle_uploads;
+void GfxSetGentleUploads(bool on) { g_gentle_uploads = on; }
 GfxImage *GfxImageNew(void) { return (GfxImage *)calloc(1, sizeof(GfxImage)); }
 float GfxScaleNow(void) { return g_scale; }
+static void gi_free_tex(GfxImage *im)
+{
+    for (int i = 0; i < GI_MAXS; ++i) { if (im->t[i]) SDL_DestroyTexture(im->t[i]); im->t[i] = NULL; im->valid[i] = im->pend[i] = false; }
+}
 void GfxImageUpload(GfxImage *im, const uint32_t *argb, int w, int h)
 {
     if (!im || w <= 0 || h <= 0) return;
-    if (!im->t || im->w != w || im->h != h) {
-        if (im->t) SDL_DestroyTexture(im->t);
-        im->t = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
-        if (!im->t) return;
-        SDL_SetTextureBlendMode(im->t, SDL_BLENDMODE_BLEND);
-        im->w = w; im->h = h;
+    int ns = (w + GI_SW - 1) / GI_SW;
+    if (ns > GI_MAXS) ns = GI_MAXS;                    /* (wider than 8192 px: the rest is not shown) */
+    if (im->w != w || im->h != h || !im->cur) {
+        gi_free_tex(im);
+        free(im->cur);
+        im->cur = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)w * (size_t)h);
+        im->w = w; im->h = h; im->ns = 0;
+        if (!im->cur) { im->w = im->h = 0; return; }
+        memcpy(im->cur, argb, sizeof(uint32_t) * (size_t)w * (size_t)h);
+        im->ns = ns;
+        for (int i = 0; i < ns; ++i) im->pend[i] = true;
+        return;
     }
-    SDL_UpdateTexture(im->t, NULL, argb, w * 4);
-    im->serial = ++g_tex_serial;
+    for (int i = 0; i < ns; ++i) {                     /* which strips changed */
+        int x0 = i * GI_SW, sw = w - x0 < GI_SW ? w - x0 : GI_SW;
+        bool ch = false;
+        for (int y = 0; y < h; ++y) {
+            const uint32_t *a = argb + (size_t)y * w + x0;
+            uint32_t *b = im->cur + (size_t)y * w + x0;
+            if (ch || memcmp(a, b, sizeof(uint32_t) * (size_t)sw) != 0) { ch = true; memcpy(b, a, sizeof(uint32_t) * (size_t)sw); }
+        }
+        if (ch) im->pend[i] = true;
+    }
 }
 void GfxImageDraw(GfxImage *im, int px, int py)
 {
-    if (!im || !im->t) return;
-    gfx_copy(im->t, im->serial, (Color){ 255, 255, 255, 255 }, (SDL_Rect){ px, py, im->w, im->h });
+    if (!im || !im->cur) return;
+    size_t budget = g_gentle_uploads && !g_soft_render ? (size_t)GFX_GENTLE_BYTES : (size_t)-1, sent = 0;
+    for (int i = 0; i < im->ns; ++i) {
+        int x0 = i * GI_SW, sw = im->w - x0 < GI_SW ? im->w - x0 : GI_SW;
+        if (im->pend[i]) {
+            size_t bytes = (size_t)sw * (size_t)im->h * 4;
+            if (sent == 0 || sent + bytes <= budget) {
+                if (!im->t[i]) {
+                    im->t[i] = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, sw, im->h);
+                    if (im->t[i]) SDL_SetTextureBlendMode(im->t[i], SDL_BLENDMODE_BLEND);
+                }
+                if (im->t[i]) {
+                    SDL_UpdateTexture(im->t[i], NULL, im->cur + x0, im->w * 4);
+                    im->serial[i] = ++g_tex_serial;
+                    im->valid[i] = true;
+                    im->pend[i] = false;
+                    sent += bytes;
+                }
+            }
+        }
+        if (im->valid[i]) gfx_copy(im->t[i], im->serial[i], (Color){ 255, 255, 255, 255 }, (SDL_Rect){ px + x0, py, sw, im->h });
+    }
 }
 
 /* 1.3.14: many plain rectangles of one colour (UI units) as one command */
@@ -972,13 +1346,10 @@ void DrawRectangleGradientV(float x, float y, float w, float h, Color top, Color
 {
     int x0 = D(x), y0 = D(y), x1 = D(x + w), y1 = D(y + h);
     if (x1 <= x0 || y1 <= y0) return;
-    if ((g_soft_render || g_eco)) {                               /* 1.3.4: in bands of 2 pixels */
-        for (int yy = y0; yy < y1; yy += 2) {
-            float f = (float)(yy - y0) / (float)(y1 - y0);
-            Color c = { (unsigned char)(top.r + (bottom.r - top.r) * f), (unsigned char)(top.g + (bottom.g - top.g) * f),
-                        (unsigned char)(top.b + (bottom.b - top.b) * f), (unsigned char)(top.a + (bottom.a - top.a) * f) };
-            fill_dev_rect(x0, yy, x1, yy + 2 < y1 ? yy + 2 : y1, c);
-        }
+    if ((g_soft_render || g_eco)) {                               /* 1.3.4: in bands of 2 pixels (2.0: one command) */
+        float p[12] = { (float)x0, (float)y0, (float)x1, (float)y1, top.r, top.g, top.b, top.a,
+                        bottom.r, bottom.g, bottom.b, bottom.a };
+        shape_draw(SH_GRAD, p, 12, top);
         return;
     }
     SDL_Vertex v[4];
@@ -1038,11 +1409,12 @@ static void mesh_flush(Mesh *m)
 
 static int mesh_vtx(Mesh *m, float x, float y, Color c, float alpha_mul)
 {
+    if (m->n >= MAXV) return MAXV - 1;                 /* 1.4.20: never past the end (a too big shape is cut, no crash) */
     SDL_Vertex *v = &m->v[m->n];
     v->position.x = x;
     v->position.y = y;
     v->color.r = c.r; v->color.g = c.g; v->color.b = c.b;
-    int a = (int)lroundf((float)c.a * alpha_mul);
+    int a = iround((float)c.a * alpha_mul);
     v->color.a = (Uint8)(a < 0 ? 0 : a > 255 ? 255 : a);
     v->tex_coord.x = 0; v->tex_coord.y = 0;
     return m->n++;
@@ -1050,6 +1422,7 @@ static int mesh_vtx(Mesh *m, float x, float y, Color c, float alpha_mul)
 
 static void mesh_tri(Mesh *m, int a, int b, int c)
 {
+    if (m->ni + 3 > MAXV * 3) return;                  /* 1.4.20: see mesh_vtx */
     m->idx[m->ni++] = a; m->idx[m->ni++] = b; m->idx[m->ni++] = c;
 }
 
@@ -1057,7 +1430,7 @@ static void mesh_tri(Mesh *m, int a, int b, int c)
 static void aa_poly(const float *p, int n, Color col)
 {
     if (n < 3 || n > 16 || col.a == 0) return;
-    if ((g_soft_render || g_eco)) { sw_poly(p, n, col); return; }
+    if ((g_soft_render || g_eco)) { shape_draw(SH_POLY, p, 2 * n, col); return; }
     float area = 0;
     for (int i = 0; i < n; ++i) {
         int j = (i + 1) % n;
@@ -1149,7 +1522,7 @@ void DrawCircleV(Vector2 center, float radius, Color c)
 {
     if (c.a == 0 || radius <= 0) return;
     float cx = center.x * g_scale, cy = center.y * g_scale, r = radius * g_scale;
-    if ((g_soft_render || g_eco)) { sw_ring(cx, cy, 0.0f, r, c); return; }
+    if ((g_soft_render || g_eco)) { float p[4] = { cx, cy, 0.0f, r }; shape_draw(SH_RING, p, 4, c); return; }
     int n = circle_segments(r);
     Mesh *m = &(Mesh){ .n = 0, .ni = 0 };
     float r_in = r - 0.5f;
@@ -1178,8 +1551,10 @@ void DrawCircleLines(int cx_i, int cy_i, float radius, Color c)
     float t = g_scale < 1.0f ? 1.0f : g_scale;     /* 1 UI unit, at least 1 physical px */
     float r0 = r - t * 0.5f, r1 = r + t * 0.5f;
     if (r0 < 0) r0 = 0;
-    if ((g_soft_render || g_eco)) { sw_ring(cx, cy, r0 > 0.0f ? r0 : 0.01f, r1, c); return; }
+    if ((g_soft_render || g_eco)) { float p[4] = { cx, cy, r0 > 0.0f ? r0 : 0.01f, r1 }; shape_draw(SH_RING, p, 4, c); return; }
     int n = circle_segments(r);
+    if (n > 84) n = 84;                                /* 1.4.20: 18 indices per segment must fit the mesh (MAXV * 3):
+                                                        * 120 segments of a big circle (radius > ~43 px) smashed the stack */
     Mesh *m = &(Mesh){ .n = 0, .ni = 0 };
     int a0[130], a1[130], b0[130], b1[130];      /* (r0-.5)(a=0) (r0+.5)(a=1) (r1-.5)(a=1) (r1+.5)(a=0) */
     for (int i = 0; i < n; ++i) {
@@ -1201,7 +1576,7 @@ void DrawCircleLines(int cx_i, int cy_i, float radius, Color c)
 }
 
 /* ---- step 36f: rounded rectangles (with soft edges) ---- */
-#define RR_SEG 7                                       /* points per corner */
+#define RR_SEG 10                                      /* points per corner */
 /* the outline of a rounded rectangle (physical px), shifted inwards by inset (negative = outwards) */
 static int rr_points(float x0, float y0, float x1, float y1, float rad, float inset, float *px, float *py)
 {
@@ -1246,7 +1621,8 @@ static void rr_geom(Rectangle r, float radius, float thick, Color c)
     if ((g_soft_render || g_eco)) {                               /* 1.3.4 */
         float t = thick > 0 ? thick * g_scale : 0.0f;
         if (thick > 0 && t < 1.0f) t = 1.0f;
-        sw_rrect(x0, y0, x1, y1, rad, t, c);
+        float p[6] = { x0, y0, x1, y1, rad, t };
+        shape_draw(SH_RRECT, p, 6, c);
         return;
     }
     const int N = 4 * RR_SEG;
@@ -1932,8 +2308,10 @@ static void soft_push(const SDL_Rect *rr, int nr)
     g_prev_w = 0;                                     /* the normal (non-Eco) path compares from scratch */
 }
 
-#define ET_W 64
-#define ET_H 32
+/* 2.0: tiles of 32x16 pixels without a graphics card (the parts drawn again follow the meters closely - about half
+ * the work of 64x32 there); 64x32 with a graphics card (fewer, bigger draw calls suit it better) */
+#define ET_W (g_soft_render ? 32 : 64)
+#define ET_H (g_soft_render ? 16 : 32)
 static unsigned *g_th, *g_thp;                        /* tile fingerprints: this frame / the last one */
 static int       g_tnx, g_tny;
 static int       g_eco_drawn;                         /* QLIM_FPS: tiles drawn (sum) */
@@ -1960,6 +2338,16 @@ static void eco_present(void)
     }
     bool direct = !g_off && !g_tgt;                   /* no kept picture possible: draw everything every time */
     for (int i = 0; i < nx * ny; ++i) g_th[i] = 2166136261u;
+    /* 2.0: every command's tile range is kept - below, only the commands that touch a changed tile are drawn again
+     * (before, every changed part looked through all ~5000 commands of the frame) */
+    static short (*trng)[4];
+    static int trng_cap;
+    if (g_ncmd > trng_cap) {
+        int nc = g_ncmd + 1024;
+        short (*t)[4] = realloc(trng, sizeof *trng * (size_t)nc);
+        if (t) { trng = t; trng_cap = nc; }
+    }
+    bool have_rng = trng && g_ncmd <= trng_cap;
     for (int k = 0; k < g_ncmd; ++k) {
         const RCmd *c = &g_cmd[k];
         int tx0 = c->bb.x / ET_W, ty0 = c->bb.y / ET_H;
@@ -1968,17 +2356,23 @@ static void eco_present(void)
         if (ty0 < 0) ty0 = 0;
         if (tx1 >= nx) tx1 = nx - 1;
         if (ty1 >= ny) ty1 = ny - 1;
+        if (have_rng) { trng[k][0] = (short)tx0; trng[k][1] = (short)ty0; trng[k][2] = (short)tx1; trng[k][3] = (short)ty1; }
         for (int ty = ty0; ty <= ty1; ++ty)
             for (int tx = tx0; tx <= tx1; ++tx) { unsigned *t = &g_th[ty * nx + tx]; *t = (*t ^ c->hash) * 16777619u; }
     }
     /* the changed tiles -> rectangles (runs in a row, then the same run in the rows below joined) */
     static SDL_Rect rr[2048];
+    static unsigned char *td;                         /* 2.0: changed tiles of this frame */
+    static int td_n;
+    if (td_n != nx * ny) { free(td); td = (unsigned char *)malloc((size_t)nx * ny); td_n = td ? nx * ny : 0; }
+    if (!td) have_rng = false;
     int nr = 0, ndirty = 0;
     bool full = g_eco_full || direct;
     for (int ty = 0; ty < ny; ++ty) {
         int run0 = -1;
         for (int tx = 0; tx <= nx; ++tx) {
             bool d = tx < nx && (full || g_th[ty * nx + tx] != g_thp[ty * nx + tx]);
+            if (tx < nx && td) td[ty * nx + tx] = d;
             if (d) ++ndirty;
             if (d && run0 < 0) run0 = tx;
             if (!d && run0 >= 0) {
@@ -1996,6 +2390,9 @@ static void eco_present(void)
             }
         }
     }
+    /* QLIM_DIRTY=1: every 30th frame, the parts drawn again (for performance work) */
+    { static int dbgd = -1, fc; if (dbgd < 0) dbgd = getenv("QLIM_DIRTY") != NULL;
+      if (dbgd && ++fc % 30 == 0) { fprintf(stderr, "DIRTY %d:", nr); for (int i = 0; i < nr; ++i) fprintf(stderr, " %d,%d,%d,%d", rr[i].x, rr[i].y, rr[i].w, rr[i].h); fprintf(stderr, "\n"); } }
     memcpy(g_thp, g_th, sizeof(unsigned) * (size_t)nx * ny);
     if (full) { nr = 1; rr[0] = (SDL_Rect){ 0, 0, W, H }; ndirty = nx * ny; }
     g_eco_drawn += ndirty;
@@ -2012,14 +2409,37 @@ static void eco_present(void)
         return;
     }
     if (g_tgt && !g_off) SDL_SetRenderTarget(g_ren, g_tgt);
-    for (int i = 0; i < nr; ++i)
+    /* 2.0: the commands that touch at least one changed tile (in their order) - the rest cannot be in a changed part */
+    static int *cand;
+    static int cand_cap;
+    int ncand = 0;
+    bool use_cand = have_rng && !full;
+    if (use_cand && g_ncmd > cand_cap) {
+        int nc = g_ncmd + 1024;
+        int *t = realloc(cand, sizeof *cand * (size_t)nc);
+        if (t) { cand = t; cand_cap = nc; } else use_cand = false;
+    }
+    if (use_cand) {
         for (int k = 0; k < g_ncmd; ++k) {
-            const RCmd *c = &g_cmd[k];
+            bool hit = false;
+            for (int ty = trng[k][1]; ty <= trng[k][3] && !hit; ++ty)
+                for (int tx = trng[k][0]; tx <= trng[k][2]; ++tx)
+                    if (td[ty * nx + tx]) { hit = true; break; }
+            if (hit) cand[ncand++] = k;
+        }
+    }
+    g_rc_clip_ok = false;
+    for (int i = 0; i < nr; ++i) {
+        int n = use_cand ? ncand : g_ncmd;
+        for (int j = 0; j < n; ++j) {
+            const RCmd *c = &g_cmd[use_cand ? cand[j] : j];
             if (c->bb.x >= rr[i].x + rr[i].w || c->bb.x + c->bb.w <= rr[i].x ||
                 c->bb.y >= rr[i].y + rr[i].h || c->bb.y + c->bb.h <= rr[i].y) continue;
             rc_play(c, &rr[i]);
         }
+    }
     SDL_RenderSetClipRect(g_ren, NULL);
+    g_rc_clip_ok = false;
     if (g_off) {
         SDL_RenderPresent(g_ren);                     /* draws into g_off */
         soft_push(rr, nr);
@@ -2079,7 +2499,15 @@ void GfxHoverLayer(Rectangle r)
 {
     if (!g_gfx_hover_filter) return;
     Vector2 mu = { g_mouse.x / g_scale, g_mouse.y / g_scale };
-    if (mu.x >= r.x && mu.x < r.x + r.width && mu.y >= r.y && mu.y < r.y + r.height) g_hov_area = 1e30f;
+    if (mu.x >= r.x && mu.x < r.x + r.width && mu.y >= r.y && mu.y < r.y + r.height) { g_hov_area = 1e30f; return; }
+    /* 2.0.0: the mouse is outside this layer (a menu, a popup), but the frame of the thing under the mouse would go
+     * through it (a long cell under an open menu) -> no frame: a layer drawn later must stay on top */
+    if (g_hov_area < 1e29f) {
+        SDL_Rect lp = { (int)lroundf(r.x * g_scale), (int)lroundf(r.y * g_scale),
+                        (int)lroundf(r.width * g_scale), (int)lroundf(r.height * g_scale) };
+        if (r.width > 1e5f || r.height > 1e5f) lp = (SDL_Rect){ 0, 0, 1 << 20, 1 << 20 };
+        if (SDL_HasIntersection(&lp, &g_hov_px)) g_hov_area = 1e30f;
+    }
 }
 static void eco_hover_draw(void)
 {
@@ -2158,7 +2586,9 @@ void EndDrawing(void)
                         if (t - (double)g_frame_start / freq >= 1.0 / 15.0 &&
                             SDL_PeepEvents(NULL, 1, SDL_PEEKEVENT, SDL_MOUSEMOTION, SDL_MOUSEMOTION) > 0) break;
                         if (t >= end) break;
-                        double st = end - t < 0.005 ? end - t : 0.005;
+                        /* 2.0: 10 ms naps (was 5): every check asks the X server for events - half the asking,
+                         * a click still answers within 10 ms */
+                        double st = end - t < 0.010 ? end - t : 0.010;
                         SDL_Delay((Uint32)(st * 1000.0) + 1);
                     }
                 }

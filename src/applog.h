@@ -24,7 +24,6 @@ int      applog_orig_stderr(void);       /* the real console (for the crash hand
 int      applog_count(void);             /* how many lines are in memory */
 /* i = 0 is the oldest. out receives the text; *level and *t (seconds since start) may be NULL. */
 bool     applog_get(int i, char *out, size_t n, int *level, double *t);
-unsigned applog_seq(void);               /* grows with every new line */
 
 /* New warnings/errors since the last "seen" (opening the window / Clear). */
 int      applog_new_warnings(void);

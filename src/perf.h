@@ -22,6 +22,7 @@ typedef struct {
     float zoom;         /* 1.3.10: the size of the interface (Ctrl+wheel, Ctrl+= / Ctrl+- / Ctrl+0) */
     int   wave;         /* 1.3.14: the waveform: 0 = Auto (light with Eco), 1 = smooth, 2 = light
                          * (light: SCROLL moves 15 times per second, whole-pixel steps) */
+    bool  gentle;       /* 2.0: pictures go to the graphics card in small pieces (old laptops: USB sound + GPU) */
 } PerfSettings;
 
 void          perf_load(void);

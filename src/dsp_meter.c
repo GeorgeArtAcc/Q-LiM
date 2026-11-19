@@ -48,8 +48,3 @@ void dsp_meter_take(DspSample *out)
 unsigned dsp_meter_xruns(void) { return atomic_load(&g_xruns); }
 unsigned dsp_meter_overloads(void) { return atomic_load(&g_over); }
 
-void dsp_meter_reset(void)
-{
-    atomic_store(&g_sum, 0); atomic_store(&g_cnt, 0); atomic_store(&g_max, 0);
-    atomic_store(&g_xruns, 0); atomic_store(&g_over, 0);
-}

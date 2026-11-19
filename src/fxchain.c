@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #define FX_MAX_BLOCK 1024              /* = MAX_BLOCK in mixer.c */
 #define MAX_CHAINS   (MAX_CHANNELS * 2)
@@ -60,7 +61,7 @@ static bool is_live(FxChain *c)
 
 static void make_sig(Session *s, Channel *ch, char *sig, size_t sz)
 {
-    size_t o = (size_t)snprintf(sig, sz, "%d/%d;", s->sample_rate, plugins_generation());
+    size_t o = (size_t)snprintf(sig, sz, "%d/%d/%u;", s->sample_rate, plugins_generation(), qplug_separate_gen());
     for (int k = 0; k < ch->fx_count && o < sz; ++k)
         o += (size_t)snprintf(sig + o, sz - o, "%d:%s|%s|%d;", k, ch->fx[k].fmt, ch->fx[k].path, ch->fx[k].bypass ? 1 : 0);
 }
@@ -88,12 +89,6 @@ void fxstate_append(int ref, const void *data, size_t len)
     memcpy(nd + b->n, data, len);
     b->d = nd; b->n += len;
 }
-void fxstate_set(int ref, const void *data, size_t len)
-{
-    if (ref < 1 || ref > g_nblobs) return;
-    g_blobs[ref - 1].n = 0;
-    fxstate_append(ref, data, len);
-}
 const void *fxstate_get(int ref, size_t *len)
 {
     if (ref < 1 || ref > g_nblobs) { *len = 0; return NULL; }
@@ -107,7 +102,8 @@ static QPlug *take_from(FxChain *d, const char *fmt, const char *id)
 {
     if (!d) return NULL;
     for (int i = 0; i < d->n; ++i)
-        if (!d->moved[i] && !strcmp(d->id[i], id) && !strcmp(d->fmt[i], fmt)) { d->moved[i] = true; return d->p[i]; }
+        if (!d->moved[i] && !strcmp(d->id[i], id) && !strcmp(d->fmt[i], fmt) &&
+            qplug_is_separate(d->p[i]) == qplug_wants_separate(fmt, id)) { d->moved[i] = true; return d->p[i]; }
     return NULL;
 }
 
@@ -263,9 +259,11 @@ static FxChain *build(Session *s, int c, FxChain *old, const char *sig, bool *wa
     return nc;
 }
 
+void fxchain_learn_poll(Session *s);
 void fxchain_sync(Session *s)
 {
     clap_host_set_main_thread();
+    fxchain_learn_poll(s);                            /* 1.4.14 */
     collect(s);
     for (int i = 0; i < g_nlive; ++i) g_live[i]->claimed = false;
     int nch = atomic_load(&s->channel_count);
@@ -364,13 +362,6 @@ bool fxchain_slot_loading(Session *s, int c, int k)
     return a && !atomic_load(&a->done);
 }
 
-bool fxchain_slot_loaded(Session *s, int c, int k)
-{
-    FxChain *f = chain_of(s, c);
-    if (!f) return false;
-    for (int i = 0; i < f->n; ++i) if (f->slot[i] == k) return true;
-    return false;
-}
 
 QPlug *fxchain_find(Session *s, int c, int k)
 {
@@ -378,6 +369,21 @@ QPlug *fxchain_find(Session *s, int c, int k)
     if (!f) return NULL;
     for (int i = 0; i < f->n; ++i) if (f->slot[i] == k && !f->moved[i]) return f->p[i];
     return NULL;
+}
+
+/* 2.0.0: before plugins move into / out of a separate process: their current settings are kept, so the new
+ * instance starts exactly as the old one was */
+void fxchain_keep_states(Session *s)
+{
+    for (int c = 0; c < s->channel_count; ++c)
+        for (int k = 0; k < s->channels[c].fx_count; ++k) {
+            QPlug *p = fxchain_find(s, c, k);
+            void *d = NULL; size_t n = 0;
+            if (!p || qplug_get_state(p, &d, &n) != 0 || !n) { free(d); continue; }
+            int ref = fxstate_new();
+            if (ref > 0) { fxstate_append(ref, d, n); s->channels[c].fx[k].state_ref = ref; }
+            free(d);
+        }
 }
 
 int fxchain_state_for_save(Session *s, int c, int k, void **data, size_t *len)
@@ -426,4 +432,102 @@ bool fxchain_slot_is_instrument(Session *s, int ch, int k)
     if (!f) return false;
     for (int i = 0; i < f->n; ++i) if (f->slot[i] == k && !f->moved[i]) return f->inst[i];
     return false;
+}
+
+/* ===== 1.4.14: MIDI Learn of plugin parameters (main thread) =====
+ * Learning: a target plugin (ch, k) and a parameter; param -1 = "the one you touch": every frame the values of
+ * the plugin's parameters are compared with the last look - the one that moved alone (in the plugin's window or on
+ * a knob of the device panel) becomes the target. The next CC from a controller is bound to the target. */
+static struct { bool on; int ch, k, param; char name[96]; float *snap; int nsnap; } g_learn;
+
+static void learn_drop_snap(void) { free(g_learn.snap); g_learn.snap = NULL; g_learn.nsnap = 0; }
+
+void fxchain_learn(Session *s, int ch, int k, int param)
+{
+    learn_drop_snap();
+    memset(&g_learn, 0, sizeof g_learn);
+    if (!s || ch < 0 || ch >= s->channel_count || k < 0 || k >= s->channels[ch].fx_count) return;
+    g_learn.on = true; g_learn.ch = ch; g_learn.k = k; g_learn.param = param;
+    snprintf(g_learn.name, sizeof g_learn.name, "%s", s->channels[ch].fx[k].name);
+}
+
+void fxchain_learn_cancel(void) { learn_drop_snap(); memset(&g_learn, 0, sizeof g_learn); }
+
+bool fxchain_learning(int *ch, int *k, int *param)
+{
+    if (!g_learn.on) return false;
+    if (ch) *ch = g_learn.ch;
+    if (k) *k = g_learn.k;
+    if (param) *param = g_learn.param;
+    return true;
+}
+
+/* the plugin is still where learning started (not removed / moved) */
+static QPlug *learn_plug(Session *s)
+{
+    if (!g_learn.on || g_learn.ch >= s->channel_count || g_learn.k >= s->channels[g_learn.ch].fx_count ||
+        strcmp(s->channels[g_learn.ch].fx[g_learn.k].name, g_learn.name) != 0) { fxchain_learn_cancel(); return NULL; }
+    return fxchain_find(s, g_learn.ch, g_learn.k);
+}
+
+void fxchain_learn_poll(Session *s)
+{
+    if (!g_learn.on) return;
+    QPlug *p = learn_plug(s);
+    if (!p) return;
+    int n = qplug_param_count(p);
+    if (n <= 0) return;
+    if (!g_learn.snap || g_learn.nsnap != n) {
+        learn_drop_snap();
+        g_learn.snap = malloc((size_t)n * sizeof(float));
+        if (!g_learn.snap) return;
+        for (int i = 0; i < n; ++i) g_learn.snap[i] = qplug_param_get(p, i);
+        g_learn.nsnap = n;
+        return;
+    }
+    int moved = -1, nmoved = 0;
+    for (int i = 0; i < n; ++i) {
+        float v = qplug_param_get(p, i);
+        if (fabsf(v - g_learn.snap[i]) > 1e-4f) { moved = i; ++nmoved; g_learn.snap[i] = v; }
+    }
+    if (nmoved == 1) g_learn.param = moved;        /* many at once = a preset was loaded: not a "touch" */
+}
+
+bool fxchain_learn_cc(Session *s, int cc, char *msg, int msz)
+{
+    if (!g_learn.on) return false;
+    QPlug *p = learn_plug(s);
+    if (!p) return false;
+    if (g_learn.param < 0) {
+        if (msg) snprintf(msg, (size_t)msz, "MIDI Learn: first move a parameter of %s (its window or a knob)", g_learn.name);
+        return true;                                  /* swallowed: it must not move anything else meanwhile */
+    }
+    char pn[64] = "";
+    qplug_param_name(p, g_learn.param, pn, sizeof pn);
+    bool ok = session_fx_midi_set(s, g_learn.ch, g_learn.k, g_learn.param, cc);
+    if (msg) {
+        if (ok) snprintf(msg, (size_t)msz, "CC %d now moves %s - %s", cc, g_learn.name, pn);
+        else snprintf(msg, (size_t)msz, "%s already has %d MIDI-learned parameters (the most)", g_learn.name, FX_MIDI_MAX);
+    }
+    fxchain_learn_cancel();
+    return true;
+}
+
+void fxchain_midi_cc(Session *s, int cc, int value)
+{
+    float v = (float)value / 127.0f;
+    for (int c = 0; c < s->channel_count; ++c) {
+        Channel *ch = &s->channels[c];
+        for (int k = 0; k < ch->fx_count; ++k) {
+            const ChFx *f = &ch->fx[k];
+            if (f->midi_n == 0) continue;
+            QPlug *p = NULL;
+            for (int i = 0; i < f->midi_n; ++i) {
+                if (f->midi[i].cc != cc) continue;
+                if (!p) p = fxchain_find(s, c, k);
+                if (!p) break;
+                if (f->midi[i].param < qplug_param_count(p)) qplug_param_set(p, f->midi[i].param, v);
+            }
+        }
+    }
 }

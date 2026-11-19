@@ -47,7 +47,6 @@ bool plugins_resolve(const char *fmt, const char *path_or_id, const char *name, 
 
 /* Search locations */
 const char *plugins_fmt_name(int pf);        /* "VST3", "VST2", "LV2", "CLAP" */
-const char *plugins_fmt_code(int pf);        /* "VST3", "VST", "LV2", "CLAP" */
 int         plugins_fmt_index(const char *code);
 int         plugins_loc_count(int pf);
 const char *plugins_loc_get(int pf, int i);

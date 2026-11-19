@@ -33,6 +33,7 @@ typedef struct { size_t start, end, back; bool loop; } Eff;
 
 struct ClipStream {
     StreamSource   src;
+    int            nch;         /* 1.4.24: floats per frame (2, or a multichannel source's channels) */
     size_t         total;
     StreamRegionFn region_fn;
     void          *region_ud;
@@ -52,7 +53,7 @@ struct ClipStream {
     uint32_t      *rpos;        /* file position of every ring frame */
     float         *pre;         /* preroll */
     float         *tmp;         /* chunk * 2, disk thread only */
-    float          xbuf[LOOP_XF * 2];   /* the audio before loop start (for the loop crossfade); disk thread only / under g_mu */
+    float          xbuf[LOOP_XF * STREAM_MAX_CH];   /* the audio before loop start (for the loop crossfade); disk thread only / under g_mu */
     Eff            pre_eff;     /* the region the preroll was built with (the fades depend on it) */
 
     size_t         pre_start;
@@ -205,19 +206,19 @@ static void edge_fades(ClipStream *s, const Eff *r, size_t pos, float *buf, size
             if (a < b) {
                 /* the audio RIGHT before loop start: [back - L, back) (before the start of the file = silence) */
                 size_t k0 = a - x0, cnt = b - a;
-                memset(s->xbuf, 0, cnt * 2 * sizeof(float));
+                const int C = s->nch;
+                memset(s->xbuf, 0, cnt * (size_t)C * sizeof(float));
                 long long pre0 = (long long)r->back - (long long)L + (long long)k0;   /* may be < 0 */
                 size_t skip = pre0 < 0 ? (size_t)(-pre0) : 0;
                 if (skip < cnt) {
-                    size_t got = s->src.read(s->src.ctx, (size_t)(pre0 + (long long)skip), s->xbuf + skip * 2, cnt - skip);
+                    size_t got = s->src.read(s->src.ctx, (size_t)(pre0 + (long long)skip), s->xbuf + skip * (size_t)C, cnt - skip);
                     (void)got;                                /* what was not read stays silence */
                 }
                 for (size_t i = 0; i < cnt; ++i) {
                     float t = ((float)(k0 + i) + 0.5f) / (float)L;
                     float w_in = 0.5f - 0.5f * cosf(t * 3.14159265f);   /* smooth S-curve, the sum is 1 */
-                    float *o = buf + (a - pos + i) * 2;
-                    o[0] = o[0] * (1.0f - w_in) + s->xbuf[i * 2 + 0] * w_in;
-                    o[1] = o[1] * (1.0f - w_in) + s->xbuf[i * 2 + 1] * w_in;
+                    float *o = buf + (a - pos + i) * (size_t)C;
+                    for (int k = 0; k < C; ++k) o[k] = o[k] * (1.0f - w_in) + s->xbuf[i * (size_t)C + (size_t)k] * w_in;
                 }
             }
         }
@@ -230,8 +231,7 @@ static void edge_fades(ClipStream *s, const Eff *r, size_t pos, float *buf, size
             for (size_t f = a; f < b; ++f) {
                 float t = ((float)(f - x0) + 0.5f) / (float)F;
                 float g = 0.5f + 0.5f * cosf(t * 3.14159265f);           /* 1 -> 0 */
-                buf[(f - pos) * 2 + 0] *= g;
-                buf[(f - pos) * 2 + 1] *= g;
+                for (int k = 0; k < s->nch; ++k) buf[(f - pos) * (size_t)s->nch + (size_t)k] *= g;
             }
         }
     }
@@ -243,8 +243,7 @@ static void edge_fades(ClipStream *s, const Eff *r, size_t pos, float *buf, size
         for (size_t f = a; f < b; ++f) {
             float t = ((float)(f - r->start) + 0.5f) / (float)F;
             float g = 0.5f - 0.5f * cosf(t * 3.14159265f);               /* 0 -> 1 */
-            buf[(f - pos) * 2 + 0] *= g;
-            buf[(f - pos) * 2 + 1] *= g;
+            for (int k = 0; k < s->nch; ++k) buf[(f - pos) * (size_t)s->nch + (size_t)k] *= g;
         }
     }
 }
@@ -256,7 +255,7 @@ static void build_preroll(ClipStream *s)
     if (n > s->pre_cap) n = s->pre_cap;
     /* The new preroll is read into a separate buffer and then swapped in with the Dekker handshake (in_read/resizing):
      * a stopped clip may still be read (fade-out, stretch thread) from the old buffer - we do not write over it. */
-    float *nb = calloc(s->pre_cap * 2, sizeof(float));
+    float *nb = calloc(s->pre_cap * (size_t)s->nch, sizeof(float));
     float *dst = nb ? nb : s->pre;
     if (!nb) {                                       /* out of memory: wait for the reader and write in place */
         atomic_store(&s->resizing, 1);
@@ -372,9 +371,9 @@ static bool service(ClipStream *s)
         size_t at = wr & s->ring_mask;
         size_t first = s->ring_frames - at;
         if (first > got) first = got;
-        memcpy(s->ring + at * 2, s->tmp, first * 2 * sizeof(float));
+        memcpy(s->ring + at * (size_t)s->nch, s->tmp, first * (size_t)s->nch * sizeof(float));
         if (got > first)
-            memcpy(s->ring, s->tmp + first * 2, (got - first) * 2 * sizeof(float));
+            memcpy(s->ring, s->tmp + first * (size_t)s->nch, (got - first) * (size_t)s->nch * sizeof(float));
         for (size_t i = 0; i < got; ++i)
             s->rpos[(wr + i) & s->ring_mask] = (uint32_t)(pos + i);
 
@@ -422,7 +421,10 @@ static void *disk_main(void *arg)
         }
         for (size_t i = 0; i < na; ++i) did |= service(act[i]);
         pthread_mutex_unlock(&g_mu);
-        if (!did) sleep_ms(2);
+        /* 2.0: nothing to read -> a longer nap (it went round all streams 500 times a second, also with nothing
+         * playing). Safe: every start begins from its preroll (>= 0.5 s ready in memory) and a playing ring holds
+         * >= 1.4 s, the disk thread is back within 5 / 20 ms. */
+        if (!did) sleep_ms(na ? 5 : 20);
     }
     return NULL;
 }
@@ -505,6 +507,7 @@ ClipStream *stream_open_path(const StreamSource *src, StreamRegionFn fn, void *u
     if (!s) return NULL;
 
     s->src = *src;
+    s->nch = stream_src_nch(src);
     s->total = src->frames(src->ctx);
     s->region_fn = fn;
     s->region_ud = ud;
@@ -517,7 +520,7 @@ ClipStream *stream_open_path(const StreamSource *src, StreamRegionFn fn, void *u
     }
     apply_tier_params(s, desired_tier(s));
     /* ring/rpos/tmp are allocated lazily at the first stream_start() */
-    s->pre  = calloc(s->pre_cap * 2, sizeof(float));
+    s->pre  = calloc(s->pre_cap * (size_t)s->nch, sizeof(float));
     if (!s->pre) { free(s); return NULL; }
     build_preroll(s);               /* synchronous: the first start is instant */
 
@@ -538,10 +541,6 @@ ClipStream *stream_open_path(const StreamSource *src, StreamRegionFn fn, void *u
     return s;
 }
 
-ClipStream *stream_open(const StreamSource *src, StreamRegionFn fn, void *ud)
-{
-    return stream_open_path(src, fn, ud, NULL);
-}
 
 void stream_close(ClipStream *s)
 {
@@ -570,14 +569,14 @@ void stream_invalidate_preroll(ClipStream *s)
 static void retier(ClipStream *s, int tier)
 {
     const Tier *t = &g_tiers[tier];
-    float *pre = calloc(t->pre * 2, sizeof(float));
+    float *pre = calloc(t->pre * (size_t)s->nch, sizeof(float));
     float *ring = NULL, *tmp = NULL;
     uint32_t *rpos = NULL;
     bool bad = (pre == NULL);
     if (s->ring) {
-        ring = calloc(t->ring * 2, sizeof(float));
+        ring = calloc(t->ring * (size_t)s->nch, sizeof(float));
         rpos = calloc(t->ring, sizeof(uint32_t));
-        tmp  = calloc(t->chunk * 2, sizeof(float));
+        tmp  = calloc(t->chunk * (size_t)s->nch, sizeof(float));
         if (!ring || !rpos || !tmp) bad = true;
     }
     if (bad) { free(pre); free(ring); free(rpos); free(tmp); return; }     /* out of memory -> stay as we were */
@@ -633,9 +632,9 @@ bool stream_start(ClipStream *s, size_t from)
         if (want != s->tier && !atomic_load_explicit(&s->active, memory_order_acquire)) retier(s, want);
     }
     if (!s->ring) {                 /* first start: allocate the memory (UI thread) */
-        s->ring = calloc(s->ring_frames * 2, sizeof(float));
+        s->ring = calloc(s->ring_frames * (size_t)s->nch, sizeof(float));
         s->rpos = calloc(s->ring_frames, sizeof(uint32_t));
-        s->tmp  = calloc(s->chunk * 2, sizeof(float));
+        s->tmp  = calloc(s->chunk * (size_t)s->nch, sizeof(float));
         if (!s->ring || !s->rpos || !s->tmp) {
             free(s->ring); free(s->rpos); free(s->tmp);
             s->ring = NULL; s->rpos = NULL; s->tmp = NULL;
@@ -686,14 +685,6 @@ void stream_rebind_nolock(ClipStream *s, StreamRegionFn fn, void *ud)
     s->region_ud = ud;
 }
 
-void stream_rebind(ClipStream *s, StreamRegionFn fn, void *ud)
-{
-    if (!s) return;
-    pthread_mutex_lock(&g_mu);      /* the disk thread holds g_mu while it reads the region */
-    s->region_fn = fn;
-    s->region_ud = ud;
-    pthread_mutex_unlock(&g_mu);
-}
 
 /* ---------- audio thread ---------- */
 
@@ -712,14 +703,11 @@ bool stream_finished(const ClipStream *s)
     return s ? atomic_load_explicit(&((ClipStream *)s)->finished, memory_order_acquire) : true;
 }
 
-unsigned stream_underruns(const ClipStream *s)
-{
-    return s ? atomic_load_explicit(&((ClipStream *)s)->underruns, memory_order_relaxed) : 0;
-}
 
 static size_t stream_read_impl(ClipStream *s, float *out, size_t n)
 {
     size_t got = 0;
+    const size_t C = (size_t)s->nch;
     unsigned e = atomic_load_explicit(&s->req_epoch, memory_order_acquire);
 
     if (e != s->c_epoch) {                      /* new start / seek */
@@ -737,7 +725,7 @@ static size_t stream_read_impl(ClipStream *s, float *out, size_t n)
         if (s->c_pre_pos < s->c_pre_n) {
             size_t k = s->c_pre_n - s->c_pre_pos;
             if (k > n) k = n;
-            memcpy(out, s->pre + s->c_pre_pos * 2, k * 2 * sizeof(float));
+            memcpy(out, s->pre + s->c_pre_pos * C, k * C * sizeof(float));
             s->c_pre_pos += k;
             got += k;
             atomic_store_explicit(&s->play_pos, s->c_pre_from + s->c_pre_pos,
@@ -765,10 +753,10 @@ static size_t stream_read_impl(ClipStream *s, float *out, size_t n)
                 size_t at = rd & s->ring_mask;
                 size_t first = s->ring_frames - at;
                 if (first > k) first = k;
-                memcpy(out + got * 2, s->ring + at * 2, first * 2 * sizeof(float));
+                memcpy(out + got * C, s->ring + at * C, first * C * sizeof(float));
                 if (k > first)
-                    memcpy(out + (got + first) * 2, s->ring,
-                           (k - first) * 2 * sizeof(float));
+                    memcpy(out + (got + first) * C, s->ring,
+                           (k - first) * C * sizeof(float));
                 rd += k;
                 got += k;
                 s->c_ring_got += k;
@@ -793,7 +781,7 @@ static size_t stream_read_impl(ClipStream *s, float *out, size_t n)
         }
     }
 
-    if (got < n) memset(out + got * 2, 0, (n - got) * 2 * sizeof(float));
+    if (got < n) memset(out + got * C, 0, (n - got) * C * sizeof(float));
     return got;
 }
 
@@ -803,7 +791,7 @@ size_t stream_read(ClipStream *s, float *out, size_t n)
     atomic_store(&s->in_read, 1);
     if (atomic_load(&s->resizing)) {
         atomic_store(&s->in_read, 0);
-        memset(out, 0, n * 2 * sizeof(float));
+        memset(out, 0, n * (size_t)s->nch * sizeof(float));
         return 0;
     }
     size_t got = stream_read_impl(s, out, n);
@@ -839,5 +827,4 @@ void streams_status_text(char *buf, size_t n)
     if (!used) snprintf(buf, n, "no clips loaded yet");
 }
 
-int stream_tier(const ClipStream *s) { return s ? s->tier : 0; }
-size_t stream_ring_frames(const ClipStream *s) { return s ? s->ring_frames : 0; }
+int stream_channels(const ClipStream *s) { return s ? s->nch : 2; }

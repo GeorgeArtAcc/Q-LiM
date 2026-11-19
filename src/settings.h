@@ -21,5 +21,11 @@ int settings_load_audio(AudioConfig *config);
 int settings_save_audio(const AudioConfig *config);
 
 int  settings_ensure_dir(const char *path);   /* mkdir -p (0 = ok) */
+/* 1.4.11: loudness normalization (Edit -> Loudness...): ~/.config/qlim/loudness.conf. target 0 = off */
+void settings_load_loudness(int *target_lufs, bool *down_only);
+void settings_save_loudness(int target_lufs, bool down_only);
+/* 1.4.12: the folder the library (L) opens in: ~/.config/qlim/library.conf. false = none saved */
+bool settings_load_library_dir(char *out, size_t n);
+void settings_save_library_dir(const char *dir);
 
 #endif

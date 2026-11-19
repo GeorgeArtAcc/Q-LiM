@@ -11,10 +11,21 @@
 #include <string.h>
 #include <unistd.h>
 
+/* 2.0.0: on Windows the UTF-8 / "replace the old file" versions, also from C++ (midi.cpp): there compat.h does not
+ * redirect fopen / rename, and the plain Windows rename refuses to replace an existing file - midi.conf was then
+ * never updated after the first save ("safe_commit: cannot replace ...", the controller was not remembered). */
+#ifdef _WIN32
+#define SAFE_FOPEN(p, m)   qw_fopen((p), (m))
+#define SAFE_RENAME(a, b)  qw_rename((a), (b))
+#else
+#define SAFE_FOPEN(p, m)   fopen((p), (m))
+#define SAFE_RENAME(a, b)  rename((a), (b))
+#endif
+
 static inline FILE *safe_open(const char *path, char *tmp, size_t tmp_size)
 {
     snprintf(tmp, tmp_size, "%s.tmp%d", path, (int)getpid());
-    return fopen(tmp, "w");
+    return SAFE_FOPEN(tmp, "w");
 }
 
 /* 0 = success. On error the temporary file is deleted and the old one stays untouched. */
@@ -35,7 +46,7 @@ static inline int safe_commit(FILE *f, const char *tmp, const char *path, int ke
         unlink(bak);
         if (link(path, bak) != 0) { /* no old file, or the file system does not support hard links - no big deal */ }
     }
-    if (rename(tmp, path) != 0) {
+    if (SAFE_RENAME(tmp, path) != 0) {
         fprintf(stderr, "safe_commit: cannot replace '%s'\n", path);
         unlink(tmp);
         return 1;

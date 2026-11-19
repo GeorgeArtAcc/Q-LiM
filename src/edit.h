@@ -22,6 +22,9 @@
 #include <stdbool.h>
 
 #define EDIT_MAX_SEGS    2048
+/* 2.1: no timeline / part / source position longer than this (~266 days at 48 kHz): damaged project files with
+ * huge numbers would otherwise overflow the arithmetic (found by fuzz_project) */
+#define EDIT_MAX_LEN     (1LL << 40)
 #define EDIT_MICRO_FADE  64          /* ~1.3 ms @ 48 kHz */
 
 typedef struct {
@@ -79,6 +82,7 @@ EditList *edit_scale(const EditList *e, double k, int64_t new_src_len);  /* samp
 /* Reading: n stereo frames (L R L R ...) from position pos of the timeline. readfn reads from the file. */
 typedef size_t (*EditReadFn)(void *ctx, size_t pos, float *out, size_t n);
 size_t    edit_read(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, float *out, size_t n);
+size_t    edit_read_n(const EditList *e, EditReadFn readfn, void *ctx, int64_t pos, float *out, size_t n, int nch);   /* 1.4.24: nch channels */
 /* The level (0..1) at which part idx sounds at local frame p (fades + micro-fades) */
 float     edit_gain(const EditList *e, int idx, int64_t p);
 

@@ -59,6 +59,21 @@ long     stretch_frames_to_end(const Stretch *st);
  * delivered the audio yet (e.g. a start from the middle of the file). Without this the latter was mistaken for the end and the clip stopped. */
 void     stretch_set_eof_check(bool (*is_eof)(void *ud));
 
+/* 1.4.13: pitch WITHOUT changing the speed (Rubber Band R3, the best open-source pitch shifter).
+ * semitones: -24..+24 (fractions = cents), 0 = untouched. formants: keep the voice's formants
+ * (no "chipmunk" / "giant" voice when singing or speaking is shifted). Any thread; takes effect within a few ms.
+ * Does nothing with WSOLA. */
+#define STRETCH_PITCH_MAX 24.0
+void     stretch_set_pitch(Stretch *st, double semitones, bool formants);
+bool     stretch_has_pitch(void);   /* true when this build can change the pitch (Rubber Band) */
+
+/* 1.4.14: offline rendering (audio export). set_offline once after create; then read_offline instead of process:
+ * it WAITS for the background thread (never silence) and returns fewer than n frames only at the very end
+ * (0 = the end, or *cancel became non-zero). With WSOLA it never ends by itself: the caller counts the frames. */
+void     stretch_set_offline(Stretch *st);
+size_t   stretch_read_offline(Stretch *st, double speed, float *out, size_t n, StretchPull pull, void *ud,
+                              const volatile int *cancel);
+
 /* Which algorithm is used: "Rubber Band R3" (bundled, best quality) or "WSOLA" (fallback). */
 const char *stretch_engine_name(void);
 

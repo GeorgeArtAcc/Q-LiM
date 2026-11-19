@@ -23,5 +23,4 @@ typedef struct {
 void     dsp_meter_take(DspSample *out);          /* takes and resets the accumulated values (called by the interface) */
 unsigned dsp_meter_xruns(void);                   /* total number of dropouts since start */
 unsigned dsp_meter_overloads(void);               /* total number of blocks that took longer than 100% */
-void     dsp_meter_reset(void);                   /* for tests / a fresh audio start */
 #endif

@@ -110,6 +110,7 @@ typedef struct GfxImage GfxImage;    /* 1.3.14: a picture the program draws itse
 GfxImage *GfxImageNew(void);
 void      GfxImageUpload(GfxImage *im, const uint32_t *argb, int w, int h);   /* ARGB, not premultiplied */
 void      GfxImageDraw(GfxImage *im, int px, int py);                         /* in real (physical) pixels */
+void      GfxSetGentleUploads(bool on);   /* 2.0: at most a little picture data to the graphics card per frame */
 float     GfxScaleNow(void);                                                  /* UI unit -> physical pixels */   /* 1.3.14: many rectangles of one colour, one command */
 void DrawRectangle(int x, int y, int w, int h, Color c);
 void DrawRectangleGradientV(float x, float y, float w, float h, Color top, Color bottom);   /* step 36c */
@@ -133,6 +134,8 @@ Vector2 MeasureTextEx(Font f, const char *text, float size, float spacing);
 void    DrawTextEx(Font f, const char *text, Vector2 pos, float size, float spacing, Color c);
 int     MeasureText(const char *text, int size);
 void    DrawText(const char *text, int x, int y, int size, Color c);
+float   GfxLogoText(int weight, const char *text, float x, float y, float size, float tracking, Color c, bool draw);   /* 2.0.0 */
+float   GfxLogoAscent(int weight, float size);
 
 /* ---- input ---- */
 Vector2 GetMousePosition(void);
@@ -144,7 +147,10 @@ int     GetMouseClicks(int b);        /* 1.3.15: 2 = this press is a double clic
 /* Call before/after an external window (zenity): releases the mouse and resets "stuck" buttons */
 void   *GfxSdlWindow(void);
 bool    GfxSoftwareRendering(void);   /* 1.3.4: the CPU draws the picture (no graphics acceleration) */
+void    GfxWakeFromThread(void);      /* 1.4.2: from another thread (MIDI in): wake the main loop now */
+void    GfxWakeDone(void);            /* the main loop has taken the wake-up (MIDI poll) */
 void    GfxSetBusyFps(int fps);       /* 1.3.4: frames per second needed while nothing is touched (0 = full) */
+double GfxSecondsSinceInput(void);   /* 2.0 */
 void    GfxSetMaxFps(int fps);        /* 1.3.7: the cap at all times (0 = none) */
 void    GfxSetRendererPref(int pref); /* 1.3.7: before InitWindow: 0 auto, 1 graphics card, 2 light (QLIM_RENDERER wins) */
 const char *GfxRendererDesc(void);    /* 1.3.7: how the window is drawn, in words */

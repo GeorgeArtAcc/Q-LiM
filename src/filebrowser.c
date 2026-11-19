@@ -46,10 +46,12 @@ void fb_init(FileBrowser *fb, const char *start_dir)
 
     if (start_dir) {
         snprintf(fb->current_dir, sizeof(fb->current_dir), "%s", start_dir);
+        snprintf(fb->start_dir, sizeof(fb->start_dir), "%s", start_dir);
     } else {
         const char *home = getenv("HOME");
         snprintf(fb->current_dir, sizeof(fb->current_dir), "%s",
                  home ? home : "/");
+        snprintf(fb->start_dir, sizeof(fb->start_dir), "%s", fb->current_dir);
     }
     fb_scan(fb);
 }
